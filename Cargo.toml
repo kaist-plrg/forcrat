@@ -1,0 +1,16 @@
+[package]
+name = "forcrat"
+version = "1.0.0"
+authors = ["Jaemin Hong <hjm0901@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.6", features = ["derive"] }
+serde = "=1.0.197"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+etrace = "1.1.1"
+rustfix = "0.8.2"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
