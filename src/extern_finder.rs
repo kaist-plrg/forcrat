@@ -1,14 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use etrace::some_or;
+use lazy_static::lazy_static;
 use rustc_hir::{
     def::{DefKind, Res},
-    def_id::{DefId, LocalDefId},
+    def_id::LocalDefId,
     intravisit::{self, Visitor as HVisitor},
-    BodyId, Expr, ExprKind, FnDecl, FnRetTy, ForeignItem, ForeignItemKind, ItemKind, Node, OwnerId,
-    QPath,
+    BodyId, Expr, ExprKind, FnDecl, FnRetTy, ForeignItemKind, ItemKind, Node, QPath,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
+use rustc_span::Symbol;
 
 use crate::compile_util::Pass;
 
@@ -22,31 +23,47 @@ impl Pass for ExternFinder {
         let hir = tcx.hir();
         let mut visitor = ExternVisitor::new(tcx);
         hir.visit_all_item_likes_in_crate(&mut visitor);
-        // for f in visitor.file_fns {
-        //     println!("{:?}", f);
-        // }
-        for (op, n) in visitor.file_calls {
-            println!("{} {:?}", tcx.def_path_str(op), n);
+
+        let mut counts: HashMap<_, usize> = HashMap::new();
+        for (_caller, callees) in visitor.file_calls {
+            for (callee, not_stdio) in callees {
+                let file_fn = &visitor.file_fns[&callee];
+                let name = file_fn.name.to_ident_string();
+                let name = strip_unlocked(&name).to_string();
+                *counts.entry((name, not_stdio)).or_default() += 1;
+            }
         }
+
+        for api in FILE_API_NAMES {
+            let n = counts.get(&(api.to_string(), true)).copied().unwrap_or(0);
+            let m = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
+            print!("{} {} ", n, m);
+        }
+        for api in STDIO_API_NAMES {
+            assert!(!counts.contains_key(&(api.to_string(), true)));
+            let n = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
+            print!("{} ", n);
+        }
+        println!();
     }
 }
 
 struct ExternVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    file_fns: HashSet<LocalDefId>,
-    file_externs: HashSet<String>,
-    file_calls: HashMap<LocalDefId, HashSet<String>>,
-    file_calls_count: HashMap<String, usize>,
+    file_fns: HashMap<LocalDefId, FileFn>,
+    custom_file_fns: HashSet<LocalDefId>,
+    file_internal_fns: HashSet<LocalDefId>,
+    file_calls: HashMap<LocalDefId, Vec<(LocalDefId, bool)>>,
 }
 
 impl<'tcx> ExternVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
-            file_fns: HashSet::new(),
-            file_externs: HashSet::new(),
+            file_fns: HashMap::new(),
+            custom_file_fns: HashSet::new(),
+            file_internal_fns: HashSet::new(),
             file_calls: HashMap::new(),
-            file_calls_count: HashMap::new(),
         }
     }
 }
@@ -56,13 +73,6 @@ impl<'tcx> HVisitor<'tcx> for ExternVisitor<'tcx> {
 
     fn nested_visit_map(&mut self) -> Self::Map {
         self.tcx.hir()
-    }
-
-    fn visit_foreign_item(&mut self, item: &'tcx ForeignItem<'tcx>) {
-        if self.is_file_extern_item(item) {
-            self.file_externs.insert(item.ident.name.to_ident_string());
-        }
-        intravisit::walk_foreign_item(self, item)
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -78,8 +88,10 @@ impl<'tcx> HVisitor<'tcx> for ExternVisitor<'tcx> {
         _: rustc_span::Span,
         def_id: LocalDefId,
     ) {
-        if self.is_file_op_decl(fd) {
-            self.file_fns.insert(def_id);
+        if let Some(file_fn) = self.get_file_fn(def_id) {
+            if !file_fn.is_libc {
+                self.custom_file_fns.insert(def_id);
+            }
         }
         intravisit::walk_fn(self, fk, fd, body_id, def_id)
     }
@@ -88,32 +100,29 @@ impl<'tcx> HVisitor<'tcx> for ExternVisitor<'tcx> {
 impl<'tcx> ExternVisitor<'tcx> {
     fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         let current_func = expr.hir_id.owner.def_id;
-        if self.is_defined_file_extern(current_func.to_def_id()) {
-            return;
+        if let Some(file_fn) = self.get_file_fn(current_func) {
+            if file_fn.is_libc {
+                return;
+            }
         }
         match expr.kind {
-            ExprKind::Call(callee, _) => {
+            ExprKind::Call(callee, args) => {
                 let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return };
                 let Res::Def(DefKind::Fn, def_id) = path.res else { return };
-                if !self.is_file_extern(def_id) {
+                let def_id = some_or!(def_id.as_local(), return);
+                let file_fn = some_or!(self.get_file_fn(def_id), return);
+                if !file_fn.is_libc {
                     return;
                 }
-                let name = path.segments.last().unwrap().ident.name.to_ident_string();
+                let not_stdio = file_fn.returns_file
+                    || file_fn
+                        .file_params
+                        .iter()
+                        .any(|i| !self.is_std_io(&args[*i]));
                 self.file_calls
                     .entry(current_func)
                     .or_default()
-                    .insert(name.clone());
-                *self.file_calls_count.entry(name.clone()).or_default() += 1;
-
-                // let ForeignItemKind::Fn(decl, _, _) = item.kind else { return };
-                // if decl
-                //     .inputs
-                //     .iter()
-                //     .zip(args)
-                //     .any(|(ty, arg)| self.has_file_ty(ty) && !self.is_std_io(arg))
-                // {
-                //     println!("{:?} {}", current_func, name);
-                // }
+                    .push((def_id, not_stdio));
             }
             ExprKind::Field(e, _) => {
                 let ty = self.tcx.typeck(current_func).expr_ty(e);
@@ -121,60 +130,63 @@ impl<'tcx> ExternVisitor<'tcx> {
                 let node = some_or!(self.tcx.hir().get_if_local(adt_def.did()), return);
                 let Node::Item(item) = node else { return };
                 if item.ident.name.to_ident_string() == "_IO_FILE" {
-                    // println!("{}", self.tcx.def_path_str(current_func));
+                    self.file_internal_fns.insert(current_func);
                 }
             }
             _ => {}
         }
     }
 
-    fn is_file_extern(&self, def_id: DefId) -> bool {
-        self.is_defined_file_extern(def_id) || self.is_linked_file_extern(def_id)
-    }
-
-    fn is_defined_file_extern(&self, def_id: DefId) -> bool {
-        let node = some_or!(self.tcx.hir().get_if_local(def_id), return false);
-        let Node::Item(item) = node else { return false };
-        matches!(item.kind, ItemKind::Fn(_, _, _)) && {
-            let name = item.ident.name.to_ident_string();
-            name == "putc_unlocked"
-                || name == "fputc_unlocked"
-                || name == "getc_unlocked"
-                || name == "ferror_unlocked"
-                || name == "getline"
-                || name == "feof_unlocked"
-                || name == "fpurge"
-                || name == "feof_unlocked"
+    fn get_file_fn(&mut self, def_id: LocalDefId) -> Option<FileFn> {
+        if let Some(api_fn) = self.file_fns.get(&def_id) {
+            return Some(api_fn.clone());
         }
-    }
-
-    fn is_linked_file_extern(&self, def_id: DefId) -> bool {
-        if !self.tcx.is_foreign_item(def_id) {
-            return false;
-        }
-        let local_def_id = some_or!(def_id.as_local(), return false);
-        let id = OwnerId {
-            def_id: local_def_id,
-        };
-        let item = self.tcx.hir().expect_foreign_item(id);
-        self.is_file_extern_item(item)
-    }
-
-    fn is_file_extern_item(&self, item: &'tcx ForeignItem<'tcx>) -> bool {
-        match item.kind {
-            ForeignItemKind::Fn(decl, _, _) => self.is_file_op_decl(decl),
-            ForeignItemKind::Static(ty, _) => self.has_file_ty(ty),
-            _ => false,
-        }
-    }
-
-    fn is_file_op_decl(&self, decl: &'tcx FnDecl<'tcx>) -> bool {
-        decl.inputs.iter().any(|ty| self.has_file_ty(ty))
-            || if let FnRetTy::Return(ty) = decl.output {
-                self.has_file_ty(ty)
-            } else {
-                false
+        let node = self.tcx.hir().get_if_local(def_id.to_def_id()).unwrap();
+        let (name, decl, is_extern) = match node {
+            Node::Item(item) => {
+                let ItemKind::Fn(sig, _, _) = item.kind else { return None };
+                (item.ident.name, sig.decl, false)
             }
+            Node::ForeignItem(item) => {
+                let ForeignItemKind::Fn(decl, _, _) = item.kind else { return None };
+                (item.ident.name, decl, true)
+            }
+            _ => return None,
+        };
+        let file_params: Vec<_> = decl
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ty)| if self.has_file_ty(ty) { Some(i) } else { None })
+            .collect();
+        let returns_file = if let FnRetTy::Return(ty) = decl.output {
+            self.has_file_ty(ty)
+        } else {
+            false
+        };
+        let name_string = name.to_ident_string();
+        let name_str = strip_unlocked(&name_string);
+        let is_libc = if !file_params.is_empty() || returns_file {
+            let is_api = FILE_API_NAME_SET.contains(name_str);
+            if is_extern {
+                assert!(is_api, "{}", name_string);
+                true
+            } else {
+                is_api
+            }
+        } else if STDIO_API_NAME_SET.contains(name_str) {
+            true
+        } else {
+            return None;
+        };
+        let api_fn = FileFn {
+            name,
+            file_params,
+            returns_file,
+            is_libc,
+        };
+        self.file_fns.insert(def_id, api_fn.clone());
+        Some(api_fn)
     }
 
     fn has_file_ty(&self, ty: &'tcx rustc_hir::Ty<'tcx>) -> bool {
@@ -192,6 +204,14 @@ impl<'tcx> ExternVisitor<'tcx> {
         let name = path.segments.last().unwrap().ident.name.to_ident_string();
         name == "stdin" || name == "stdout" || name == "stderr"
     }
+}
+
+#[derive(Debug, Clone)]
+struct FileFn {
+    name: Symbol,
+    file_params: Vec<usize>,
+    returns_file: bool,
+    is_libc: bool,
 }
 
 struct TyVisitor<'tcx> {
@@ -225,4 +245,66 @@ impl<'tcx> HVisitor<'tcx> for TyVisitor<'tcx> {
         }
         intravisit::walk_ty(self, t)
     }
+}
+
+fn strip_unlocked(name: &str) -> &str {
+    name.strip_suffix("_unlocked").unwrap_or(name)
+}
+
+static FILE_API_NAMES: [&str; 46] = [
+    "fopen",
+    "tmpfile",
+    "fclose",
+    "putc",
+    "fputc",
+    "fputs",
+    "fprintf",
+    "vfprintf",
+    "fwrite",
+    "fflush",
+    "getc",
+    "fgetc",
+    "fgets",
+    "fscanf",
+    "vfscanf",
+    "getline",
+    "getdelim",
+    "fread",
+    "ungetc",
+    "fseek",
+    "fseeko",
+    "ftell",
+    "ftello",
+    "rewind",
+    "funlockfile",
+    "flockfile",
+    "popen",
+    "pclose",
+    "fileno",
+    "fdopen",
+    "ferror",
+    "feof",
+    "clearerr",
+    "freopen",
+    "setvbuf",
+    "setbuf",
+    "setlinebuf",
+    "fpurge",
+    "endmntent",
+    "getmntent",
+    "setmntent",
+    "fgetpos",
+    "fsetpos",
+    "__fpending",
+    "__freading",
+    "__fwriting",
+];
+static STDIO_API_NAMES: [&str; 8] = [
+    "putchar", "puts", "printf", "vprintf", "getchar", "gets", "scanf", "vscanf",
+];
+
+lazy_static! {
+    static ref FILE_API_NAME_SET: HashSet<&'static str> = FILE_API_NAMES.iter().copied().collect();
+    static ref STDIO_API_NAME_SET: HashSet<&'static str> =
+        STDIO_API_NAMES.iter().copied().collect();
 }
