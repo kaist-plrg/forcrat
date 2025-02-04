@@ -6,7 +6,8 @@ use rustc_hir::{
     def::{DefKind, Res},
     def_id::LocalDefId,
     intravisit::{self, Visitor as HVisitor},
-    BodyId, Expr, ExprKind, FnDecl, FnRetTy, ForeignItemKind, ItemKind, Node, QPath,
+    BodyId, Expr, ExprKind, FieldDef, FnDecl, FnRetTy, ForeignItemKind, HirId, Item, ItemKind,
+    MutTy, Node, QPath, TyKind,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::Symbol;
@@ -24,27 +25,35 @@ impl Pass for ExternFinder {
         let mut visitor = ExternVisitor::new(tcx);
         hir.visit_all_item_likes_in_crate(&mut visitor);
 
-        let mut counts: HashMap<_, usize> = HashMap::new();
-        for (_caller, callees) in visitor.file_calls {
-            for (callee, not_stdio) in callees {
-                let file_fn = &visitor.file_fns[&callee];
-                let name = file_fn.name.to_ident_string();
-                let name = strip_unlocked(&name).to_string();
-                *counts.entry((name, not_stdio)).or_default() += 1;
-            }
-        }
+        // println!(
+        //     "{} {} {} {} ",
+        //     visitor.file_locals.len(),
+        //     visitor.file_statics.len(),
+        //     visitor.file_fields.len(),
+        //     visitor.custom_file_fns.len(),
+        // );
 
-        for api in FILE_API_NAMES {
-            let n = counts.get(&(api.to_string(), true)).copied().unwrap_or(0);
-            let m = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
-            print!("{} {} ", n, m);
-        }
-        for api in STDIO_API_NAMES {
-            assert!(!counts.contains_key(&(api.to_string(), true)));
-            let n = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
-            print!("{} ", n);
-        }
-        println!();
+        // let mut counts: HashMap<_, usize> = HashMap::new();
+        // for (_caller, callees) in visitor.file_calls {
+        //     for (callee, not_stdio) in callees {
+        //         let file_fn = &visitor.file_fns[&callee];
+        //         let name = file_fn.name.to_ident_string();
+        //         let name = strip_unlocked(&name).to_string();
+        //         *counts.entry((name, not_stdio)).or_default() += 1;
+        //     }
+        // }
+
+        // for api in FILE_API_NAMES {
+        //     let n = counts.get(&(api.to_string(), true)).copied().unwrap_or(0);
+        //     let m = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
+        //     print!("{} {} ", n, m);
+        // }
+        // for api in STDIO_API_NAMES {
+        //     assert!(!counts.contains_key(&(api.to_string(), true)));
+        //     let n = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
+        //     print!("{} ", n);
+        // }
+        // println!();
     }
 }
 
@@ -54,6 +63,9 @@ struct ExternVisitor<'tcx> {
     custom_file_fns: HashSet<LocalDefId>,
     file_internal_fns: HashSet<LocalDefId>,
     file_calls: HashMap<LocalDefId, Vec<(LocalDefId, bool)>>,
+    file_locals: HashSet<HirId>,
+    file_statics: HashSet<LocalDefId>,
+    file_fields: HashSet<LocalDefId>,
 }
 
 impl<'tcx> ExternVisitor<'tcx> {
@@ -64,6 +76,9 @@ impl<'tcx> ExternVisitor<'tcx> {
             custom_file_fns: HashSet::new(),
             file_internal_fns: HashSet::new(),
             file_calls: HashMap::new(),
+            file_locals: HashSet::new(),
+            file_statics: HashSet::new(),
+            file_fields: HashSet::new(),
         }
     }
 }
@@ -77,7 +92,24 @@ impl<'tcx> HVisitor<'tcx> for ExternVisitor<'tcx> {
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         self.handle_expr(expr);
-        intravisit::walk_expr(self, expr)
+        intravisit::walk_expr(self, expr);
+    }
+
+    fn visit_item(&mut self, item: &'tcx Item<'tcx>) {
+        self.handle_item(item);
+        intravisit::walk_item(self, item);
+    }
+
+    fn visit_field_def(&mut self, fd: &'tcx FieldDef<'tcx>) {
+        if self.has_file_ty(fd.ty) {
+            self.file_fields.insert(fd.def_id);
+        }
+        intravisit::walk_field_def(self, fd);
+    }
+
+    fn visit_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
+        self.handle_local(local);
+        intravisit::walk_local(self, local);
     }
 
     fn visit_fn(
@@ -93,7 +125,7 @@ impl<'tcx> HVisitor<'tcx> for ExternVisitor<'tcx> {
                 self.custom_file_fns.insert(def_id);
             }
         }
-        intravisit::walk_fn(self, fk, fd, body_id, def_id)
+        intravisit::walk_fn(self, fk, fd, body_id, def_id);
     }
 }
 
@@ -123,6 +155,20 @@ impl<'tcx> ExternVisitor<'tcx> {
                     .entry(current_func)
                     .or_default()
                     .push((def_id, not_stdio));
+                for i in &file_fn.file_params {
+                    let arg = &args[*i];
+                    if self.is_std_io(arg) {
+                        continue;
+                    }
+                    // println!(
+                    //     "{}",
+                    //     self.tcx
+                    //         .sess
+                    //         .source_map()
+                    //         .span_to_snippet(arg.span)
+                    //         .unwrap()
+                    // );
+                }
             }
             ExprKind::Field(e, _) => {
                 let ty = self.tcx.typeck(current_func).expr_ty(e);
@@ -134,6 +180,20 @@ impl<'tcx> ExternVisitor<'tcx> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_item(&mut self, item: &'tcx Item<'tcx>) {
+        let ItemKind::Static(ty, _, _) = item.kind else { return };
+        if self.has_file_ty(ty) {
+            self.file_statics.insert(item.owner_id.def_id);
+        }
+    }
+
+    fn handle_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
+        let ty = some_or!(local.ty, return);
+        if self.has_file_ty(ty) {
+            self.file_locals.insert(local.hir_id);
         }
     }
 
@@ -192,6 +252,9 @@ impl<'tcx> ExternVisitor<'tcx> {
     fn has_file_ty(&self, ty: &'tcx rustc_hir::Ty<'tcx>) -> bool {
         let mut visitor = TyVisitor::new(self.tcx);
         visitor.visit_ty(ty);
+        // if visitor.has_file {
+        //     println!("{}", self.tcx.sess.source_map().span_to_snippet(ty.span).unwrap());
+        // }
         visitor.has_file
     }
 
@@ -307,4 +370,61 @@ lazy_static! {
     static ref FILE_API_NAME_SET: HashSet<&'static str> = FILE_API_NAMES.iter().copied().collect();
     static ref STDIO_API_NAME_SET: HashSet<&'static str> =
         STDIO_API_NAMES.iter().copied().collect();
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct FmtTy<'tcx>(rustc_hir::Ty<'tcx>);
+
+impl std::fmt::Display for FmtTy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.kind {
+            TyKind::Slice(t) => write!(f, "[{}]", FmtTy(*t)),
+            TyKind::Array(t, _) => write!(f, "[{}; _]", FmtTy(*t)),
+            TyKind::Ptr(MutTy { ty, mutbl }) => {
+                write!(
+                    f,
+                    "*{} {}",
+                    if mutbl.is_mut() { "mut" } else { "const" },
+                    FmtTy(*ty)
+                )
+            }
+            TyKind::Ref(_, MutTy { ty, mutbl }) => {
+                write!(
+                    f,
+                    "&{}{}",
+                    if mutbl.is_mut() { "mut " } else { "" },
+                    FmtTy(*ty)
+                )
+            }
+            TyKind::BareFn(fn_ty) => {
+                write!(f, "fn(")?;
+                for t in fn_ty.decl.inputs {
+                    write!(f, "{}, ", FmtTy(*t))?;
+                }
+                write!(f, ")")?;
+                if let FnRetTy::Return(t) = fn_ty.decl.output {
+                    write!(f, " -> {}", FmtTy(*t))?;
+                }
+                Ok(())
+            }
+            TyKind::Never => write!(f, "!"),
+            TyKind::Tup(tys) => {
+                write!(f, "(")?;
+                for t in tys {
+                    write!(f, "{}, ", FmtTy(*t))?;
+                }
+                write!(f, ")")
+            }
+            TyKind::Path(path) => {
+                if let QPath::Resolved(_, path) = path {
+                    for seg in path.segments {
+                        write!(f, "::{}", seg.ident.name.to_ident_string())?;
+                    }
+                }
+                write!(f, "")
+            }
+            _ => write!(f, "_"),
+        }
+    }
 }
