@@ -34,15 +34,25 @@ impl Pass for FileAnalysis {
     type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) {
+        info!("\n{:?}", self.steensgaard);
         let hir = tcx.hir();
 
         let mut locs: IndexVec<LocId, Loc> = IndexVec::new();
+        let mut fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>> =
+            FxHashMap::default();
 
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
             let body = match item.kind {
                 ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
+                    let ty = self
+                        .steensgaard
+                        .var_ty(self.steensgaard.global(local_def_id));
+                    fn_ty_functions
+                        .entry(ty.fn_ty)
+                        .or_default()
+                        .push(local_def_id);
                     tcx.optimized_mir(local_def_id)
                 }
                 ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
@@ -67,6 +77,9 @@ impl Pass for FileAnalysis {
             }
         }
 
+        for (i, fs) in &fn_ty_functions {
+            info!("{:?}: {:?}", i, fs);
+        }
         for (i, loc) in locs.iter_enumerated() {
             info!("{:?}: {:?}", i, loc);
         }
@@ -74,6 +87,8 @@ impl Pass for FileAnalysis {
 
         let mut analyzer = Analyzer {
             tcx,
+            steensgaard: &self.steensgaard,
+            fn_ty_functions,
             loc_ind_map,
             graph: Graph::new(locs.len()),
         };
@@ -104,9 +119,11 @@ impl Pass for FileAnalysis {
     }
 }
 
-struct Analyzer<'tcx> {
+struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     loc_ind_map: FxHashMap<Loc, LocId>,
+    fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
+    steensgaard: &'a steensgaard::AnalysisResult,
     graph: Graph,
 }
 
@@ -116,7 +133,7 @@ struct Ctx<'a, 'tcx> {
     local_decls: &'a IndexVec<Local, LocalDecl<'tcx>>,
 }
 
-impl<'tcx> Analyzer<'tcx> {
+impl<'tcx> Analyzer<'_, 'tcx> {
     fn transfer_stmt(&mut self, stmt: &Statement<'tcx>, ctx: Ctx<'_, 'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         let ty = l.ty(ctx.local_decls, self.tcx).ty;
@@ -204,22 +221,12 @@ impl<'tcx> Analyzer<'tcx> {
     }
 
     fn transfer_constant(&self, constant: Constant<'tcx>) -> LocId {
-        let ConstantKind::Val(value, ty) = constant.literal else { panic!() };
-        match value {
-            ConstValue::Scalar(scalar) => {
-                let Scalar::Ptr(ptr, _) = scalar else { panic!() };
-                let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance) else {
-                    panic!()
-                };
-                let loc = Loc::Var(def_id.expect_local(), RETURN_PLACE);
-                self.loc_ind_map[&loc]
-            }
-            ConstValue::ZeroSized => {
-                let TyKind::FnDef(_def_id, _) = ty.kind() else { panic!() };
-                todo!()
-            }
-            _ => panic!(),
-        }
+        let ConstantKind::Val(value, _) = constant.literal else { panic!() };
+        let ConstValue::Scalar(scalar) = value else { panic!() };
+        let Scalar::Ptr(ptr, _) = scalar else { panic!() };
+        let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance) else { panic!() };
+        let loc = Loc::Var(def_id.expect_local(), RETURN_PLACE);
+        self.loc_ind_map[&loc]
     }
 
     fn transfer_term(&mut self, term: &Terminator<'tcx>, ctx: Ctx<'_, 'tcx>) {
@@ -233,23 +240,27 @@ impl<'tcx> Analyzer<'tcx> {
             return;
         };
         assert!(!destination.is_indirect_first_projection());
-        // let ty = destination.ty(ctx.local_decls, self.tcx).ty;
-        // let mut visitor = FileTypeVisitor { tcx: self.tcx };
-        // ty.visit_with(&mut visitor);
         match func {
-            Operand::Copy(func) | Operand::Move(func) => {
-                assert!(func.projection.is_empty());
-                todo!();
+            Operand::Copy(callee) | Operand::Move(callee) => {
+                assert!(callee.projection.is_empty());
+                let ty = self
+                    .steensgaard
+                    .var_ty(self.steensgaard.local(ctx.function, callee.local));
+                let callees = self.fn_ty_functions[&ty.fn_ty].clone();
+                for callee in callees {
+                    assert!(file_api_kind(callee, self.tcx).is_none());
+                    self.transfer_non_api_call(callee, args, *destination, ctx);
+                }
             }
             Operand::Constant(box constant) => {
                 let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
                 assert!(matches!(value, ConstValue::ZeroSized));
                 let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                 if let Some(kind) = file_api_kind(def_id, self.tcx) {
                     match kind {
                         FileApiKind::Open => {}
                         FileApiKind::Operation(permission) => {
+                            let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(arg, ctx);
@@ -260,23 +271,34 @@ impl<'tcx> Analyzer<'tcx> {
                         }
                         FileApiKind::NotSupported => panic!(),
                     }
-                } else if let Some(def_id) = def_id.as_local() {
-                    for (i, (t, arg)) in sig.inputs().iter().zip(args).enumerate() {
-                        if let Some(variance) = file_type_variance(*t, self.tcx) {
-                            let l = Loc::Var(def_id, Local::from_usize(i + 1));
-                            let l = self.loc_ind_map[&l];
-                            let r = self.transfer_operand(arg, ctx);
-                            self.graph.add_edge(l, r, variance);
-                        }
-                    }
-                    if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
-                        let l = self.transfer_place(*destination, ctx);
-                        let r = Loc::Var(def_id, RETURN_PLACE);
-                        let r = self.loc_ind_map[&r];
-                        self.graph.add_edge(l, r, variance);
-                    }
+                } else if let Some(callee) = def_id.as_local() {
+                    self.transfer_non_api_call(callee, args, *destination, ctx);
                 }
             }
+        }
+    }
+
+    fn transfer_non_api_call(
+        &mut self,
+        callee: LocalDefId,
+        args: &[Operand<'tcx>],
+        destination: Place<'tcx>,
+        ctx: Ctx<'_, 'tcx>,
+    ) {
+        let sig = self.tcx.fn_sig(callee).skip_binder().skip_binder();
+        for (i, (t, arg)) in sig.inputs().iter().zip(args).enumerate() {
+            if let Some(variance) = file_type_variance(*t, self.tcx) {
+                let l = Loc::Var(callee, Local::from_usize(i + 1));
+                let l = self.loc_ind_map[&l];
+                let r = self.transfer_operand(arg, ctx);
+                self.graph.add_edge(l, r, variance);
+            }
+        }
+        if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
+            let l = self.transfer_place(destination, ctx);
+            let r = Loc::Var(callee, RETURN_PLACE);
+            let r = self.loc_ind_map[&r];
+            self.graph.add_edge(l, r, variance);
         }
     }
 }
@@ -285,7 +307,6 @@ impl<'tcx> Analyzer<'tcx> {
 enum Variance {
     Covariant,
     Invariant,
-    Contravariant,
 }
 
 fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance> {
@@ -307,8 +328,6 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
             }
         }
         TyKind::Array(ty, _) | TyKind::Slice(ty) => file_type_variance(*ty, tcx),
-        TyKind::FnDef(_def_id, _) => todo!(),
-        TyKind::FnPtr(_sig) => todo!(),
         _ => None,
     }
 }
@@ -371,10 +390,6 @@ impl Graph {
             Variance::Covariant => {
                 info!("{:?} --> {:?}", from, to);
                 self.edges[from].insert(to);
-            }
-            Variance::Contravariant => {
-                info!("{:?} <-- {:?}", from, to);
-                self.edges[to].insert(from);
             }
             Variance::Invariant => {
                 info!("{:?} <-> {:?}", from, to);
@@ -469,11 +484,11 @@ static FILE_API_NAMES: [(&str, FileApiKind); 46] = [
     ("getline", FileApiKind::Operation(Permission::Read)),
     ("getdelim", FileApiKind::Operation(Permission::Read)),
     ("fread", FileApiKind::Operation(Permission::Read)),
-    ("fseek", FileApiKind::Operation(Permission::Read)),
-    ("fseeko", FileApiKind::Operation(Permission::Read)),
-    ("ftell", FileApiKind::Operation(Permission::Read)),
-    ("ftello", FileApiKind::Operation(Permission::Read)),
-    ("rewind", FileApiKind::Operation(Permission::Read)),
+    ("fseek", FileApiKind::Operation(Permission::Seek)),
+    ("fseeko", FileApiKind::Operation(Permission::Seek)),
+    ("ftell", FileApiKind::Operation(Permission::Seek)),
+    ("ftello", FileApiKind::Operation(Permission::Seek)),
+    ("rewind", FileApiKind::Operation(Permission::Seek)),
     ("ungetc", FileApiKind::NotSupported),
     ("funlockfile", FileApiKind::NotSupported),
     ("flockfile", FileApiKind::NotSupported),

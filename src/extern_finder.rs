@@ -11,6 +11,7 @@ use rustc_hir::{
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::Symbol;
+use tracing::info;
 
 use crate::compile_util::Pass;
 
@@ -25,35 +26,35 @@ impl Pass for ExternFinder {
         let mut visitor = ExternVisitor::new(tcx);
         hir.visit_all_item_likes_in_crate(&mut visitor);
 
-        // println!(
-        //     "{} {} {} {} ",
-        //     visitor.file_locals.len(),
-        //     visitor.file_statics.len(),
-        //     visitor.file_fields.len(),
-        //     visitor.custom_file_fns.len(),
-        // );
+        println!(
+            "{} {} {} {} ",
+            visitor.file_locals.len(),
+            visitor.file_statics.len(),
+            visitor.file_fields.len(),
+            visitor.custom_file_fns.len(),
+        );
 
-        // let mut counts: HashMap<_, usize> = HashMap::new();
-        // for (_caller, callees) in visitor.file_calls {
-        //     for (callee, not_stdio) in callees {
-        //         let file_fn = &visitor.file_fns[&callee];
-        //         let name = file_fn.name.to_ident_string();
-        //         let name = strip_unlocked(&name).to_string();
-        //         *counts.entry((name, not_stdio)).or_default() += 1;
-        //     }
-        // }
+        let mut counts: HashMap<_, usize> = HashMap::new();
+        for (_caller, callees) in visitor.file_calls {
+            for (callee, not_stdio) in callees {
+                let file_fn = &visitor.file_fns[&callee];
+                let name = file_fn.name.to_ident_string();
+                let name = strip_unlocked(&name).to_string();
+                *counts.entry((name, not_stdio)).or_default() += 1;
+            }
+        }
 
-        // for api in FILE_API_NAMES {
-        //     let n = counts.get(&(api.to_string(), true)).copied().unwrap_or(0);
-        //     let m = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
-        //     print!("{} {} ", n, m);
-        // }
-        // for api in STDIO_API_NAMES {
-        //     assert!(!counts.contains_key(&(api.to_string(), true)));
-        //     let n = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
-        //     print!("{} ", n);
-        // }
-        // println!();
+        for api in FILE_API_NAMES {
+            let n = counts.get(&(api.to_string(), true)).copied().unwrap_or(0);
+            let m = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
+            print!("{} {} ", n, m);
+        }
+        for api in STDIO_API_NAMES {
+            assert!(!counts.contains_key(&(api.to_string(), true)));
+            let n = counts.get(&(api.to_string(), false)).copied().unwrap_or(0);
+            print!("{} ", n);
+        }
+        println!();
     }
 }
 
@@ -160,14 +161,14 @@ impl<'tcx> ExternVisitor<'tcx> {
                     if self.is_std_io(arg) {
                         continue;
                     }
-                    // println!(
-                    //     "{}",
-                    //     self.tcx
-                    //         .sess
-                    //         .source_map()
-                    //         .span_to_snippet(arg.span)
-                    //         .unwrap()
-                    // );
+                    info!(
+                        "{}",
+                        self.tcx
+                            .sess
+                            .source_map()
+                            .span_to_snippet(arg.span)
+                            .unwrap()
+                    );
                 }
             }
             ExprKind::Field(e, _) => {
@@ -252,9 +253,12 @@ impl<'tcx> ExternVisitor<'tcx> {
     fn has_file_ty(&self, ty: &'tcx rustc_hir::Ty<'tcx>) -> bool {
         let mut visitor = TyVisitor::new(self.tcx);
         visitor.visit_ty(ty);
-        // if visitor.has_file {
-        //     println!("{}", self.tcx.sess.source_map().span_to_snippet(ty.span).unwrap());
-        // }
+        if visitor.has_file {
+            info!(
+                "{}",
+                self.tcx.sess.source_map().span_to_snippet(ty.span).unwrap()
+            );
+        }
         visitor.has_file
     }
 
