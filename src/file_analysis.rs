@@ -3,6 +3,9 @@ use std::ops::ControlFlow;
 use lazy_static::lazy_static;
 use rustc_abi::{FieldIdx, FIRST_VARIANT};
 use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
+use rustc_data_structures::graph::{
+    scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
+};
 use rustc_hash::FxHashMap;
 use rustc_hir::{
     def_id::{DefId, LocalDefId},
@@ -10,7 +13,7 @@ use rustc_hir::{
     ItemKind,
 };
 use rustc_index::{
-    bit_set::{BitSet, HybridBitSet},
+    bit_set::{BitSet, HybridBitSet, HybridIter},
     Idx, IndexVec,
 };
 use rustc_middle::{
@@ -90,7 +93,7 @@ impl Pass for FileAnalysis {
             steensgaard: &self.steensgaard,
             fn_ty_functions,
             loc_ind_map,
-            graph: Graph::new(locs.len()),
+            graph: Graph::new(locs.len(), 4),
         };
 
         for item_id in hir.items() {
@@ -116,6 +119,9 @@ impl Pass for FileAnalysis {
                 analyzer.transfer_term(bbd.terminator(), ctx);
             }
         }
+
+        let sol = analyzer.graph.solve();
+        println!("{:?}", sol);
     }
 }
 
@@ -124,7 +130,7 @@ struct Analyzer<'a, 'tcx> {
     loc_ind_map: FxHashMap<Loc, LocId>,
     fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
     steensgaard: &'a steensgaard::AnalysisResult,
-    graph: Graph,
+    graph: Graph<LocId, Permission>,
 }
 
 #[derive(Clone, Copy)]
@@ -264,7 +270,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(arg, ctx);
-                                    self.graph.add_permission(x, permission);
+                                    self.graph.add_solution(x, permission);
                                     break;
                                 }
                             }
@@ -288,7 +294,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let sig = self.tcx.fn_sig(callee).skip_binder().skip_binder();
         for (i, (t, arg)) in sig.inputs().iter().zip(args).enumerate() {
             if let Some(variance) = file_type_variance(*t, self.tcx) {
-                let l = Loc::Var(callee, Local::from_usize(i + 1));
+                let l = Loc::Var(callee, Local::new(i + 1));
                 let l = self.loc_ind_map[&l];
                 let r = self.transfer_operand(arg, ctx);
                 self.graph.add_edge(l, r, variance);
@@ -367,54 +373,175 @@ impl Idx for Permission {
     }
 }
 
-struct Graph {
-    permissions: IndexVec<LocId, BitSet<Permission>>,
-    edges: IndexVec<LocId, HybridBitSet<LocId>>,
+struct Graph<V: Idx, T: Idx> {
+    solutions: IndexVec<V, BitSet<T>>,
+    edges: IndexVec<V, HybridBitSet<V>>,
 }
 
-impl Graph {
-    fn new(size: usize) -> Self {
+impl<V: Idx, T: Idx> Graph<V, T> {
+    fn new(size: usize, tok_num: usize) -> Self {
         Self {
-            permissions: IndexVec::from_raw(vec![BitSet::new_empty(4); size]),
+            solutions: IndexVec::from_raw(vec![BitSet::new_empty(tok_num); size]),
             edges: IndexVec::from_raw(vec![HybridBitSet::new_empty(size); size]),
         }
     }
 
-    fn add_permission(&mut self, loc: LocId, permission: Permission) {
-        info!("{:?} {:?}", loc, permission);
-        self.permissions[loc].insert(permission);
+    fn add_solution(&mut self, v: V, t: T) {
+        self.solutions[v].insert(t);
     }
 
-    fn add_edge(&mut self, from: LocId, to: LocId, v: Variance) {
+    fn add_edge(&mut self, from: V, to: V, v: Variance) {
         match v {
             Variance::Covariant => {
-                info!("{:?} --> {:?}", from, to);
                 self.edges[from].insert(to);
             }
             Variance::Invariant => {
-                info!("{:?} <-> {:?}", from, to);
                 self.edges[from].insert(to);
                 self.edges[to].insert(from);
             }
         }
     }
-}
 
-#[derive(Default)]
-struct AdtVisitor {
-    adts: Vec<LocalDefId>,
-}
+    fn solve(self) -> IndexVec<V, BitSet<T>> {
+        let Self {
+            mut solutions,
+            mut edges,
+        } = self;
+        let len = solutions.len();
 
-impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for AdtVisitor {
-    type BreakTy = ();
+        let mut deltas = solutions.clone();
+        let mut id_to_rep: IndexVec<V, _> = IndexVec::from_raw((0..len).map(V::new).collect());
 
-    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
-        if let TyKind::Adt(adt_def, _) = t.kind() {
-            if let Some(def_id) = adt_def.did().as_local() {
-                self.adts.push(def_id);
+        while deltas.iter().any(|s| !s.is_empty()) {
+            let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&edges));
+
+            let mut components = vec![HybridBitSet::new_empty(len); sccs.num_sccs()];
+            for i in solutions.indices() {
+                let scc = sccs.scc(i);
+                components[scc.index()].insert(i);
+            }
+
+            let mut scc_to_rep = vec![];
+            let mut cycles = vec![];
+            let mut new_id_to_rep = FxHashMap::default();
+            for component in components.iter() {
+                let rep = component.iter().next().unwrap();
+                scc_to_rep.push(rep);
+                if contains_multiple(component) {
+                    cycles.push((rep, component));
+                    for id in component.iter() {
+                        if id != rep {
+                            new_id_to_rep.insert(id, rep);
+                        }
+                    }
+                }
+            }
+
+            let mut po = vec![];
+            for scc in sccs.all_sccs() {
+                po.push(scc_to_rep[scc]);
+            }
+
+            if sccs.num_sccs() != len {
+                // update id_to_rep
+                for rep in &mut id_to_rep {
+                    if let Some(new_rep) = new_id_to_rep.get(rep) {
+                        *rep = *new_rep;
+                    }
+                }
+
+                // update deltas
+                for (rep, ids) in &cycles {
+                    for id in ids.iter() {
+                        if *rep != id {
+                            let set = std::mem::replace(&mut deltas[id], BitSet::new_empty(len));
+                            deltas[*rep].union(&set);
+                        }
+                    }
+                }
+
+                // update solutions
+                for (rep, ids) in &cycles {
+                    let mut intersection = BitSet::new_empty(len);
+                    intersection.insert_all();
+                    for id in ids.iter() {
+                        intersection.intersect(&solutions[id]);
+                        if *rep != id {
+                            let set = std::mem::replace(&mut solutions[id], BitSet::new_empty(len));
+                            solutions[*rep].union(&set);
+                        }
+                    }
+                    let mut union = solutions[*rep].clone();
+                    union.subtract(&intersection);
+                    deltas[*rep].union(&union);
+                }
+
+                // update edges
+                edges = IndexVec::from_raw(vec![HybridBitSet::new_empty(len); len]);
+                for (scc, rep) in scc_to_rep.iter().enumerate() {
+                    let succs = &mut edges[*rep];
+                    for succ in sccs.successors(scc) {
+                        succs.insert(scc_to_rep[*succ]);
+                    }
+                }
+            }
+
+            for v in po.into_iter().rev() {
+                if deltas[v].is_empty() {
+                    continue;
+                }
+                let delta = std::mem::replace(&mut deltas[v], BitSet::new_empty(len));
+
+                for l in edges[v].iter() {
+                    if l == v {
+                        continue;
+                    }
+                    for f in delta.iter() {
+                        if solutions[l].insert(f) {
+                            deltas[l].insert(f);
+                        }
+                    }
+                }
             }
         }
-        t.super_visit_with(self)
+
+        for (id, rep) in id_to_rep.iter_enumerated() {
+            if id != *rep {
+                solutions[id] = solutions[*rep].clone();
+            }
+        }
+
+        solutions
+    }
+}
+
+#[inline]
+fn contains_multiple<T: Idx>(set: &HybridBitSet<T>) -> bool {
+    let mut iter = set.iter();
+    iter.next().is_some() && iter.next().is_some()
+}
+
+#[repr(transparent)]
+struct VecBitSet<'a, T: Idx>(&'a IndexVec<T, HybridBitSet<T>>);
+
+impl<T: Idx> DirectedGraph for VecBitSet<'_, T> {
+    type Node = T;
+}
+
+impl<T: Idx> WithNumNodes for VecBitSet<'_, T> {
+    fn num_nodes(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<'a, T: Idx> GraphSuccessors<'_> for VecBitSet<'a, T> {
+    type Item = T;
+    type Iter = HybridIter<'a, T>;
+}
+
+impl<T: Idx> WithSuccessors for VecBitSet<'_, T> {
+    fn successors(&self, node: Self::Node) -> <Self as GraphSuccessors<'_>>::Iter {
+        self.0[node].iter()
     }
 }
 
