@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use rustc_hir::{
     def_id::{DefId, LocalDefId},
     definitions::DefPathData,
-    ItemKind,
+    ItemKind, Node,
 };
 use rustc_index::{
     bit_set::{BitSet, HybridBitSet, HybridIter},
@@ -40,9 +40,10 @@ impl Pass for FileAnalysis {
         info!("\n{:?}", self.steensgaard);
         let hir = tcx.hir();
 
-        let mut locs: IndexVec<LocId, Loc> = IndexVec::new();
         let mut fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>> =
             FxHashMap::default();
+        let mut locs: IndexVec<LocId, Loc> =
+            IndexVec::from_raw(vec![Loc::Stdin, Loc::Stdout, Loc::Stderr]);
 
         for item_id in hir.items() {
             let item = hir.item(item_id);
@@ -88,12 +89,17 @@ impl Pass for FileAnalysis {
         }
         let loc_ind_map: FxHashMap<_, _> = locs.iter_enumerated().map(|(i, l)| (*l, i)).collect();
 
+        let mut origin_graph: Graph<LocId, Origin> = Graph::new(locs.len(), 6);
+        origin_graph.add_solution(loc_ind_map[&Loc::Stdin], Origin::Stdin);
+        origin_graph.add_solution(loc_ind_map[&Loc::Stdout], Origin::Stdout);
+        origin_graph.add_solution(loc_ind_map[&Loc::Stderr], Origin::Stderr);
         let mut analyzer = Analyzer {
             tcx,
             steensgaard: &self.steensgaard,
             fn_ty_functions,
             loc_ind_map,
-            graph: Graph::new(locs.len(), 4),
+            permission_graph: Graph::new(locs.len(), 4),
+            origin_graph,
         };
 
         for item_id in hir.items() {
@@ -120,8 +126,14 @@ impl Pass for FileAnalysis {
             }
         }
 
-        let sol = analyzer.graph.solve();
-        println!("{:?}", sol);
+        let permissions = analyzer.permission_graph.solve();
+        let origins = analyzer.origin_graph.solve();
+
+        for (((i, loc), permissions), origins) in
+            locs.iter_enumerated().zip(permissions).zip(origins)
+        {
+            info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
+        }
     }
 }
 
@@ -130,7 +142,8 @@ struct Analyzer<'a, 'tcx> {
     loc_ind_map: FxHashMap<Loc, LocId>,
     fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
     steensgaard: &'a steensgaard::AnalysisResult,
-    graph: Graph<LocId, Permission>,
+    permission_graph: Graph<LocId, Permission>,
+    origin_graph: Graph<LocId, Origin>,
 }
 
 #[derive(Clone, Copy)]
@@ -148,33 +161,34 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             match r {
                 Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
                     let r = self.transfer_operand(op, ctx);
-                    self.graph.add_edge(l, r, variance);
+                    self.assign(l, r, variance);
                 }
-                Rvalue::Cast(kind, op, _) => {
-                    if *kind == CastKind::PtrToPtr {
+                Rvalue::Cast(kind, op, _) => match kind {
+                    CastKind::PtrToPtr => {
                         let rty = op.ty(ctx.local_decls, self.tcx);
                         if contains_file_ty(rty, self.tcx) {
                             let r = self.transfer_operand(op, ctx);
-                            self.graph.add_edge(l, r, variance);
+                            self.assign(l, r, variance);
                         }
-                    } else {
-                        assert!(
-                            *kind == CastKind::PointerFromExposedAddress
-                                || !contains_file_ty(ty, self.tcx)
-                        );
                     }
-                }
+                    CastKind::PointerFromExposedAddress => {
+                        self.add_origin(l, Origin::Null);
+                    }
+                    _ => {
+                        assert!(!contains_file_ty(ty, self.tcx));
+                    }
+                },
                 Rvalue::Ref(_, _, place)
                 | Rvalue::AddressOf(_, place)
                 | Rvalue::CopyForDeref(place) => {
                     let r = self.transfer_place(*place, ctx);
-                    self.graph.add_edge(l, r, variance);
+                    self.assign(l, r, variance);
                 }
                 Rvalue::Aggregate(box kind, fields) => {
                     assert!(matches!(kind, AggregateKind::Array(_)));
                     for f in fields {
                         let r = self.transfer_operand(f, ctx);
-                        self.graph.add_edge(l, r, variance);
+                        self.assign(l, r, variance);
                     }
                 }
                 _ => {}
@@ -188,7 +202,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
                     let l = self.loc_ind_map[&l];
                     let r = self.transfer_operand(f, ctx);
-                    self.graph.add_edge(l, r, variance);
+                    self.assign(l, r, variance);
                 }
             } else {
                 for (idx, f) in fields.iter_enumerated() {
@@ -197,7 +211,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         let l = Loc::Field(def_id.expect_local(), idx);
                         let l = self.loc_ind_map[&l];
                         let r = self.transfer_operand(f, ctx);
-                        self.graph.add_edge(l, r, variance);
+                        self.assign(l, r, variance);
                     }
                 }
             }
@@ -231,7 +245,20 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let ConstValue::Scalar(scalar) = value else { panic!() };
         let Scalar::Ptr(ptr, _) = scalar else { panic!() };
         let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance) else { panic!() };
-        let loc = Loc::Var(def_id.expect_local(), RETURN_PLACE);
+        let def_id = def_id.expect_local();
+        let node = self.tcx.hir().find_by_def_id(def_id).unwrap();
+        let loc = if matches!(node, Node::ForeignItem(_)) {
+            let key = self.tcx.def_key(def_id);
+            let DefPathData::ValueNs(name) = key.disambiguated_data.data else { panic!() };
+            match name.as_str() {
+                "stdin" => Loc::Stdin,
+                "stdout" => Loc::Stdout,
+                "stderr" => Loc::Stderr,
+                x => panic!("{}", x),
+            }
+        } else {
+            Loc::Var(def_id, RETURN_PLACE)
+        };
         self.loc_ind_map[&loc]
     }
 
@@ -264,13 +291,20 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
                 if let Some(kind) = file_api_kind(def_id, self.tcx) {
                     match kind {
-                        FileApiKind::Open => {}
+                        FileApiKind::FileOpen => {
+                            let x = self.transfer_place(*destination, ctx);
+                            self.add_origin(x, Origin::File);
+                        }
+                        FileApiKind::PipeOpen => {
+                            let x = self.transfer_place(*destination, ctx);
+                            self.add_origin(x, Origin::Pipe);
+                        }
                         FileApiKind::Operation(permission) => {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(arg, ctx);
-                                    self.graph.add_solution(x, permission);
+                                    self.add_permission(x, permission);
                                     break;
                                 }
                             }
@@ -297,14 +331,40 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 let l = Loc::Var(callee, Local::new(i + 1));
                 let l = self.loc_ind_map[&l];
                 let r = self.transfer_operand(arg, ctx);
-                self.graph.add_edge(l, r, variance);
+                self.assign(l, r, variance);
             }
         }
         if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
             let l = self.transfer_place(destination, ctx);
             let r = Loc::Var(callee, RETURN_PLACE);
             let r = self.loc_ind_map[&r];
-            self.graph.add_edge(l, r, variance);
+            self.assign(l, r, variance);
+        }
+    }
+
+    fn add_permission(&mut self, loc: LocId, permission: Permission) {
+        info!("{:?} {:?}", loc, permission);
+        self.permission_graph.add_solution(loc, permission);
+    }
+
+    fn add_origin(&mut self, loc: LocId, origin: Origin) {
+        info!("{:?} {:?}", loc, origin);
+        self.origin_graph.add_solution(loc, origin);
+    }
+
+    fn assign(&mut self, lhs: LocId, rhs: LocId, v: Variance) {
+        info!("{:?} := {:?} {:?}", lhs, rhs, v);
+        match v {
+            Variance::Covariant => {
+                self.permission_graph.add_edge(lhs, rhs);
+                self.origin_graph.add_edge(rhs, lhs);
+            }
+            Variance::Invariant => {
+                self.permission_graph.add_edge(lhs, rhs);
+                self.permission_graph.add_edge(rhs, lhs);
+                self.origin_graph.add_edge(lhs, rhs);
+                self.origin_graph.add_edge(rhs, lhs);
+            }
         }
     }
 }
@@ -340,6 +400,9 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Loc {
+    Stdin,
+    Stdout,
+    Stderr,
     Var(LocalDefId, Local),
     Field(LocalDefId, FieldIdx),
 }
@@ -373,7 +436,34 @@ impl Idx for Permission {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum Origin {
+    Null = 0,
+    File = 1,
+    Stdin = 2,
+    Stdout = 3,
+    Stderr = 4,
+    Pipe = 5,
+}
+
+impl Idx for Origin {
+    #[inline]
+    fn new(idx: usize) -> Self {
+        if idx > 5 {
+            panic!()
+        }
+        unsafe { std::mem::transmute(idx as u8) }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self as _
+    }
+}
+
 struct Graph<V: Idx, T: Idx> {
+    tok_num: usize,
     solutions: IndexVec<V, BitSet<T>>,
     edges: IndexVec<V, HybridBitSet<V>>,
 }
@@ -381,6 +471,7 @@ struct Graph<V: Idx, T: Idx> {
 impl<V: Idx, T: Idx> Graph<V, T> {
     fn new(size: usize, tok_num: usize) -> Self {
         Self {
+            tok_num,
             solutions: IndexVec::from_raw(vec![BitSet::new_empty(tok_num); size]),
             edges: IndexVec::from_raw(vec![HybridBitSet::new_empty(size); size]),
         }
@@ -390,32 +481,25 @@ impl<V: Idx, T: Idx> Graph<V, T> {
         self.solutions[v].insert(t);
     }
 
-    fn add_edge(&mut self, from: V, to: V, v: Variance) {
-        match v {
-            Variance::Covariant => {
-                self.edges[from].insert(to);
-            }
-            Variance::Invariant => {
-                self.edges[from].insert(to);
-                self.edges[to].insert(from);
-            }
-        }
+    fn add_edge(&mut self, from: V, to: V) {
+        self.edges[from].insert(to);
     }
 
     fn solve(self) -> IndexVec<V, BitSet<T>> {
         let Self {
+            tok_num,
             mut solutions,
             mut edges,
         } = self;
-        let len = solutions.len();
+        let size = solutions.len();
 
         let mut deltas = solutions.clone();
-        let mut id_to_rep: IndexVec<V, _> = IndexVec::from_raw((0..len).map(V::new).collect());
+        let mut id_to_rep: IndexVec<V, _> = IndexVec::from_raw((0..size).map(V::new).collect());
 
         while deltas.iter().any(|s| !s.is_empty()) {
             let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&edges));
 
-            let mut components = vec![HybridBitSet::new_empty(len); sccs.num_sccs()];
+            let mut components = vec![HybridBitSet::new_empty(size); sccs.num_sccs()];
             for i in solutions.indices() {
                 let scc = sccs.scc(i);
                 components[scc.index()].insert(i);
@@ -442,7 +526,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 po.push(scc_to_rep[scc]);
             }
 
-            if sccs.num_sccs() != len {
+            if sccs.num_sccs() != size {
                 // update id_to_rep
                 for rep in &mut id_to_rep {
                     if let Some(new_rep) = new_id_to_rep.get(rep) {
@@ -454,7 +538,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 for (rep, ids) in &cycles {
                     for id in ids.iter() {
                         if *rep != id {
-                            let set = std::mem::replace(&mut deltas[id], BitSet::new_empty(len));
+                            let set = std::mem::replace(&mut deltas[id], BitSet::new_empty(size));
                             deltas[*rep].union(&set);
                         }
                     }
@@ -462,12 +546,13 @@ impl<V: Idx, T: Idx> Graph<V, T> {
 
                 // update solutions
                 for (rep, ids) in &cycles {
-                    let mut intersection = BitSet::new_empty(len);
+                    let mut intersection = BitSet::new_empty(tok_num);
                     intersection.insert_all();
                     for id in ids.iter() {
                         intersection.intersect(&solutions[id]);
                         if *rep != id {
-                            let set = std::mem::replace(&mut solutions[id], BitSet::new_empty(len));
+                            let set =
+                                std::mem::replace(&mut solutions[id], BitSet::new_empty(tok_num));
                             solutions[*rep].union(&set);
                         }
                     }
@@ -477,7 +562,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 }
 
                 // update edges
-                edges = IndexVec::from_raw(vec![HybridBitSet::new_empty(len); len]);
+                edges = IndexVec::from_raw(vec![HybridBitSet::new_empty(size); size]);
                 for (scc, rep) in scc_to_rep.iter().enumerate() {
                     let succs = &mut edges[*rep];
                     for succ in sccs.successors(scc) {
@@ -490,7 +575,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 if deltas[v].is_empty() {
                     continue;
                 }
-                let delta = std::mem::replace(&mut deltas[v], BitSet::new_empty(len));
+                let delta = std::mem::replace(&mut deltas[v], BitSet::new_empty(size));
 
                 for l in edges[v].iter() {
                     if l == v {
@@ -587,15 +672,18 @@ fn strip_unlocked(name: &str) -> &str {
 
 #[derive(Debug, Clone, Copy)]
 enum FileApiKind {
-    Open,
+    FileOpen,
+    PipeOpen,
     Operation(Permission),
     NotSupported,
 }
 
 static FILE_API_NAMES: [(&str, FileApiKind); 46] = [
-    ("fopen", FileApiKind::Open),
-    ("tmpfile", FileApiKind::Open),
+    ("fopen", FileApiKind::FileOpen),
+    ("tmpfile", FileApiKind::FileOpen),
     ("fclose", FileApiKind::Operation(Permission::Close)),
+    ("popen", FileApiKind::PipeOpen),
+    ("pclose", FileApiKind::Operation(Permission::Close)),
     ("putc", FileApiKind::Operation(Permission::Write)),
     ("fputc", FileApiKind::Operation(Permission::Write)),
     ("fputs", FileApiKind::Operation(Permission::Write)),
@@ -619,8 +707,6 @@ static FILE_API_NAMES: [(&str, FileApiKind); 46] = [
     ("ungetc", FileApiKind::NotSupported),
     ("funlockfile", FileApiKind::NotSupported),
     ("flockfile", FileApiKind::NotSupported),
-    ("popen", FileApiKind::NotSupported),
-    ("pclose", FileApiKind::NotSupported),
     ("fileno", FileApiKind::NotSupported),
     ("fdopen", FileApiKind::NotSupported),
     ("ferror", FileApiKind::NotSupported),
