@@ -18,7 +18,9 @@ fn main() {
         let log_file = File::create(log).unwrap();
         tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
+            .without_time()
             .with_ansi(false)
+            .with_level(false)
             .with_writer(log_file)
             .init();
     }

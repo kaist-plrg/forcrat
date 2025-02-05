@@ -1,7 +1,8 @@
+use tracing::info;
 use std::ops::ControlFlow;
 
-use rustc_abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
-use rustc_ast::Mutability;
+use lazy_static::lazy_static;
+use rustc_abi::{FieldIdx, FIRST_VARIANT};
 use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
 use rustc_hash::FxHashMap;
 use rustc_hir::{
@@ -66,7 +67,9 @@ impl Pass for FileAnalysis {
             }
         }
 
-        println!("{:?}", locs);
+        for (i, loc) in locs.iter_enumerated() {
+            info!("{:?}: {:?}", i, loc);
+        }
         let loc_ind_map: FxHashMap<_, _> = locs.iter_enumerated().map(|(i, l)| (*l, i)).collect();
 
         let mut analyzer = Analyzer {
@@ -91,9 +94,11 @@ impl Pass for FileAnalysis {
             };
             for bbd in body.basic_blocks.iter() {
                 for stmt in &bbd.statements {
+                    info!("{:?}", stmt);
                     analyzer.transfer_stmt(stmt, ctx);
                 }
-                // analyzer.transfer_term(local_def_id, &body.local_decls, bbd.terminator());
+                info!("{:?}", bbd.terminator().kind);
+                analyzer.transfer_term(bbd.terminator(), ctx);
             }
         }
     }
@@ -114,7 +119,6 @@ struct Ctx<'a, 'tcx> {
 impl<'tcx> Analyzer<'tcx> {
     fn transfer_stmt(&mut self, stmt: &Statement<'tcx>, ctx: Ctx<'_, 'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
-        println!("{:?}", stmt);
         let ty = l.ty(ctx.local_decls, self.tcx).ty;
         if let Some(variance) = file_type_variance(ty, self.tcx) {
             let l = self.transfer_place(*l, ctx);
@@ -232,6 +236,34 @@ impl<'tcx> Analyzer<'tcx> {
         // let ty = destination.ty(ctx.local_decls, self.tcx).ty;
         // let mut visitor = FileTypeVisitor { tcx: self.tcx };
         // ty.visit_with(&mut visitor);
+        match func {
+            Operand::Copy(func) | Operand::Move(func) => {
+                assert!(func.projection.is_empty());
+                todo!();
+            }
+            Operand::Constant(box constant) => {
+                let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                assert!(matches!(value, ConstValue::ZeroSized));
+                let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                if let Some(kind) = file_api_kind(def_id, self.tcx) {
+                    match kind {
+                        FileApiKind::Open => {}
+                        FileApiKind::Operation(permission) => {
+                            let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
+                            for (t, arg) in sig.inputs().iter().zip(args) {
+                                if contains_file_ty(*t, self.tcx) {
+                                    let x = self.transfer_operand(arg, ctx);
+                                    self.graph.add_permission(x, permission);
+                                    break;
+                                }
+                            }
+                        }
+                        FileApiKind::NotSupported => panic!(),
+                    }
+                } else {
+                }
+            }
+        }
     }
 }
 
@@ -316,21 +348,22 @@ impl Graph {
     }
 
     fn add_permission(&mut self, loc: LocId, permission: Permission) {
+        info!("{:?} {:?}", loc, permission);
         self.permissions[loc].insert(permission);
     }
 
     fn add_edge(&mut self, from: LocId, to: LocId, v: Variance) {
         match v {
             Variance::Covariant => {
-                println!("{:?} :> {:?}", from, to);
+                info!("{:?} --> {:?}", from, to);
                 self.edges[from].insert(to);
             }
             Variance::Contravariant => {
-                println!("{:?} <: {:?}", from, to);
+                info!("{:?} <-- {:?}", from, to);
                 self.edges[to].insert(from);
             }
             Variance::Invariant => {
-                println!("{:?} == {:?}", from, to);
+                info!("{:?} <-> {:?}", from, to);
                 self.edges[from].insert(to);
                 self.edges[to].insert(from);
             }
@@ -382,4 +415,77 @@ fn is_file_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
     let key = tcx.def_key(id);
     let DefPathData::TypeNs(name) = key.disambiguated_data.data else { return false };
     name.as_str() == "_IO_FILE"
+}
+
+fn file_api_kind(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<FileApiKind> {
+    let key = tcx.def_key(id);
+    let DefPathData::ValueNs(name) = key.disambiguated_data.data else { return None };
+    FILE_API_NAME_SET
+        .get(strip_unlocked(name.as_str()))
+        .copied()
+}
+
+fn strip_unlocked(name: &str) -> &str {
+    name.strip_suffix("_unlocked").unwrap_or(name)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileApiKind {
+    Open,
+    Operation(Permission),
+    NotSupported,
+}
+
+static FILE_API_NAMES: [(&str, FileApiKind); 46] = [
+    ("fopen", FileApiKind::Open),
+    ("tmpfile", FileApiKind::Open),
+    ("fclose", FileApiKind::Operation(Permission::Close)),
+    ("putc", FileApiKind::Operation(Permission::Write)),
+    ("fputc", FileApiKind::Operation(Permission::Write)),
+    ("fputs", FileApiKind::Operation(Permission::Write)),
+    ("fprintf", FileApiKind::Operation(Permission::Write)),
+    ("vfprintf", FileApiKind::Operation(Permission::Write)),
+    ("fwrite", FileApiKind::Operation(Permission::Write)),
+    ("fflush", FileApiKind::Operation(Permission::Write)),
+    ("getc", FileApiKind::Operation(Permission::Read)),
+    ("fgetc", FileApiKind::Operation(Permission::Read)),
+    ("fgets", FileApiKind::Operation(Permission::Read)),
+    ("fscanf", FileApiKind::Operation(Permission::Read)),
+    ("vfscanf", FileApiKind::Operation(Permission::Read)),
+    ("getline", FileApiKind::Operation(Permission::Read)),
+    ("getdelim", FileApiKind::Operation(Permission::Read)),
+    ("fread", FileApiKind::Operation(Permission::Read)),
+    ("fseek", FileApiKind::Operation(Permission::Read)),
+    ("fseeko", FileApiKind::Operation(Permission::Read)),
+    ("ftell", FileApiKind::Operation(Permission::Read)),
+    ("ftello", FileApiKind::Operation(Permission::Read)),
+    ("rewind", FileApiKind::Operation(Permission::Read)),
+    ("ungetc", FileApiKind::NotSupported),
+    ("funlockfile", FileApiKind::NotSupported),
+    ("flockfile", FileApiKind::NotSupported),
+    ("popen", FileApiKind::NotSupported),
+    ("pclose", FileApiKind::NotSupported),
+    ("fileno", FileApiKind::NotSupported),
+    ("fdopen", FileApiKind::NotSupported),
+    ("ferror", FileApiKind::NotSupported),
+    ("feof", FileApiKind::NotSupported),
+    ("clearerr", FileApiKind::NotSupported),
+    ("freopen", FileApiKind::NotSupported),
+    ("setvbuf", FileApiKind::NotSupported),
+    ("setbuf", FileApiKind::NotSupported),
+    ("setlinebuf", FileApiKind::NotSupported),
+    ("fpurge", FileApiKind::NotSupported),
+    ("endmntent", FileApiKind::NotSupported),
+    ("getmntent", FileApiKind::NotSupported),
+    ("setmntent", FileApiKind::NotSupported),
+    ("fgetpos", FileApiKind::NotSupported),
+    ("fsetpos", FileApiKind::NotSupported),
+    ("__fpending", FileApiKind::NotSupported),
+    ("__freading", FileApiKind::NotSupported),
+    ("__fwriting", FileApiKind::NotSupported),
+];
+
+lazy_static! {
+    static ref FILE_API_NAME_SET: FxHashMap<&'static str, FileApiKind> =
+        FILE_API_NAMES.iter().copied().collect();
 }
