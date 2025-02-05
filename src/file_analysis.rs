@@ -1,4 +1,3 @@
-use tracing::info;
 use std::ops::ControlFlow;
 
 use lazy_static::lazy_static;
@@ -22,6 +21,7 @@ use rustc_middle::{
     query::{IntoQueryParam, Key},
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeVisitable, TypeVisitor},
 };
+use tracing::info;
 
 use crate::{compile_util::Pass, rustc_middle::ty::TypeSuperVisitable, steensgaard};
 
@@ -245,11 +245,11 @@ impl<'tcx> Analyzer<'tcx> {
                 let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
                 assert!(matches!(value, ConstValue::ZeroSized));
                 let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                 if let Some(kind) = file_api_kind(def_id, self.tcx) {
                     match kind {
                         FileApiKind::Open => {}
                         FileApiKind::Operation(permission) => {
-                            let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(arg, ctx);
@@ -260,7 +260,21 @@ impl<'tcx> Analyzer<'tcx> {
                         }
                         FileApiKind::NotSupported => panic!(),
                     }
-                } else {
+                } else if let Some(def_id) = def_id.as_local() {
+                    for (i, (t, arg)) in sig.inputs().iter().zip(args).enumerate() {
+                        if let Some(variance) = file_type_variance(*t, self.tcx) {
+                            let l = Loc::Var(def_id, Local::from_usize(i + 1));
+                            let l = self.loc_ind_map[&l];
+                            let r = self.transfer_operand(arg, ctx);
+                            self.graph.add_edge(l, r, variance);
+                        }
+                    }
+                    if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
+                        let l = self.transfer_place(*destination, ctx);
+                        let r = Loc::Var(def_id, RETURN_PLACE);
+                        let r = self.loc_ind_map[&r];
+                        self.graph.add_edge(l, r, variance);
+                    }
                 }
             }
         }
