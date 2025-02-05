@@ -29,6 +29,7 @@
 #![warn(variant_size_differences)]
 #![feature(rustc_private)]
 #![feature(box_patterns)]
+#![feature(min_specialization)]
 
 extern crate rustc_abi;
 extern crate rustc_ast;
@@ -45,9 +46,13 @@ extern crate rustc_index;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_mir_dataflow;
+extern crate rustc_serialize;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_type_ir;
 
 pub mod compile_util;
+pub mod disjoint_set;
 pub mod extern_finder;
+pub mod file_analysis;
+pub mod steensgaard;

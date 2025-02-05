@@ -24,5 +24,11 @@ fn main() {
     }
 
     let file = args.input.join("c2rust-lib.rs");
-    extern_finder::ExternFinder.run_on_path(&file);
+    let res = steensgaard::Steensgaard.run_on_path(&file);
+    // println!("{:?}", res.vars);
+    // println!("{:?}", res.var_tys);
+    // println!("{:?}", res.fns);
+    // println!("{:?}", res.fn_tys);
+    // extern_finder::ExternFinder.run_on_path(&file);
+    file_analysis::FileAnalysis { steensgaard: res }.run_on_path(&file);
 }
