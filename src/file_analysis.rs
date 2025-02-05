@@ -1,10 +1,11 @@
 use std::ops::ControlFlow;
 
-use etrace::some_or;
-use rustc_abi::{FieldIdx, VariantIdx};
+use rustc_abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
+use rustc_ast::Mutability;
+use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
 use rustc_hash::FxHashMap;
 use rustc_hir::{
-    def_id::{DefId, LocalDefId, LocalDefIdMap},
+    def_id::{DefId, LocalDefId},
     definitions::DefPathData,
     ItemKind,
 };
@@ -14,11 +15,11 @@ use rustc_index::{
 };
 use rustc_middle::{
     mir::{
-        AggregateKind, CastKind, Local, LocalDecl, Operand, Place, ProjectionElem, Rvalue,
-        Statement, StatementKind, Terminator, TerminatorKind,
+        AggregateKind, CastKind, Constant, ConstantKind, Local, LocalDecl, Operand, Place,
+        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
     },
     query::{IntoQueryParam, Key},
-    ty::{List, Ty, TyCtxt, TyKind, TypeVisitable, TypeVisitor},
+    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeVisitable, TypeVisitor},
 };
 
 use crate::{compile_util::Pass, rustc_middle::ty::TypeSuperVisitable, steensgaard};
@@ -48,11 +49,7 @@ impl Pass for FileAnalysis {
                     if item.ident.as_str() != "_IO_FILE" =>
                 {
                     let adt_def = tcx.adt_def(item.owner_id);
-                    for (i, fd) in adt_def
-                        .variant(VariantIdx::from_u32(0))
-                        .fields
-                        .iter_enumerated()
-                    {
+                    for (i, fd) in adt_def.variant(FIRST_VARIANT).fields.iter_enumerated() {
                         let ty = fd.ty(tcx, List::empty());
                         if contains_file_ty(ty, tcx) {
                             locs.push(Loc::Field(local_def_id, i));
@@ -119,71 +116,72 @@ impl<'tcx> Analyzer<'tcx> {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         println!("{:?}", stmt);
         let ty = l.ty(ctx.local_decls, self.tcx).ty;
-        match r {
-            Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
-                if contains_file_ty(ty, self.tcx) {
-                    if let Some(r) = self.transfer_operand(op, ctx) {
-                        let l = self.transfer_place(*l, ctx);
-                        self.graph.add_edge(l, r);
-                    }
+        if let Some(variance) = file_type_variance(ty, self.tcx) {
+            let l = self.transfer_place(*l, ctx);
+            match r {
+                Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
+                    let r = self.transfer_operand(op, ctx);
+                    self.graph.add_edge(l, r, variance);
                 }
-            }
-            Rvalue::Cast(kind, _, _) => {
-                assert!(
-                    *kind == CastKind::PointerFromExposedAddress || !contains_file_ty(ty, self.tcx)
-                );
-            }
-            Rvalue::Ref(_, _, place)
-            | Rvalue::AddressOf(_, place)
-            | Rvalue::CopyForDeref(place) => {
-                if contains_file_ty(ty, self.tcx) {
-                    let r = self.transfer_place(*place, ctx);
-                    let l = self.transfer_place(*l, ctx);
-                    self.graph.add_edge(l, r);
-                }
-            }
-            Rvalue::Aggregate(box kind, fields) => match kind {
-                AggregateKind::Array(_) => {
-                    if contains_file_ty(ty, self.tcx) {
-                        let l = self.transfer_place(*l, ctx);
-                        for f in fields {
-                            let r = some_or!(self.transfer_operand(f, ctx), continue);
-                            self.graph.add_edge(l, r);
-                        }
-                    }
-                }
-                AggregateKind::Adt(def_id, _, _, _, field_idx) => {
-                    if self.tcx.adt_def(def_id).is_union() {
-                        let f = &fields[FieldIdx::from_u32(0)];
-                        let ty = f.ty(ctx.local_decls, self.tcx);
-                        if contains_file_ty(ty, self.tcx) {
-                            if let Some(r) = self.transfer_operand(f, ctx) {
-                                let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
-                                let l = self.loc_ind_map[&l];
-                                self.graph.add_edge(l, r);
-                            }
+                Rvalue::Cast(kind, op, _) => {
+                    if *kind == CastKind::PtrToPtr {
+                        let rty = op.ty(ctx.local_decls, self.tcx);
+                        if contains_file_ty(rty, self.tcx) {
+                            let r = self.transfer_operand(op, ctx);
+                            self.graph.add_edge(l, r, variance);
                         }
                     } else {
-                        for (idx, f) in fields.iter_enumerated() {
-                            let ty = f.ty(ctx.local_decls, self.tcx);
-                            if contains_file_ty(ty, self.tcx) {
-                                if let Some(r) = self.transfer_operand(f, ctx) {
-                                    let l = Loc::Field(def_id.expect_local(), idx);
-                                    let l = self.loc_ind_map[&l];
-                                    self.graph.add_edge(l, r);
-                                }
-                            }
-                        }
+                        assert!(
+                            *kind == CastKind::PointerFromExposedAddress
+                                || !contains_file_ty(ty, self.tcx)
+                        );
+                    }
+                }
+                Rvalue::Ref(_, _, place)
+                | Rvalue::AddressOf(_, place)
+                | Rvalue::CopyForDeref(place) => {
+                    let r = self.transfer_place(*place, ctx);
+                    self.graph.add_edge(l, r, variance);
+                }
+                Rvalue::Aggregate(box kind, fields) => {
+                    assert!(matches!(kind, AggregateKind::Array(_)));
+                    for f in fields {
+                        let r = self.transfer_operand(f, ctx);
+                        self.graph.add_edge(l, r, variance);
                     }
                 }
                 _ => {}
-            },
-            _ => panic!(),
+            }
+        } else if let Rvalue::Aggregate(box kind, fields) = r {
+            let AggregateKind::Adt(def_id, _, _, _, field_idx) = kind else { panic!() };
+            if self.tcx.adt_def(def_id).is_union() {
+                let f = &fields[FieldIdx::from_u32(0)];
+                let ty = f.ty(ctx.local_decls, self.tcx);
+                if let Some(variance) = file_type_variance(ty, self.tcx) {
+                    let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
+                    let l = self.loc_ind_map[&l];
+                    let r = self.transfer_operand(f, ctx);
+                    self.graph.add_edge(l, r, variance);
+                }
+            } else {
+                for (idx, f) in fields.iter_enumerated() {
+                    let ty = f.ty(ctx.local_decls, self.tcx);
+                    if let Some(variance) = file_type_variance(ty, self.tcx) {
+                        let l = Loc::Field(def_id.expect_local(), idx);
+                        let l = self.loc_ind_map[&l];
+                        let r = self.transfer_operand(f, ctx);
+                        self.graph.add_edge(l, r, variance);
+                    }
+                }
+            }
         }
     }
 
-    fn transfer_operand(&self, operand: &Operand<'tcx>, ctx: Ctx<'_, 'tcx>) -> Option<LocId> {
-        operand.place().map(|p| self.transfer_place(p, ctx))
+    fn transfer_operand(&self, operand: &Operand<'tcx>, ctx: Ctx<'_, 'tcx>) -> LocId {
+        match operand {
+            Operand::Copy(p) | Operand::Move(p) => self.transfer_place(*p, ctx),
+            Operand::Constant(box c) => self.transfer_constant(*c),
+        }
     }
 
     fn transfer_place(&self, place: Place<'tcx>, ctx: Ctx<'_, 'tcx>) -> LocId {
@@ -201,6 +199,25 @@ impl<'tcx> Analyzer<'tcx> {
         self.loc_ind_map[&loc]
     }
 
+    fn transfer_constant(&self, constant: Constant<'tcx>) -> LocId {
+        let ConstantKind::Val(value, ty) = constant.literal else { panic!() };
+        match value {
+            ConstValue::Scalar(scalar) => {
+                let Scalar::Ptr(ptr, _) = scalar else { panic!() };
+                let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance) else {
+                    panic!()
+                };
+                let loc = Loc::Var(def_id.expect_local(), RETURN_PLACE);
+                self.loc_ind_map[&loc]
+            }
+            ConstValue::ZeroSized => {
+                let TyKind::FnDef(_def_id, _) = ty.kind() else { panic!() };
+                todo!()
+            }
+            _ => panic!(),
+        }
+    }
+
     fn transfer_term(&mut self, term: &Terminator<'tcx>, ctx: Ctx<'_, 'tcx>) {
         let TerminatorKind::Call {
             func,
@@ -215,6 +232,38 @@ impl<'tcx> Analyzer<'tcx> {
         // let ty = destination.ty(ctx.local_decls, self.tcx).ty;
         // let mut visitor = FileTypeVisitor { tcx: self.tcx };
         // ty.visit_with(&mut visitor);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variance {
+    Covariant,
+    Invariant,
+    Contravariant,
+}
+
+fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance> {
+    match ty.kind() {
+        TyKind::RawPtr(TypeAndMut { ty, mutbl }) | TyKind::Ref(_, ty, mutbl) => {
+            if let TyKind::Adt(adt_def, _) = ty.kind() {
+                if is_file_ty(adt_def.did(), tcx) {
+                    Some(Variance::Covariant)
+                } else {
+                    None
+                }
+            } else {
+                let v = file_type_variance(*ty, tcx)?;
+                if mutbl.is_not() {
+                    Some(v)
+                } else {
+                    Some(Variance::Invariant)
+                }
+            }
+        }
+        TyKind::Array(ty, _) | TyKind::Slice(ty) => file_type_variance(*ty, tcx),
+        TyKind::FnDef(_def_id, _) => todo!(),
+        TyKind::FnPtr(_sig) => todo!(),
+        _ => None,
     }
 }
 
@@ -270,9 +319,22 @@ impl Graph {
         self.permissions[loc].insert(permission);
     }
 
-    fn add_edge(&mut self, from: LocId, to: LocId) {
-        println!("{:?} -> {:?}", from, to);
-        self.edges[from].insert(to);
+    fn add_edge(&mut self, from: LocId, to: LocId, v: Variance) {
+        match v {
+            Variance::Covariant => {
+                println!("{:?} :> {:?}", from, to);
+                self.edges[from].insert(to);
+            }
+            Variance::Contravariant => {
+                println!("{:?} <: {:?}", from, to);
+                self.edges[to].insert(from);
+            }
+            Variance::Invariant => {
+                println!("{:?} == {:?}", from, to);
+                self.edges[from].insert(to);
+                self.edges[to].insert(from);
+            }
+        }
     }
 }
 
