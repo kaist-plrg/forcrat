@@ -6,17 +6,19 @@ use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
 use rustc_data_structures::graph::{
     scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
+    def::{DefKind, Res},
     def_id::{DefId, LocalDefId},
     definitions::DefPathData,
-    ItemKind, Node,
+    intravisit, ExprKind, ItemKind, Node, QPath,
 };
 use rustc_index::{
     bit_set::{BitSet, HybridBitSet, HybridIter},
     Idx, IndexVec,
 };
 use rustc_middle::{
+    hir::nested_filter,
     mir::{
         AggregateKind, CastKind, Constant, ConstantKind, Local, LocalDecl, Operand, Place,
         ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
@@ -24,6 +26,7 @@ use rustc_middle::{
     query::{IntoQueryParam, Key},
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeVisitable, TypeVisitor},
 };
+use rustc_span::Span;
 use tracing::info;
 
 use crate::{compile_util::Pass, rustc_middle::ty::TypeSuperVisitable, steensgaard};
@@ -40,8 +43,16 @@ impl Pass for FileAnalysis {
         info!("\n{:?}", self.steensgaard);
         let hir = tcx.hir();
 
+        let mut visitor = StdioArgVisitor::new(tcx);
+        hir.visit_all_item_likes_in_crate(&mut visitor);
+        let stdio_args = visitor.stdio_args;
+        for span in &stdio_args {
+            info!("{:?}", span);
+        }
+
         let mut fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>> =
             FxHashMap::default();
+        let mut stdio_arg_locs: FxHashSet<Loc> = FxHashSet::default();
         let mut locs: IndexVec<LocId, Loc> =
             IndexVec::from_raw(vec![Loc::Stdin, Loc::Stdout, Loc::Stderr]);
 
@@ -74,9 +85,21 @@ impl Pass for FileAnalysis {
                 }
                 _ => continue,
             };
+            for bbd in body.basic_blocks.iter() {
+                for stmt in &bbd.statements {
+                    if stdio_args.contains(&stmt.source_info.span) {
+                        let StatementKind::Assign(box (l, _)) = stmt.kind else { continue };
+                        assert!(l.projection.is_empty());
+                        stdio_arg_locs.insert(Loc::Var(local_def_id, l.local));
+                    }
+                }
+            }
             for (i, local_decl) in body.local_decls.iter_enumerated() {
                 if contains_file_ty(local_decl.ty, tcx) {
-                    locs.push(Loc::Var(local_def_id, i));
+                    let loc = Loc::Var(local_def_id, i);
+                    if !stdio_arg_locs.contains(&loc) {
+                        locs.push(loc);
+                    }
                 }
             }
         }
@@ -97,6 +120,7 @@ impl Pass for FileAnalysis {
             tcx,
             steensgaard: &self.steensgaard,
             fn_ty_functions,
+            stdio_arg_locs,
             loc_ind_map,
             permission_graph: Graph::new(locs.len(), 4),
             origin_graph,
@@ -105,6 +129,7 @@ impl Pass for FileAnalysis {
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
+            info!("{:?}", local_def_id);
             let body = match item.kind {
                 ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
                     tcx.optimized_mir(local_def_id)
@@ -139,6 +164,7 @@ impl Pass for FileAnalysis {
 
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    stdio_arg_locs: FxHashSet<Loc>,
     loc_ind_map: FxHashMap<Loc, LocId>,
     fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
     steensgaard: &'a steensgaard::AnalysisResult,
@@ -157,51 +183,56 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         let ty = l.ty(ctx.local_decls, self.tcx).ty;
         if let Some(variance) = file_type_variance(ty, self.tcx) {
-            let l = self.transfer_place(*l, ctx);
-            match r {
-                Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
-                    let r = self.transfer_operand(op, ctx);
-                    self.assign(l, r, variance);
-                }
-                Rvalue::Cast(kind, op, _) => match kind {
-                    CastKind::PtrToPtr => {
-                        let rty = op.ty(ctx.local_decls, self.tcx);
-                        if contains_file_ty(rty, self.tcx) {
-                            let r = self.transfer_operand(op, ctx);
+            if let Some(l) = self.transfer_place(*l, ctx) {
+                match r {
+                    Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
+                        if let Some(r) = self.transfer_operand(op, ctx) {
                             self.assign(l, r, variance);
                         }
                     }
-                    CastKind::PointerFromExposedAddress => {
-                        self.add_origin(l, Origin::Null);
-                    }
-                    _ => {
-                        assert!(!contains_file_ty(ty, self.tcx));
-                    }
-                },
-                Rvalue::Ref(_, _, place)
-                | Rvalue::AddressOf(_, place)
-                | Rvalue::CopyForDeref(place) => {
-                    let r = self.transfer_place(*place, ctx);
-                    self.assign(l, r, variance);
-                }
-                Rvalue::Aggregate(box kind, fields) => {
-                    assert!(matches!(kind, AggregateKind::Array(_)));
-                    for f in fields {
-                        let r = self.transfer_operand(f, ctx);
+                    Rvalue::Cast(kind, op, _) => match kind {
+                        CastKind::PtrToPtr => {
+                            let rty = op.ty(ctx.local_decls, self.tcx);
+                            if contains_file_ty(rty, self.tcx) {
+                                let r = self.transfer_operand(op, ctx).unwrap();
+                                self.assign(l, r, variance);
+                            }
+                        }
+                        CastKind::PointerFromExposedAddress => {
+                            self.add_origin(l, Origin::Null);
+                        }
+                        _ => {
+                            assert!(!contains_file_ty(ty, self.tcx));
+                        }
+                    },
+                    Rvalue::Ref(_, _, place)
+                    | Rvalue::AddressOf(_, place)
+                    | Rvalue::CopyForDeref(place) => {
+                        let r = self.transfer_place(*place, ctx).unwrap();
                         self.assign(l, r, variance);
                     }
+                    Rvalue::Aggregate(box kind, fields) => {
+                        assert!(matches!(kind, AggregateKind::Array(_)));
+                        for f in fields {
+                            let r = self.transfer_operand(f, ctx).unwrap();
+                            self.assign(l, r, variance);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        } else if let Rvalue::Aggregate(box kind, fields) = r {
-            let AggregateKind::Adt(def_id, _, _, _, field_idx) = kind else { panic!() };
+        } else if let Rvalue::Aggregate(
+            box AggregateKind::Adt(def_id, _, _, _, field_idx),
+            fields,
+        ) = r
+        {
             if self.tcx.adt_def(def_id).is_union() {
                 let f = &fields[FieldIdx::from_u32(0)];
                 let ty = f.ty(ctx.local_decls, self.tcx);
                 if let Some(variance) = file_type_variance(ty, self.tcx) {
                     let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
                     let l = self.loc_ind_map[&l];
-                    let r = self.transfer_operand(f, ctx);
+                    let r = self.transfer_operand(f, ctx).unwrap();
                     self.assign(l, r, variance);
                 }
             } else {
@@ -210,7 +241,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     if let Some(variance) = file_type_variance(ty, self.tcx) {
                         let l = Loc::Field(def_id.expect_local(), idx);
                         let l = self.loc_ind_map[&l];
-                        let r = self.transfer_operand(f, ctx);
+                        let r = self.transfer_operand(f, ctx).unwrap();
                         self.assign(l, r, variance);
                     }
                 }
@@ -218,18 +249,22 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         }
     }
 
-    fn transfer_operand(&self, operand: &Operand<'tcx>, ctx: Ctx<'_, 'tcx>) -> LocId {
+    fn transfer_operand(&self, operand: &Operand<'tcx>, ctx: Ctx<'_, 'tcx>) -> Option<LocId> {
         match operand {
             Operand::Copy(p) | Operand::Move(p) => self.transfer_place(*p, ctx),
-            Operand::Constant(box c) => self.transfer_constant(*c),
+            Operand::Constant(box c) => Some(self.transfer_constant(*c)),
         }
     }
 
-    fn transfer_place(&self, place: Place<'tcx>, ctx: Ctx<'_, 'tcx>) -> LocId {
+    fn transfer_place(&self, place: Place<'tcx>, ctx: Ctx<'_, 'tcx>) -> Option<LocId> {
         let loc = if place.projection.is_empty()
             || place.projection.len() == 1 && place.is_indirect_first_projection()
         {
-            Loc::Var(ctx.function, place.local)
+            let loc = Loc::Var(ctx.function, place.local);
+            if self.stdio_arg_locs.contains(&loc) {
+                return None;
+            }
+            loc
         } else {
             let (last, init) = place.projection.split_last().unwrap();
             let ty = Place::ty_from(place.local, init, ctx.local_decls, self.tcx).ty;
@@ -237,7 +272,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             let ProjectionElem::Field(f, _) = last else { panic!() };
             Loc::Field(def_id, *f)
         };
-        self.loc_ind_map[&loc]
+        Some(self.loc_ind_map[&loc])
     }
 
     fn transfer_constant(&self, constant: Constant<'tcx>) -> LocId {
@@ -279,10 +314,11 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 let ty = self
                     .steensgaard
                     .var_ty(self.steensgaard.local(ctx.function, callee.local));
-                let callees = self.fn_ty_functions[&ty.fn_ty].clone();
-                for callee in callees {
-                    assert!(file_api_kind(callee, self.tcx).is_none());
-                    self.transfer_non_api_call(callee, args, *destination, ctx);
+                if let Some(callees) = self.fn_ty_functions.get(&ty.fn_ty) {
+                    for callee in callees.clone() {
+                        assert!(file_api_kind(callee, self.tcx).is_none());
+                        self.transfer_non_api_call(callee, args, *destination, ctx);
+                    }
                 }
             }
             Operand::Constant(box constant) => {
@@ -292,19 +328,20 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 if let Some(kind) = file_api_kind(def_id, self.tcx) {
                     match kind {
                         FileApiKind::FileOpen => {
-                            let x = self.transfer_place(*destination, ctx);
+                            let x = self.transfer_place(*destination, ctx).unwrap();
                             self.add_origin(x, Origin::File);
                         }
                         FileApiKind::PipeOpen => {
-                            let x = self.transfer_place(*destination, ctx);
+                            let x = self.transfer_place(*destination, ctx).unwrap();
                             self.add_origin(x, Origin::Pipe);
                         }
                         FileApiKind::Operation(permission) => {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
-                                    let x = self.transfer_operand(arg, ctx);
-                                    self.add_permission(x, permission);
+                                    if let Some(x) = self.transfer_operand(arg, ctx) {
+                                        self.add_permission(x, permission);
+                                    }
                                     break;
                                 }
                             }
@@ -330,28 +367,31 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             if let Some(variance) = file_type_variance(*t, self.tcx) {
                 let l = Loc::Var(callee, Local::new(i + 1));
                 let l = self.loc_ind_map[&l];
-                let r = self.transfer_operand(arg, ctx);
+                let r = self.transfer_operand(arg, ctx).unwrap();
                 self.assign(l, r, variance);
             }
         }
         if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
-            let l = self.transfer_place(destination, ctx);
+            let l = self.transfer_place(destination, ctx).unwrap();
             let r = Loc::Var(callee, RETURN_PLACE);
             let r = self.loc_ind_map[&r];
             self.assign(l, r, variance);
         }
     }
 
+    #[inline]
     fn add_permission(&mut self, loc: LocId, permission: Permission) {
         info!("{:?} {:?}", loc, permission);
         self.permission_graph.add_solution(loc, permission);
     }
 
+    #[inline]
     fn add_origin(&mut self, loc: LocId, origin: Origin) {
         info!("{:?} {:?}", loc, origin);
         self.origin_graph.add_solution(loc, origin);
     }
 
+    #[inline]
     fn assign(&mut self, lhs: LocId, rhs: LocId, v: Variance) {
         info!("{:?} := {:?} {:?}", lhs, rhs, v);
         match v {
@@ -469,6 +509,7 @@ struct Graph<V: Idx, T: Idx> {
 }
 
 impl<V: Idx, T: Idx> Graph<V, T> {
+    #[inline]
     fn new(size: usize, tok_num: usize) -> Self {
         Self {
             tok_num,
@@ -477,10 +518,12 @@ impl<V: Idx, T: Idx> Graph<V, T> {
         }
     }
 
+    #[inline]
     fn add_solution(&mut self, v: V, t: T) {
         self.solutions[v].insert(t);
     }
 
+    #[inline]
     fn add_edge(&mut self, from: V, to: V) {
         self.edges[from].insert(to);
     }
@@ -647,6 +690,50 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for FileTypeVisitor<'tcx> {
     }
 }
 
+struct StdioArgVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    stdio_args: FxHashSet<Span>,
+}
+
+impl<'tcx> intravisit::Visitor<'tcx> for StdioArgVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+        self.handle_expr(expr);
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+impl<'tcx> StdioArgVisitor<'tcx> {
+    #[inline]
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            stdio_args: FxHashSet::default(),
+        }
+    }
+
+    #[inline]
+    fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+        let ExprKind::Call(_, args) = expr.kind else { return };
+        for arg in args {
+            let ExprKind::Path(QPath::Resolved(_, path)) = arg.kind else { continue };
+            let Res::Def(DefKind::Static(_), def_id) = path.res else { continue };
+            let key = self.tcx.def_key(def_id);
+            let DefPathData::ValueNs(name) = key.disambiguated_data.data else { continue };
+            let name = name.as_str();
+            if name == "stdin" || name == "stdout" || name == "stderr" {
+                self.stdio_args.insert(arg.span);
+            }
+        }
+    }
+}
+
+#[inline]
 fn contains_file_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     let mut visitor = FileTypeVisitor { tcx };
     ty.visit_with(&mut visitor).is_break()
@@ -666,6 +753,7 @@ fn file_api_kind(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<File
         .copied()
 }
 
+#[inline]
 fn strip_unlocked(name: &str) -> &str {
     name.strip_suffix("_unlocked").unwrap_or(name)
 }
