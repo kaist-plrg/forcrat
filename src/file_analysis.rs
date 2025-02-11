@@ -59,6 +59,9 @@ impl Pass for FileAnalysis {
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
+            if file_api_kind(local_def_id, tcx).is_some() {
+                continue;
+            }
             let body = match item.kind {
                 ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
                     let ty = self
@@ -129,6 +132,9 @@ impl Pass for FileAnalysis {
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
+            if file_api_kind(local_def_id, tcx).is_some() {
+                continue;
+            }
             info!("{:?}", local_def_id);
             let body = match item.kind {
                 ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
@@ -335,7 +341,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             let x = self.transfer_place(*destination, ctx).unwrap();
                             self.add_origin(x, Origin::Pipe);
                         }
-                        FileApiKind::Operation(permission) => {
+                        FileApiKind::Operation(Some(permission)) => {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
@@ -346,7 +352,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 }
                             }
                         }
-                        FileApiKind::NotSupported => panic!(),
+                        FileApiKind::Operation(None) => {}
+                        FileApiKind::NotSupported => {
+                            println!("{:?}", def_id);
+                        }
                     }
                 } else if let Some(callee) = def_id.as_local() {
                     self.transfer_non_api_call(callee, args, *destination, ctx);
@@ -438,13 +447,45 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Loc {
     Stdin,
     Stdout,
     Stderr,
     Var(LocalDefId, Local),
     Field(LocalDefId, FieldIdx),
+}
+
+fn fmt_def_id(
+    f: &mut std::fmt::Formatter<'_>,
+    key: impl IntoQueryParam<DefId>,
+) -> std::fmt::Result {
+    let def_id = key.into_query_param();
+    rustc_middle::ty::tls::with_opt(|opt_tcx| {
+        if let Some(tcx) = opt_tcx {
+            write!(f, "{}", tcx.def_path_str(def_id))
+        } else {
+            write!(f, "{}", def_id.index.index())
+        }
+    })
+}
+
+impl std::fmt::Debug for Loc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Loc::Stdin => write!(f, "stdin"),
+            Loc::Stdout => write!(f, "stdout"),
+            Loc::Stderr => write!(f, "stderr"),
+            Loc::Var(def_id, local) => {
+                fmt_def_id(f, *def_id)?;
+                write!(f, ":{}", local.index())
+            }
+            Loc::Field(def_id, field) => {
+                fmt_def_id(f, *def_id)?;
+                write!(f, ".{}", field.index())
+            }
+        }
+    }
 }
 
 rustc_index::newtype_index! {
@@ -719,7 +760,12 @@ impl<'tcx> StdioArgVisitor<'tcx> {
 
     #[inline]
     fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        let ExprKind::Call(_, args) = expr.kind else { return };
+        let ExprKind::Call(callee, args) = expr.kind else { return };
+        let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return };
+        let Res::Def(DefKind::Fn, def_id) = path.res else { return };
+        if file_api_kind(def_id, self.tcx).is_none() {
+            return;
+        }
         for arg in args {
             let ExprKind::Path(QPath::Resolved(_, path)) = arg.kind else { continue };
             let Res::Def(DefKind::Static(_), def_id) = path.res else { continue };
@@ -749,56 +795,57 @@ fn file_api_kind(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<File
     let key = tcx.def_key(id);
     let DefPathData::ValueNs(name) = key.disambiguated_data.data else { return None };
     FILE_API_NAME_SET
-        .get(strip_unlocked(name.as_str()))
+        .get(normalize_api_name(name.as_str()))
         .copied()
 }
 
 #[inline]
-fn strip_unlocked(name: &str) -> &str {
-    name.strip_suffix("_unlocked").unwrap_or(name)
+fn normalize_api_name(name: &str) -> &str {
+    let name = name.strip_suffix("_unlocked").unwrap_or(name);
+    name.strip_prefix("rpl_").unwrap_or(name)
 }
 
 #[derive(Debug, Clone, Copy)]
 enum FileApiKind {
     FileOpen,
     PipeOpen,
-    Operation(Permission),
+    Operation(Option<Permission>),
     NotSupported,
 }
 
 static FILE_API_NAMES: [(&str, FileApiKind); 46] = [
     ("fopen", FileApiKind::FileOpen),
     ("tmpfile", FileApiKind::FileOpen),
-    ("fclose", FileApiKind::Operation(Permission::Close)),
+    ("fdopen", FileApiKind::FileOpen),
+    ("fclose", FileApiKind::Operation(Some(Permission::Close))),
     ("popen", FileApiKind::PipeOpen),
-    ("pclose", FileApiKind::Operation(Permission::Close)),
-    ("putc", FileApiKind::Operation(Permission::Write)),
-    ("fputc", FileApiKind::Operation(Permission::Write)),
-    ("fputs", FileApiKind::Operation(Permission::Write)),
-    ("fprintf", FileApiKind::Operation(Permission::Write)),
-    ("vfprintf", FileApiKind::Operation(Permission::Write)),
-    ("fwrite", FileApiKind::Operation(Permission::Write)),
-    ("fflush", FileApiKind::Operation(Permission::Write)),
-    ("getc", FileApiKind::Operation(Permission::Read)),
-    ("fgetc", FileApiKind::Operation(Permission::Read)),
-    ("fgets", FileApiKind::Operation(Permission::Read)),
-    ("fscanf", FileApiKind::Operation(Permission::Read)),
-    ("vfscanf", FileApiKind::Operation(Permission::Read)),
-    ("getline", FileApiKind::Operation(Permission::Read)),
-    ("getdelim", FileApiKind::Operation(Permission::Read)),
-    ("fread", FileApiKind::Operation(Permission::Read)),
-    ("fseek", FileApiKind::Operation(Permission::Seek)),
-    ("fseeko", FileApiKind::Operation(Permission::Seek)),
-    ("ftell", FileApiKind::Operation(Permission::Seek)),
-    ("ftello", FileApiKind::Operation(Permission::Seek)),
-    ("rewind", FileApiKind::Operation(Permission::Seek)),
+    ("pclose", FileApiKind::Operation(Some(Permission::Close))),
+    ("putc", FileApiKind::Operation(Some(Permission::Write))),
+    ("fputc", FileApiKind::Operation(Some(Permission::Write))),
+    ("fputs", FileApiKind::Operation(Some(Permission::Write))),
+    ("fprintf", FileApiKind::Operation(Some(Permission::Write))),
+    ("vfprintf", FileApiKind::Operation(Some(Permission::Write))),
+    ("fwrite", FileApiKind::Operation(Some(Permission::Write))),
+    ("fflush", FileApiKind::Operation(Some(Permission::Write))),
+    ("getc", FileApiKind::Operation(Some(Permission::Read))),
+    ("fgetc", FileApiKind::Operation(Some(Permission::Read))),
+    ("fgets", FileApiKind::Operation(Some(Permission::Read))),
+    ("fscanf", FileApiKind::Operation(Some(Permission::Read))),
+    ("vfscanf", FileApiKind::Operation(Some(Permission::Read))),
+    ("getline", FileApiKind::Operation(Some(Permission::Read))),
+    ("getdelim", FileApiKind::Operation(Some(Permission::Read))),
+    ("fread", FileApiKind::Operation(Some(Permission::Read))),
+    ("fseek", FileApiKind::Operation(Some(Permission::Seek))),
+    ("fseeko", FileApiKind::Operation(Some(Permission::Seek))),
+    ("ftell", FileApiKind::Operation(Some(Permission::Seek))),
+    ("ftello", FileApiKind::Operation(Some(Permission::Seek))),
+    ("rewind", FileApiKind::Operation(Some(Permission::Seek))),
     ("ungetc", FileApiKind::NotSupported),
     ("funlockfile", FileApiKind::NotSupported),
     ("flockfile", FileApiKind::NotSupported),
-    ("fileno", FileApiKind::NotSupported),
-    ("fdopen", FileApiKind::NotSupported),
-    ("ferror", FileApiKind::NotSupported),
-    ("feof", FileApiKind::NotSupported),
+    ("fileno", FileApiKind::Operation(None)),
+    ("ferror", FileApiKind::Operation(None)),
+    ("feof", FileApiKind::Operation(Some(Permission::Read))),
     ("clearerr", FileApiKind::NotSupported),
     ("freopen", FileApiKind::NotSupported),
     ("setvbuf", FileApiKind::NotSupported),
