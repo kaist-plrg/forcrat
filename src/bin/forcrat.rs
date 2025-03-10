@@ -1,7 +1,7 @@
 use std::{fs::File, path::PathBuf};
 
 use clap::Parser;
-use forcrat::{compile_util::Pass, *};
+use forcrat::{api_list::API_LIST, compile_util::Pass, *};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -26,11 +26,22 @@ fn main() {
     }
 
     let file = args.input.join("c2rust-lib.rs");
-    let res = steensgaard::Steensgaard.run_on_path(&file);
+    // extern_finder::ExternFinder.run_on_path(&file);
+    let (counts, std_arg_counts) = api_counter::ApiCounter.run_on_path(&file);
+    for (name, api_kind) in API_LIST {
+        let v = counts.get(name).copied().unwrap_or(0);
+        print!("{} ", v);
+        if api_kind.is_read() || api_kind.is_write() {
+            let v = std_arg_counts.get(name).copied().unwrap_or(0);
+            print!("{} ", v);
+        }
+    }
+    println!();
+
+    // let res = steensgaard::Steensgaard.run_on_path(&file);
     // println!("{:?}", res.vars);
     // println!("{:?}", res.var_tys);
     // println!("{:?}", res.fns);
     // println!("{:?}", res.fn_tys);
-    // extern_finder::ExternFinder.run_on_path(&file);
-    file_analysis::FileAnalysis { steensgaard: res }.run_on_path(&file);
+    // file_analysis::FileAnalysis { steensgaard: res }.run_on_path(&file);
 }

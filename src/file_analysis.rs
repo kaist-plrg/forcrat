@@ -24,12 +24,12 @@ use rustc_middle::{
         ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
     },
     query::{IntoQueryParam, Key},
-    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeVisitable, TypeVisitor},
+    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeSuperVisitable, TypeVisitable, TypeVisitor},
 };
 use rustc_span::Span;
 use tracing::info;
 
-use crate::{compile_util::Pass, rustc_middle::ty::TypeSuperVisitable, steensgaard};
+use crate::{compile_util::Pass, steensgaard};
 
 #[derive(Debug)]
 pub struct FileAnalysis {
@@ -59,7 +59,7 @@ impl Pass for FileAnalysis {
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
-            if file_api_kind(local_def_id, tcx).is_some() {
+            if file_api_kind(local_def_id, tcx).is_some() || is_io_api(local_def_id, tcx) {
                 continue;
             }
             let body = match item.kind {
@@ -132,7 +132,7 @@ impl Pass for FileAnalysis {
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
-            if file_api_kind(local_def_id, tcx).is_some() {
+            if file_api_kind(local_def_id, tcx).is_some() || is_io_api(local_def_id, tcx) {
                 continue;
             }
             info!("{:?}", local_def_id);
@@ -202,6 +202,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             if contains_file_ty(rty, self.tcx) {
                                 let r = self.transfer_operand(op, ctx).unwrap();
                                 self.assign(l, r, variance);
+                            } else {
+                                println!("{:?}", rty);
                             }
                         }
                         CastKind::PointerFromExposedAddress => {
@@ -374,6 +376,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let sig = self.tcx.fn_sig(callee).skip_binder().skip_binder();
         for (i, (t, arg)) in sig.inputs().iter().zip(args).enumerate() {
             if let Some(variance) = file_type_variance(*t, self.tcx) {
+                println!("{:?} {:?}", ctx.function, callee);
                 let l = Loc::Var(callee, Local::new(i + 1));
                 let l = self.loc_ind_map[&l];
                 let r = self.transfer_operand(arg, ctx).unwrap();
@@ -799,6 +802,12 @@ fn file_api_kind(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<File
         .copied()
 }
 
+fn is_io_api(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
+    let key = tcx.def_key(id);
+    let DefPathData::ValueNs(name) = key.disambiguated_data.data else { return false };
+    IO_API_NAME_SET.contains(normalize_api_name(name.as_str()))
+}
+
 #[inline]
 fn normalize_api_name(name: &str) -> &str {
     let name = name.strip_suffix("_unlocked").unwrap_or(name);
@@ -862,7 +871,12 @@ static FILE_API_NAMES: [(&str, FileApiKind); 46] = [
     ("__fwriting", FileApiKind::NotSupported),
 ];
 
+static IO_API_NAMES: [&str; 8] = [
+    "scanf", "vscanf", "getchar", "printf", "vprintf", "putchar", "puts", "perror",
+];
+
 lazy_static! {
     static ref FILE_API_NAME_SET: FxHashMap<&'static str, FileApiKind> =
         FILE_API_NAMES.iter().copied().collect();
+    static ref IO_API_NAME_SET: FxHashSet<&'static str> = IO_API_NAMES.iter().copied().collect();
 }

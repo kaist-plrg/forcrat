@@ -13,9 +13,15 @@ use rustc_errors::{
 };
 use rustc_feature::UnstableFeatures;
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    def::{DefKind, Res},
+    definitions::DefPathData,
+    Expr, ExprKind, QPath,
+};
 use rustc_interface::Config;
 use rustc_middle::{
     mir::{Body, TerminatorKind},
+    query::IntoQueryParam,
     ty::TyCtxt,
 };
 use rustc_session::{
@@ -23,9 +29,10 @@ use rustc_session::{
     EarlyErrorHandler,
 };
 use rustc_span::{
+    def_id::DefId,
     edition::Edition,
     source_map::{FileName, SourceMap},
-    RealFileName, Span,
+    RealFileName, Span, Symbol,
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 
@@ -305,4 +312,22 @@ pub fn body_to_str(body: &Body<'_>) -> String {
         }
     }
     s
+}
+
+#[inline]
+pub fn def_id_to_value_symbol(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<Symbol> {
+    let key = tcx.def_key(id);
+    let DefPathData::ValueNs(name) = key.disambiguated_data.data else { return None };
+    Some(name)
+}
+
+pub fn is_std_io_expr<'tcx>(expr: &Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind else { return false };
+    let Res::Def(DefKind::Static(_), def_id) = path.res else { return false };
+    if !tcx.is_foreign_item(def_id) {
+        return false;
+    }
+    let name = def_id_to_value_symbol(def_id, tcx).unwrap();
+    let name = name.as_str();
+    name == "stdin" || name == "stdout" || name == "stderr"
 }
