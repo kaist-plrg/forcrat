@@ -32,6 +32,7 @@
 #![feature(min_specialization)]
 
 extern crate rustc_abi;
+extern crate rustc_ast;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -54,4 +55,5 @@ pub mod compile_util;
 pub mod disjoint_set;
 pub mod extern_finder;
 pub mod file_analysis;
+pub mod retval_use_counter;
 pub mod steensgaard;

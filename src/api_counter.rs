@@ -1,4 +1,7 @@
+use std::rc::Rc;
+
 use etrace::some_or;
+use rustc_ast::LitKind;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
     def::{DefKind, Res},
@@ -9,7 +12,7 @@ use rustc_hir::{
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 
 use crate::{
-    api_list::{is_symbol_api, normalize_api_name, API_SET},
+    api_list::{is_symbol_api, normalize_api_name, API_MAP},
     compile_util::{def_id_to_value_symbol, is_std_io_expr, Pass},
 };
 
@@ -67,7 +70,7 @@ impl<'tcx> ApiVisitor<'tcx> {
         let Res::Def(DefKind::Fn, def_id) = path.res else { return true };
         let symbol = some_or!(def_id_to_value_symbol(def_id, self.tcx), return true);
         let name = normalize_api_name(symbol.as_str());
-        let (name, api_kind) = some_or!(API_SET.get_key_value(name), return true);
+        let (name, api_kind) = some_or!(API_MAP.get_key_value(name), return true);
         let counts = if (api_kind.is_read() || api_kind.is_write())
             && args.iter().any(|arg| is_std_io_expr(arg, self.tcx))
         {
@@ -83,7 +86,7 @@ impl<'tcx> ApiVisitor<'tcx> {
         let Res::Def(DefKind::Fn, def_id) = path.res else { return };
         let symbol = some_or!(def_id_to_value_symbol(def_id, self.tcx), return);
         let name = normalize_api_name(symbol.as_str());
-        let (name, _) = some_or!(API_SET.get_key_value(name), return);
+        let (name, _) = some_or!(API_MAP.get_key_value(name), return);
         *self.counts.entry(*name).or_default() += 1;
     }
 }
@@ -104,5 +107,35 @@ impl<'tcx> Visitor<'tcx> for ApiVisitor<'tcx> {
     fn visit_path(&mut self, path: &Path<'tcx>, _: HirId) {
         self.handle_path(path);
         intravisit::walk_path(self, path);
+    }
+}
+
+#[derive(Debug)]
+pub enum OpenMode {
+    Lit(Rc<[u8]>),
+    If(String, Box<OpenMode>, Box<OpenMode>),
+    Path(String, Res),
+}
+
+fn normalize_open_mode<'tcx>(expr: Expr<'tcx>, tcx: TyCtxt<'tcx>) -> OpenMode {
+    match expr.kind {
+        ExprKind::MethodCall(_, e, _, _) | ExprKind::Cast(e, _) | ExprKind::DropTemps(e) => {
+            normalize_open_mode(*e, tcx)
+        }
+        ExprKind::Lit(lit) => {
+            let LitKind::ByteStr(ref bytes, _) = lit.node else { panic!() };
+            OpenMode::Lit(bytes.clone())
+        }
+        ExprKind::If(c, t, Some(f)) => {
+            let c = tcx.sess.source_map().span_to_snippet(c.span).unwrap();
+            let t = normalize_open_mode(*t, tcx);
+            let f = normalize_open_mode(*f, tcx);
+            OpenMode::If(c, Box::new(t), Box::new(f))
+        }
+        ExprKind::Path(QPath::Resolved(_, path)) => {
+            let s = tcx.sess.source_map().span_to_snippet(path.span).unwrap();
+            OpenMode::Path(s, path.res)
+        }
+        _ => panic!(),
     }
 }

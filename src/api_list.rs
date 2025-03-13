@@ -12,7 +12,7 @@ use crate::compile_util::def_id_to_value_symbol;
 
 #[inline]
 pub fn symbol_api_kind(name: Symbol) -> Option<ApiKind> {
-    API_SET.get(normalize_api_name(name.as_str())).copied()
+    API_MAP.get(normalize_api_name(name.as_str())).copied()
 }
 
 #[inline]
@@ -22,7 +22,7 @@ pub fn def_id_api_kind(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Optio
 
 #[inline]
 pub fn is_symbol_api(name: Symbol) -> bool {
-    API_SET.contains_key(normalize_api_name(name.as_str()))
+    API_MAP.contains_key(normalize_api_name(name.as_str()))
 }
 
 #[inline]
@@ -43,15 +43,17 @@ pub fn normalize_api_name(name: &str) -> &str {
 #[repr(u8)]
 pub enum Permission {
     Read = 0,
-    Write = 1,
-    Seek = 2,
-    Close = 3,
+    BufRead = 1,
+    Write = 2,
+    Seek = 3,
+    Lock = 4,
+    Close = 5,
 }
 
 impl Idx for Permission {
     #[inline]
     fn new(idx: usize) -> Self {
-        if idx > 3 {
+        if idx > 5 {
             panic!()
         }
         unsafe { std::mem::transmute(idx as u8) }
@@ -111,7 +113,7 @@ impl ApiKind {
 }
 
 lazy_static! {
-    pub static ref API_SET: FxHashMap<&'static str, ApiKind> = API_LIST.iter().copied().collect();
+    pub static ref API_MAP: FxHashMap<&'static str, ApiKind> = API_LIST.iter().copied().collect();
 }
 
 pub static API_LIST: [(&str, ApiKind); 87] = [
@@ -127,15 +129,15 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("fclose", Operation(Some(Close))),
     ("pclose", Operation(Some(Close))),
     // Read (10)
-    ("fscanf", Operation(Some(Read))),
-    ("vfscanf", Operation(Some(Read))),
+    ("fscanf", Operation(Some(BufRead))),
+    ("vfscanf", Operation(Some(BufRead))),
     ("getc", Operation(Some(Read))), // unlocked
     ("fgetc", Operation(Some(Read))),
-    ("fgets", Operation(Some(Read))),
+    ("fgets", Operation(Some(BufRead))),
     ("fread", Operation(Some(Read))),
     ("ungetc", Unsupported),
-    ("getline", Operation(Some(Read))),
-    ("getdelim", Operation(Some(Read))),
+    ("getline", Operation(Some(BufRead))),
+    ("getdelim", Operation(Some(BufRead))),
     // Read stdin (5)
     ("scanf", StdioOperation),
     ("vscanf", StdioOperation),
@@ -179,9 +181,9 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("feof", Unsupported),
     ("ferror", Unsupported),
     // Locking (3)
-    ("flockfile", Operation(None)),
-    ("ftrylockfile", Operation(None)),
-    ("funlockfile", Operation(None)),
+    ("flockfile", Operation(Some(Lock))),
+    ("ftrylockfile", Operation(Some(Lock))),
+    ("funlockfile", Operation(Some(Lock))),
     // Buffering (2)
     ("setvbuf", Unsupported),
     ("setbuf", Unsupported),
@@ -199,11 +201,11 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     // Open (1)
     ("open_wmemstream", Open(Buffer)),
     // Read (6)
-    ("fwscanf", Operation(Some(Read))),
-    ("vfwscanf", Operation(Some(Read))),
+    ("fwscanf", Operation(Some(BufRead))),
+    ("vfwscanf", Operation(Some(BufRead))),
     ("getwc", Operation(Some(Read))),
     ("fgetwc", Operation(Some(Read))),
-    ("fgetws", Operation(Some(Read))),
+    ("fgetws", Operation(Some(BufRead))),
     ("ungetwc", Unsupported),
     // Read stdin (3)
     ("wscanf", StdioOperation),
