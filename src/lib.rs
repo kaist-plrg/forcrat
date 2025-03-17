@@ -33,6 +33,7 @@
 
 extern crate rustc_abi;
 extern crate rustc_ast;
+extern crate rustc_ast_pretty;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -45,6 +46,7 @@ extern crate rustc_hir;
 extern crate rustc_index;
 extern crate rustc_interface;
 extern crate rustc_middle;
+extern crate rustc_parse;
 extern crate rustc_serialize;
 extern crate rustc_session;
 extern crate rustc_span;
@@ -57,3 +59,4 @@ pub mod extern_finder;
 pub mod file_analysis;
 pub mod retval_use_counter;
 pub mod steensgaard;
+pub mod transformation;

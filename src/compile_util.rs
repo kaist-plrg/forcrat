@@ -205,7 +205,8 @@ impl Emitter for CountingEmitter {
     }
 }
 
-struct SilentEmitter;
+#[derive(Debug, Clone, Copy)]
+pub struct SilentEmitter;
 
 impl Translate for SilentEmitter {
     fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {

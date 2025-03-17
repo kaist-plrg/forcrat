@@ -1,4 +1,8 @@
-use std::{fs::File, path::PathBuf};
+use std::{
+    fs,
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 use clap::{Parser, Subcommand};
 use forcrat::{api_list::API_LIST, compile_util::Pass, *};
@@ -8,6 +12,10 @@ enum Command {
     CountApis,
     CountReturnValues,
     Analyze,
+    Transformation {
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -63,6 +71,46 @@ fn main() {
             println!("{:?}", res.fns);
             println!("{:?}", res.fn_tys);
             file_analysis::FileAnalysis { steensgaard: res }.run_on_path(&file);
+        }
+        Command::Transformation { mut output } => {
+            output.push(args.input.file_name().unwrap());
+            if output.exists() {
+                assert!(output.is_dir());
+                clear_dir(&output);
+            } else {
+                fs::create_dir(&output).unwrap();
+            }
+            copy_dir(&args.input, &output, true);
+            let output = output.join("c2rust-lib.rs");
+            transformation::Transformation.run_on_path(&output);
+        }
+    }
+}
+
+fn clear_dir(path: &Path) {
+    for entry in fs::read_dir(path).unwrap() {
+        let entry_path = entry.unwrap().path();
+        if entry_path.is_dir() {
+            let name = entry_path.file_name().unwrap();
+            if name != "target" {
+                fs::remove_dir_all(entry_path).unwrap();
+            }
+        } else {
+            fs::remove_file(entry_path).unwrap();
+        }
+    }
+}
+
+fn copy_dir(src: &Path, dst: &Path, root: bool) {
+    for entry in fs::read_dir(src).unwrap() {
+        let src_path = entry.unwrap().path();
+        let name = src_path.file_name().unwrap();
+        let dst_path = dst.join(name);
+        if src_path.is_file() {
+            fs::copy(src_path, dst_path).unwrap();
+        } else if src_path.is_dir() && (!root || name != "target") {
+            fs::create_dir(&dst_path).unwrap();
+            copy_dir(&src_path, &dst_path, false);
         }
     }
 }
