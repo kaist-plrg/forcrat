@@ -128,6 +128,32 @@ pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LoHi {
+    lo_line: usize,
+    lo_col: usize,
+    hi_line: usize,
+    hi_col: usize,
+}
+
+pub fn span_to_plh(span: Span, source_map: &SourceMap) -> Option<(PathBuf, LoHi)> {
+    let fname = source_map.span_to_filename(span);
+    let file = source_map.get_source_file(&fname).unwrap();
+    if let FileName::Real(RealFileName::LocalPath(p)) = fname {
+        let lo = file.lookup_file_pos_with_col_display(span.lo());
+        let hi = file.lookup_file_pos_with_col_display(span.hi());
+        let lo_hi = LoHi {
+            lo_line: lo.0,
+            lo_col: lo.2,
+            hi_line: hi.0,
+            hi_col: hi.2,
+        };
+        Some((p, lo_hi))
+    } else {
+        None
+    }
+}
+
 pub type Suggestions = HashMap<PathBuf, Vec<Suggestion>>;
 
 pub fn apply_suggestions(suggestions: &Suggestions) {

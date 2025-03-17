@@ -81,8 +81,14 @@ fn main() {
                 fs::create_dir(&output).unwrap();
             }
             copy_dir(&args.input, &output, true);
-            let output = output.join("c2rust-lib.rs");
-            transformation::Transformation.run_on_path(&output);
+            let file = output.join("c2rust-lib.rs");
+
+            let res = steensgaard::Steensgaard.run_on_path(&file);
+            let res = file_analysis::FileAnalysis { steensgaard: res }.run_on_path(&file);
+            transformation::Transformation {
+                analysis_result: res,
+            }
+            .run_on_path(&file);
         }
     }
 }

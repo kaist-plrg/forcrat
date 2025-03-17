@@ -33,14 +33,22 @@ use crate::{
 };
 
 #[derive(Debug)]
+pub struct AnalysisResult {
+    pub locs: IndexVec<LocId, Loc>,
+    pub loc_ind_map: FxHashMap<Loc, LocId>,
+    pub permissions: IndexVec<LocId, BitSet<Permission>>,
+    pub origins: IndexVec<LocId, BitSet<Origin>>,
+}
+
+#[derive(Debug)]
 pub struct FileAnalysis {
     pub steensgaard: steensgaard::AnalysisResult,
 }
 
 impl Pass for FileAnalysis {
-    type Out = ();
+    type Out = AnalysisResult;
 
-    fn run(&self, tcx: TyCtxt<'_>) {
+    fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         info!("\n{:?}", self.steensgaard);
         let hir = tcx.hir();
 
@@ -125,7 +133,7 @@ impl Pass for FileAnalysis {
             steensgaard: &self.steensgaard,
             fn_ty_functions,
             stdio_arg_locs,
-            loc_ind_map,
+            loc_ind_map: &loc_ind_map,
             permission_graph: Graph::new(locs.len(), Permission::NUM),
             origin_graph,
         };
@@ -162,9 +170,16 @@ impl Pass for FileAnalysis {
         let origins = analyzer.origin_graph.solve();
 
         for (((i, loc), permissions), origins) in
-            locs.iter_enumerated().zip(permissions).zip(origins)
+            locs.iter_enumerated().zip(&permissions).zip(&origins)
         {
             info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
+        }
+
+        AnalysisResult {
+            locs,
+            loc_ind_map,
+            permissions,
+            origins,
         }
     }
 }
@@ -172,7 +187,7 @@ impl Pass for FileAnalysis {
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     stdio_arg_locs: FxHashSet<Loc>,
-    loc_ind_map: FxHashMap<Loc, LocId>,
+    loc_ind_map: &'a FxHashMap<Loc, LocId>,
     fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
     steensgaard: &'a steensgaard::AnalysisResult,
     permission_graph: Graph<LocId, Permission>,
@@ -447,7 +462,7 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Loc {
+pub enum Loc {
     Stdin,
     Stdout,
     Stderr,

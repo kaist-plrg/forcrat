@@ -53,6 +53,7 @@ extern crate rustc_span;
 
 pub mod api_counter;
 pub mod api_list;
+pub mod ast_maker;
 pub mod compile_util;
 pub mod disjoint_set;
 pub mod extern_finder;
