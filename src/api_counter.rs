@@ -79,6 +79,13 @@ impl<'tcx> ApiVisitor<'tcx> {
             &mut self.counts
         };
         *counts.entry(*name).or_default() += 1;
+        if *name == "fseek" || *name == "fseeko" {
+            // if let OpenMode::Path(p, r) = normalize_open_mode(args[1], self.tcx) {
+            //     println!("{} {:?}", p, r);
+            // }
+            let source_map = self.tcx.sess.source_map();
+            println!("{}", source_map.span_to_snippet(args[2].span).unwrap());
+        }
         true
     }
 
@@ -117,7 +124,7 @@ pub enum OpenMode {
     Path(String, Res),
 }
 
-fn normalize_open_mode<'tcx>(expr: Expr<'tcx>, tcx: TyCtxt<'tcx>) -> OpenMode {
+pub fn normalize_open_mode<'tcx>(expr: Expr<'tcx>, tcx: TyCtxt<'tcx>) -> OpenMode {
     match expr.kind {
         ExprKind::MethodCall(_, e, _, _) | ExprKind::Cast(e, _) | ExprKind::DropTemps(e) => {
             normalize_open_mode(*e, tcx)
