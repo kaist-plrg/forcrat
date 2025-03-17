@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -22,7 +23,7 @@ use rustc_interface::Config;
 use rustc_middle::{
     mir::{Body, TerminatorKind},
     query::IntoQueryParam,
-    ty::TyCtxt,
+    ty::{Ty, TyCtxt, TyKind, TypeVisitor},
 };
 use rustc_session::{
     config::{CheckCfg, CrateType, ErrorOutputType, Input, Options},
@@ -35,6 +36,8 @@ use rustc_span::{
     RealFileName, Span, Symbol,
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
+
+use crate::rustc_middle::ty::{TypeSuperVisitable, TypeVisitable};
 
 pub trait Pass: Sync {
     type Out: Send;
@@ -330,4 +333,34 @@ pub fn is_std_io_expr<'tcx>(expr: &Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     let name = def_id_to_value_symbol(def_id, tcx).unwrap();
     let name = name.as_str();
     name == "stdin" || name == "stdout" || name == "stderr"
+}
+
+#[inline]
+pub fn is_file_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
+    let key = tcx.def_key(id);
+    let DefPathData::TypeNs(name) = key.disambiguated_data.data else { return false };
+    name.as_str() == "_IO_FILE"
+}
+
+#[inline]
+pub fn contains_file_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    let mut visitor = FileTypeVisitor { tcx };
+    ty.visit_with(&mut visitor).is_break()
+}
+
+struct FileTypeVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+}
+
+impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for FileTypeVisitor<'tcx> {
+    type BreakTy = ();
+
+    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+        if let TyKind::Adt(adt_def, _) = t.kind() {
+            if is_file_ty(adt_def.did(), self.tcx) {
+                return ControlFlow::Break(());
+            }
+        }
+        t.super_visit_with(self)
+    }
 }

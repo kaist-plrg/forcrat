@@ -1,6 +1,3 @@
-use std::ops::ControlFlow;
-
-use lazy_static::lazy_static;
 use rustc_abi::{FieldIdx, FIRST_VARIANT};
 use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
 use rustc_data_structures::graph::{
@@ -24,12 +21,16 @@ use rustc_middle::{
         ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
     },
     query::{IntoQueryParam, Key},
-    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut, TypeSuperVisitable, TypeVisitable, TypeVisitor},
+    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_span::Span;
 use tracing::info;
 
-use crate::{compile_util::Pass, steensgaard};
+use crate::{
+    api_list::{def_id_api_kind, is_def_id_api, is_symbol_api, ApiKind, Origin, Permission},
+    compile_util::{contains_file_ty, is_file_ty, is_std_io_expr, Pass},
+    steensgaard,
+};
 
 #[derive(Debug)]
 pub struct FileAnalysis {
@@ -59,11 +60,11 @@ impl Pass for FileAnalysis {
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
-            if file_api_kind(local_def_id, tcx).is_some() || is_io_api(local_def_id, tcx) {
-                continue;
-            }
             let body = match item.kind {
-                ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
+                ItemKind::Fn(_, _, _) => {
+                    if is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
+                        continue;
+                    }
                     let ty = self
                         .steensgaard
                         .var_ty(self.steensgaard.global(local_def_id));
@@ -115,7 +116,7 @@ impl Pass for FileAnalysis {
         }
         let loc_ind_map: FxHashMap<_, _> = locs.iter_enumerated().map(|(i, l)| (*l, i)).collect();
 
-        let mut origin_graph: Graph<LocId, Origin> = Graph::new(locs.len(), 6);
+        let mut origin_graph: Graph<LocId, Origin> = Graph::new(locs.len(), Origin::NUM);
         origin_graph.add_solution(loc_ind_map[&Loc::Stdin], Origin::Stdin);
         origin_graph.add_solution(loc_ind_map[&Loc::Stdout], Origin::Stdout);
         origin_graph.add_solution(loc_ind_map[&Loc::Stderr], Origin::Stderr);
@@ -125,24 +126,24 @@ impl Pass for FileAnalysis {
             fn_ty_functions,
             stdio_arg_locs,
             loc_ind_map,
-            permission_graph: Graph::new(locs.len(), 4),
+            permission_graph: Graph::new(locs.len(), Permission::NUM),
             origin_graph,
         };
 
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
-            if file_api_kind(local_def_id, tcx).is_some() || is_io_api(local_def_id, tcx) {
-                continue;
-            }
-            info!("{:?}", local_def_id);
             let body = match item.kind {
-                ItemKind::Fn(_, _, _) if item.ident.name.as_str() != "main" => {
+                ItemKind::Fn(_, _, _) => {
+                    if is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
+                        continue;
+                    }
                     tcx.optimized_mir(local_def_id)
                 }
                 ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
                 _ => continue,
             };
+            info!("{:?}", local_def_id);
             let ctx = Ctx {
                 function: local_def_id,
                 local_decls: &body.local_decls,
@@ -206,9 +207,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 println!("{:?}", rty);
                             }
                         }
-                        CastKind::PointerFromExposedAddress => {
-                            self.add_origin(l, Origin::Null);
-                        }
+                        CastKind::PointerFromExposedAddress => {}
+                        // self.add_origin(l, Origin::Null);
                         _ => {
                             assert!(!contains_file_ty(ty, self.tcx));
                         }
@@ -324,7 +324,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     .var_ty(self.steensgaard.local(ctx.function, callee.local));
                 if let Some(callees) = self.fn_ty_functions.get(&ty.fn_ty) {
                     for callee in callees.clone() {
-                        assert!(file_api_kind(callee, self.tcx).is_none());
+                        assert!(is_def_id_api(callee, self.tcx));
                         self.transfer_non_api_call(callee, args, *destination, ctx);
                     }
                 }
@@ -333,17 +333,13 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
                 assert!(matches!(value, ConstValue::ZeroSized));
                 let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                if let Some(kind) = file_api_kind(def_id, self.tcx) {
+                if let Some(kind) = def_id_api_kind(def_id, self.tcx) {
                     match kind {
-                        FileApiKind::FileOpen => {
+                        ApiKind::Open(origin) => {
                             let x = self.transfer_place(*destination, ctx).unwrap();
-                            self.add_origin(x, Origin::File);
+                            self.add_origin(x, origin);
                         }
-                        FileApiKind::PipeOpen => {
-                            let x = self.transfer_place(*destination, ctx).unwrap();
-                            self.add_origin(x, Origin::Pipe);
-                        }
-                        FileApiKind::Operation(Some(permission)) => {
+                        ApiKind::Operation(Some(permission)) => {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
@@ -354,8 +350,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 }
                             }
                         }
-                        FileApiKind::Operation(None) => {}
-                        FileApiKind::NotSupported => {
+                        ApiKind::Operation(None) | ApiKind::StdioOperation | ApiKind::NotIO => {}
+                        ApiKind::Unsupported => {
                             println!("{:?}", def_id);
                         }
                     }
@@ -494,56 +490,6 @@ impl std::fmt::Debug for Loc {
 rustc_index::newtype_index! {
     #[debug_format = "L{}"]
     pub struct LocId {}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-enum Permission {
-    Read = 0,
-    Write = 1,
-    Seek = 2,
-    Close = 3,
-}
-
-impl Idx for Permission {
-    #[inline]
-    fn new(idx: usize) -> Self {
-        if idx > 3 {
-            panic!()
-        }
-        unsafe { std::mem::transmute(idx as u8) }
-    }
-
-    #[inline]
-    fn index(self) -> usize {
-        self as _
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-enum Origin {
-    Null = 0,
-    File = 1,
-    Stdin = 2,
-    Stdout = 3,
-    Stderr = 4,
-    Pipe = 5,
-}
-
-impl Idx for Origin {
-    #[inline]
-    fn new(idx: usize) -> Self {
-        if idx > 5 {
-            panic!()
-        }
-        unsafe { std::mem::transmute(idx as u8) }
-    }
-
-    #[inline]
-    fn index(self) -> usize {
-        self as _
-    }
 }
 
 struct Graph<V: Idx, T: Idx> {
@@ -717,39 +663,9 @@ impl<T: Idx> WithSuccessors for VecBitSet<'_, T> {
     }
 }
 
-struct FileTypeVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-}
-
-impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for FileTypeVisitor<'tcx> {
-    type BreakTy = ();
-
-    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
-        if let TyKind::Adt(adt_def, _) = t.kind() {
-            if is_file_ty(adt_def.did(), self.tcx) {
-                return ControlFlow::Break(());
-            }
-        }
-        t.super_visit_with(self)
-    }
-}
-
 struct StdioArgVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     stdio_args: FxHashSet<Span>,
-}
-
-impl<'tcx> intravisit::Visitor<'tcx> for StdioArgVisitor<'tcx> {
-    type NestedFilter = nested_filter::OnlyBodies;
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
-    }
-
-    fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        self.handle_expr(expr);
-        intravisit::walk_expr(self, expr);
-    }
 }
 
 impl<'tcx> StdioArgVisitor<'tcx> {
@@ -766,117 +682,26 @@ impl<'tcx> StdioArgVisitor<'tcx> {
         let ExprKind::Call(callee, args) = expr.kind else { return };
         let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return };
         let Res::Def(DefKind::Fn, def_id) = path.res else { return };
-        if file_api_kind(def_id, self.tcx).is_none() {
+        if !is_def_id_api(def_id, self.tcx) {
             return;
         }
         for arg in args {
-            let ExprKind::Path(QPath::Resolved(_, path)) = arg.kind else { continue };
-            let Res::Def(DefKind::Static(_), def_id) = path.res else { continue };
-            let key = self.tcx.def_key(def_id);
-            let DefPathData::ValueNs(name) = key.disambiguated_data.data else { continue };
-            let name = name.as_str();
-            if name == "stdin" || name == "stdout" || name == "stderr" {
+            if is_std_io_expr(arg, self.tcx) {
                 self.stdio_args.insert(arg.span);
             }
         }
     }
 }
 
-#[inline]
-fn contains_file_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
-    let mut visitor = FileTypeVisitor { tcx };
-    ty.visit_with(&mut visitor).is_break()
-}
+impl<'tcx> intravisit::Visitor<'tcx> for StdioArgVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
 
-fn is_file_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    let key = tcx.def_key(id);
-    let DefPathData::TypeNs(name) = key.disambiguated_data.data else { return false };
-    name.as_str() == "_IO_FILE"
-}
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
 
-fn file_api_kind(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<FileApiKind> {
-    let key = tcx.def_key(id);
-    let DefPathData::ValueNs(name) = key.disambiguated_data.data else { return None };
-    FILE_API_NAME_SET
-        .get(normalize_api_name(name.as_str()))
-        .copied()
-}
-
-fn is_io_api(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    let key = tcx.def_key(id);
-    let DefPathData::ValueNs(name) = key.disambiguated_data.data else { return false };
-    IO_API_NAME_SET.contains(normalize_api_name(name.as_str()))
-}
-
-#[inline]
-fn normalize_api_name(name: &str) -> &str {
-    let name = name.strip_suffix("_unlocked").unwrap_or(name);
-    name.strip_prefix("rpl_").unwrap_or(name)
-}
-
-#[derive(Debug, Clone, Copy)]
-enum FileApiKind {
-    FileOpen,
-    PipeOpen,
-    Operation(Option<Permission>),
-    NotSupported,
-}
-
-static FILE_API_NAMES: [(&str, FileApiKind); 46] = [
-    ("fopen", FileApiKind::FileOpen),
-    ("tmpfile", FileApiKind::FileOpen),
-    ("fdopen", FileApiKind::FileOpen),
-    ("fclose", FileApiKind::Operation(Some(Permission::Close))),
-    ("popen", FileApiKind::PipeOpen),
-    ("pclose", FileApiKind::Operation(Some(Permission::Close))),
-    ("putc", FileApiKind::Operation(Some(Permission::Write))),
-    ("fputc", FileApiKind::Operation(Some(Permission::Write))),
-    ("fputs", FileApiKind::Operation(Some(Permission::Write))),
-    ("fprintf", FileApiKind::Operation(Some(Permission::Write))),
-    ("vfprintf", FileApiKind::Operation(Some(Permission::Write))),
-    ("fwrite", FileApiKind::Operation(Some(Permission::Write))),
-    ("fflush", FileApiKind::Operation(Some(Permission::Write))),
-    ("getc", FileApiKind::Operation(Some(Permission::Read))),
-    ("fgetc", FileApiKind::Operation(Some(Permission::Read))),
-    ("fgets", FileApiKind::Operation(Some(Permission::Read))),
-    ("fscanf", FileApiKind::Operation(Some(Permission::Read))),
-    ("vfscanf", FileApiKind::Operation(Some(Permission::Read))),
-    ("getline", FileApiKind::Operation(Some(Permission::Read))),
-    ("getdelim", FileApiKind::Operation(Some(Permission::Read))),
-    ("fread", FileApiKind::Operation(Some(Permission::Read))),
-    ("fseek", FileApiKind::Operation(Some(Permission::Seek))),
-    ("fseeko", FileApiKind::Operation(Some(Permission::Seek))),
-    ("ftell", FileApiKind::Operation(Some(Permission::Seek))),
-    ("ftello", FileApiKind::Operation(Some(Permission::Seek))),
-    ("rewind", FileApiKind::Operation(Some(Permission::Seek))),
-    ("ungetc", FileApiKind::NotSupported),
-    ("funlockfile", FileApiKind::NotSupported),
-    ("flockfile", FileApiKind::NotSupported),
-    ("fileno", FileApiKind::Operation(None)),
-    ("ferror", FileApiKind::Operation(None)),
-    ("feof", FileApiKind::Operation(Some(Permission::Read))),
-    ("clearerr", FileApiKind::NotSupported),
-    ("freopen", FileApiKind::NotSupported),
-    ("setvbuf", FileApiKind::NotSupported),
-    ("setbuf", FileApiKind::NotSupported),
-    ("setlinebuf", FileApiKind::NotSupported),
-    ("fpurge", FileApiKind::NotSupported),
-    ("endmntent", FileApiKind::NotSupported),
-    ("getmntent", FileApiKind::NotSupported),
-    ("setmntent", FileApiKind::NotSupported),
-    ("fgetpos", FileApiKind::NotSupported),
-    ("fsetpos", FileApiKind::NotSupported),
-    ("__fpending", FileApiKind::NotSupported),
-    ("__freading", FileApiKind::NotSupported),
-    ("__fwriting", FileApiKind::NotSupported),
-];
-
-static IO_API_NAMES: [&str; 8] = [
-    "scanf", "vscanf", "getchar", "printf", "vprintf", "putchar", "puts", "perror",
-];
-
-lazy_static! {
-    static ref FILE_API_NAME_SET: FxHashMap<&'static str, FileApiKind> =
-        FILE_API_NAMES.iter().copied().collect();
-    static ref IO_API_NAME_SET: FxHashSet<&'static str> = IO_API_NAMES.iter().copied().collect();
+    fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+        self.handle_expr(expr);
+        intravisit::walk_expr(self, expr);
+    }
 }

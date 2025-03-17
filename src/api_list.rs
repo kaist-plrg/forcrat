@@ -50,6 +50,10 @@ pub enum Permission {
     Close = 5,
 }
 
+impl Permission {
+    pub const NUM: usize = 6;
+}
+
 impl Idx for Permission {
     #[inline]
     fn new(idx: usize) -> Self {
@@ -74,6 +78,10 @@ pub enum Origin {
     File = 3,
     Pipe = 4,
     Buffer = 5,
+}
+
+impl Origin {
+    pub const NUM: usize = 6;
 }
 
 impl Idx for Origin {
