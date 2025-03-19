@@ -1,21 +1,17 @@
-use std::{fs, path::PathBuf};
+use std::{fs, ops::DerefMut, path::PathBuf};
 
 use etrace::ok_or;
-use rustc_ast::{mut_visit, mut_visit::MutVisitor};
-use rustc_data_structures::sync::Lrc;
+use rustc_ast::{ast::*, mut_visit, mut_visit::MutVisitor, ptr::P};
+use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashMap;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{mir, ty::TyCtxt};
-use rustc_session::parse::ParseSess;
-use rustc_span::{
-    source_map::{FilePathMapping, SourceMap},
-    FileName, RealFileName,
-};
+use rustc_span::{source_map::SourceMap, FileName, RealFileName, Symbol};
 
 use crate::{
     api_list::{is_symbol_api, Permission},
     ast_maker::*,
-    compile_util::{self, LoHi, Pass, SilentEmitter},
+    compile_util::{self, LoHi, Pass},
     file_analysis::{self, Loc},
 };
 
@@ -65,9 +61,7 @@ impl Pass for Transformation {
             if !path.starts_with(&dir) {
                 continue;
             }
-            let handler = rustc_errors::Handler::with_emitter(Box::new(SilentEmitter));
-            let source_map = Lrc::new(SourceMap::new(FilePathMapping::empty()));
-            let parse_sess = ParseSess::with_span_handler(handler, source_map);
+            let parse_sess = new_parse_sess();
             let mut parser = rustc_parse::new_parser_from_file(&parse_sess, &path, None);
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
@@ -75,7 +69,7 @@ impl Pass for Transformation {
                 fn_permissions: fn_permissions.get(&path).unwrap_or(&empty),
             };
             visitor.visit_crate(&mut krate);
-            let s = rustc_ast_pretty::pprust::crate_to_string_for_macros(&krate);
+            let s = pprust::crate_to_string_for_macros(&krate);
             fs::write(path, s).unwrap();
         }
     }
@@ -87,58 +81,104 @@ struct TransformVisitor<'a> {
 }
 
 impl MutVisitor for TransformVisitor<'_> {
-    fn visit_item_kind(&mut self, item: &mut rustc_ast::ItemKind) {
+    fn visit_item_kind(&mut self, item: &mut ItemKind) {
         mut_visit::noop_visit_item_kind(item, self);
 
-        if let rustc_ast::ItemKind::Fn(f) = item {
+        if let ItemKind::Fn(f) = item {
             let (_, lh) = compile_util::span_to_plh(f.sig.span, self.source_map).unwrap();
             if let Some(permissions) = self.fn_permissions.get(&lh) {
                 let mut ps = BitSet::new_empty(Permission::NUM);
                 for (param, perm) in f.sig.decl.inputs.iter_mut().zip(permissions) {
                     if !perm.is_empty() {
-                        let path = mk_path(vec![mk_path_segment(mk_ident("TTT"), None)]);
-                        *param.ty = mk_path_ty(path);
+                        *param.ty = ty!("Option<TTT>");
                         ps.union(*perm);
                     }
                 }
                 if !ps.is_empty() {
-                    let mut bounds = vec![];
-                    for p in ps.iter() {
-                        let p = format!("{:?}", p);
-                        let bound = rustc_ast::GenericBound::Trait(
-                            mk_poly_trait_ref(
-                                vec![],
-                                mk_trait_ref(mk_path(vec![
-                                    mk_path_segment(mk_ident("std"), None),
-                                    mk_path_segment(mk_ident("io"), None),
-                                    mk_path_segment(mk_ident(&p), None),
-                                ])),
-                            ),
-                            rustc_ast::TraitBoundModifier::None,
-                        );
-                        bounds.push(bound);
+                    let mut param = "TTT: ".to_string();
+                    for (i, p) in ps.iter().enumerate() {
+                        if i > 0 {
+                            param.push_str(" + ");
+                        }
+                        use std::fmt::Write;
+                        write!(param, "std::io::{:?}", p).unwrap();
                     }
-                    let gp = mk_generic_param(
-                        mk_ident("TTT"),
-                        bounds,
-                        rustc_ast::GenericParamKind::Type { default: None },
-                    );
-                    f.generics.params.push(gp);
+                    f.generics.params.push(parse_ty_param(param));
                 }
             }
         }
     }
 
-    //     fn visit_block(&mut self, block: &mut P<rustc_ast::Block>) {
-    //         mut_visit::noop_visit_block(block, self);
+    fn visit_expr(&mut self, expr: &mut P<Expr>) {
+        mut_visit::noop_visit_expr(expr, self);
+        if let ExprKind::Call(callee, args) = &mut expr.kind {
+            if let ExprKind::Path(None, path) = &callee.kind {
+                if let [seg] = &path.segments[..] {
+                    let symbol = seg.ident.name;
+                    match symbol.as_str() {
+                        "fopen" => {
+                            let [path, mode] = &args[..] else { panic!() };
+                            let mode = normalize_open_mode(mode);
+                            match mode {
+                                OpenMode::Lit(mode) => {
+                                    let (prefix, _suffix) = mode.as_str().split_at(1);
+                                    match prefix {
+                                        "r" => {
+                                            let new_expr = expr!(
+                                                "std::fs::File::open(std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()).ok()",
+                                                pprust::expr_to_string(path)
+                                            );
+                                            *expr.deref_mut() = new_expr;
+                                        }
+                                        "w" => todo!(),
+                                        "a" => todo!(),
+                                        _ => panic!("{:?}", mode),
+                                    }
+                                }
+                                OpenMode::If(_c, _t, _f) => todo!(),
+                                OpenMode::Other(_e) => todo!(),
+                            }
+                        }
+                        "fclose" => {
+                            *callee.deref_mut() = expr!("drop");
+                        }
+                        "fgetc" | "getc" => {
+                            let [stream] = &args[..] else { panic!() };
+                            let stream = pprust::expr_to_string(stream);
+                            let new_expr = expr!("{{
+                                let mut buf = [0];
+                                ({}).unwrap().read_exact(&mut buf).map_or(libc::EOF, |_| buf[0] as _)
+                            }}", stream);
+                            *expr.deref_mut() = new_expr;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
 
-    //         let expr = mk_lit_expr(rustc_ast::token::LitKind::Bool, "true");
-    //         let pat = mk_ident_pat(
-    //             rustc_ast::ByRef::No,
-    //             rustc_ast::Mutability::Not,
-    //             "newly_defined_x",
-    //         );
-    //         let stmt = mk_local_init_stmt(pat, None, expr);
-    //         block.stmts.insert(0, stmt);
-    //     }
+#[derive(Debug)]
+enum OpenMode<'a> {
+    Lit(Symbol),
+    If(&'a Expr, Box<OpenMode<'a>>, Box<OpenMode<'a>>),
+    Other(&'a Expr),
+}
+
+fn normalize_open_mode(expr: &Expr) -> OpenMode<'_> {
+    match &expr.kind {
+        ExprKind::MethodCall(box MethodCall { receiver: e, .. }) | ExprKind::Cast(e, _) => {
+            normalize_open_mode(e)
+        }
+        ExprKind::Lit(lit) => OpenMode::Lit(lit.symbol),
+        ExprKind::If(c, t, Some(f)) => {
+            let [t] = &t.stmts[..] else { panic!() };
+            let StmtKind::Expr(t) = &t.kind else { panic!() };
+            let t = normalize_open_mode(t);
+            let f = normalize_open_mode(f);
+            OpenMode::If(c, Box::new(t), Box::new(f))
+        }
+        _ => OpenMode::Other(expr),
+    }
 }
