@@ -40,16 +40,15 @@ pub struct AnalysisResult {
     pub origins: IndexVec<LocId, BitSet<Origin>>,
 }
 
-#[derive(Debug)]
-pub struct FileAnalysis {
-    pub steensgaard: steensgaard::AnalysisResult,
-}
+#[derive(Debug, Clone, Copy)]
+pub struct FileAnalysis;
 
 impl Pass for FileAnalysis {
     type Out = AnalysisResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        info!("\n{:?}", self.steensgaard);
+        let steensgaard = steensgaard::Steensgaard.run(tcx);
+        info!("\n{:?}", steensgaard);
         let hir = tcx.hir();
 
         let mut visitor = StdioArgVisitor::new(tcx);
@@ -73,9 +72,7 @@ impl Pass for FileAnalysis {
                     if is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
                         continue;
                     }
-                    let ty = self
-                        .steensgaard
-                        .var_ty(self.steensgaard.global(local_def_id));
+                    let ty = steensgaard.var_ty(steensgaard.global(local_def_id));
                     fn_ty_functions
                         .entry(ty.fn_ty)
                         .or_default()
@@ -130,7 +127,7 @@ impl Pass for FileAnalysis {
         origin_graph.add_solution(loc_ind_map[&Loc::Stderr], Origin::Stderr);
         let mut analyzer = Analyzer {
             tcx,
-            steensgaard: &self.steensgaard,
+            steensgaard: &steensgaard,
             fn_ty_functions,
             stdio_arg_locs,
             loc_ind_map: &loc_ind_map,

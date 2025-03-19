@@ -128,12 +128,22 @@ pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoHi {
     lo_line: usize,
     lo_col: usize,
     hi_line: usize,
     hi_col: usize,
+}
+
+impl std::fmt::Debug for LoHi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}-{}:{}",
+            self.lo_line, self.lo_col, self.hi_line, self.hi_col
+        )
+    }
 }
 
 pub fn span_to_plh(span: Span, source_map: &SourceMap) -> Option<(PathBuf, LoHi)> {

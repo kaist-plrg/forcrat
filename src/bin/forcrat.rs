@@ -11,6 +11,7 @@ use forcrat::{api_list::API_LIST, compile_util::Pass, *};
 enum Command {
     CountApis,
     CountReturnValues,
+    Steensgaard,
     Analyze,
     Transformation {
         #[arg(short, long)]
@@ -64,13 +65,15 @@ fn main() {
                 println!("{} {} {}", name, counts.used, counts.unused);
             }
         }
-        Command::Analyze => {
+        Command::Steensgaard => {
             let res = steensgaard::Steensgaard.run_on_path(&file);
             println!("{:?}", res.vars);
             println!("{:?}", res.var_tys);
             println!("{:?}", res.fns);
             println!("{:?}", res.fn_tys);
-            file_analysis::FileAnalysis { steensgaard: res }.run_on_path(&file);
+        }
+        Command::Analyze => {
+            file_analysis::FileAnalysis.run_on_path(&file);
         }
         Command::Transformation { mut output } => {
             output.push(args.input.file_name().unwrap());
@@ -83,12 +86,7 @@ fn main() {
             copy_dir(&args.input, &output, true);
             let file = output.join("c2rust-lib.rs");
 
-            let res = steensgaard::Steensgaard.run_on_path(&file);
-            let res = file_analysis::FileAnalysis { steensgaard: res }.run_on_path(&file);
-            transformation::Transformation {
-                analysis_result: res,
-            }
-            .run_on_path(&file);
+            transformation::Transformation.run_on_path(&file);
         }
     }
 }
