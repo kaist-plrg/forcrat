@@ -146,22 +146,18 @@ impl std::fmt::Debug for LoHi {
     }
 }
 
-pub fn span_to_plh(span: Span, source_map: &SourceMap) -> Option<(PathBuf, LoHi)> {
+pub fn span_to_flh(span: Span, source_map: &SourceMap) -> (FileName, LoHi) {
     let fname = source_map.span_to_filename(span);
     let file = source_map.get_source_file(&fname).unwrap();
-    if let FileName::Real(RealFileName::LocalPath(p)) = fname {
-        let lo = file.lookup_file_pos_with_col_display(span.lo());
-        let hi = file.lookup_file_pos_with_col_display(span.hi());
-        let lo_hi = LoHi {
-            lo_line: lo.0,
-            lo_col: lo.2,
-            hi_line: hi.0,
-            hi_col: hi.2,
-        };
-        Some((p, lo_hi))
-    } else {
-        None
-    }
+    let lo = file.lookup_file_pos_with_col_display(span.lo());
+    let hi = file.lookup_file_pos_with_col_display(span.hi());
+    let lo_hi = LoHi {
+        lo_line: lo.0,
+        lo_col: lo.2,
+        hi_line: hi.0,
+        hi_col: hi.2,
+    };
+    (fname, lo_hi)
 }
 
 pub type Suggestions = HashMap<PathBuf, Vec<Suggestion>>;

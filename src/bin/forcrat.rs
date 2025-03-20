@@ -86,7 +86,10 @@ fn main() {
             copy_dir(&args.input, &output, true);
             let file = output.join("c2rust-lib.rs");
 
-            transformation::Transformation.run_on_path(&file);
+            let updated = transformation::Transformation.run_on_path(&file);
+            for (p, s) in updated {
+                fs::write(p, s).unwrap();
+            }
         }
     }
 }

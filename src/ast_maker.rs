@@ -23,7 +23,7 @@ pub fn new_parse_sess() -> ParseSess {
 
 #[inline]
 pub fn new_parser_from_str(parse_sess: &ParseSess, s: String) -> Parser<'_> {
-    let file_name = FileName::Custom("".to_string());
+    let file_name = FileName::Custom("main.rs".to_string());
     rustc_parse::new_parser_from_source_str(parse_sess, file_name, s)
 }
 

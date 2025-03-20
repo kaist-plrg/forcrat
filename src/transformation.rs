@@ -1,4 +1,4 @@
-use std::{fs, ops::DerefMut};
+use std::{fs, ops::DerefMut, path::PathBuf};
 
 use etrace::{ok_or, some_or};
 use rustc_ast::{ast::*, mut_visit, mut_visit::MutVisitor, ptr::P};
@@ -19,15 +19,22 @@ use crate::{
 pub struct Transformation;
 
 impl Pass for Transformation {
-    type Out = ();
+    type Out = Vec<(PathBuf, String)>;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let source_map = tcx.sess.source_map();
 
         let files = source_map.files();
         let lib = files.iter().next().unwrap();
-        let FileName::Real(RealFileName::LocalPath(lib_path)) = &lib.name else { panic!() };
-        let dir = fs::canonicalize(lib_path.parent().unwrap()).unwrap();
+        let dir = match &lib.name {
+            // normal input
+            FileName::Real(RealFileName::LocalPath(lib_path)) => {
+                Some(fs::canonicalize(lib_path.parent().unwrap()).unwrap())
+            }
+            // test input
+            FileName::Custom(_) => None,
+            _ => panic!(),
+        };
         drop(files);
 
         let analysis_result = file_analysis::FileAnalysis.run(tcx);
@@ -59,12 +66,15 @@ impl Pass for Transformation {
                     } else {
                         let o = &analysis_result.origins[*loc_id];
                         let span = local.source_info.span;
-                        let (p, lh) = compile_util::span_to_plh(span, source_map).unwrap();
-                        local_origins.entry(p).or_default().insert(lh, o);
+                        let (fname, lh) = compile_util::span_to_flh(span, source_map);
+                        local_origins.entry(fname).or_default().insert(lh, o);
                     }
                 }
-                let (p, lh) = compile_util::span_to_plh(sig.span, source_map).unwrap();
-                fn_permissions.entry(p).or_default().insert(lh, permissions);
+                let (fname, lh) = compile_util::span_to_flh(sig.span, source_map);
+                fn_permissions
+                    .entry(fname)
+                    .or_default()
+                    .insert(lh, permissions);
 
                 for bbd in body.basic_blocks.iter() {
                     let terminator = bbd.terminator();
@@ -85,35 +95,58 @@ impl Pass for Transformation {
                     if file_args.is_empty() {
                         continue;
                     }
-                    let (p, lh) = compile_util::span_to_plh(span, source_map).unwrap();
-                    call_file_args.entry(p).or_default().insert(lh, file_args);
+                    let (fname, lh) = compile_util::span_to_flh(span, source_map);
+                    call_file_args
+                        .entry(fname)
+                        .or_default()
+                        .insert(lh, file_args);
                 }
             }
         }
 
+        let mut updated = vec![];
         for file in source_map.files().iter() {
-            let FileName::Real(RealFileName::LocalPath(path)) = &file.name else { continue };
-            let path = ok_or!(fs::canonicalize(path), continue);
-            if !path.starts_with(&dir) {
-                continue;
-            }
             let parse_sess = new_parse_sess();
-            let mut parser = rustc_parse::new_parser_from_file(&parse_sess, &path, None);
+            let (path, mut parser) = if let Some(dir) = &dir {
+                // normal input
+                let FileName::Real(RealFileName::LocalPath(path)) = &file.name else { continue };
+                let path = ok_or!(fs::canonicalize(path), continue);
+                if !path.starts_with(dir) {
+                    continue;
+                }
+                let parser = rustc_parse::new_parser_from_file(&parse_sess, &path, None);
+                (path, parser)
+            } else {
+                // test input
+                let FileName::Custom(path) = &file.name else { continue };
+                if path != "main.rs" {
+                    continue;
+                }
+                let code = file.src.as_ref().unwrap();
+                let parser = new_parser_from_str(&parse_sess, code.to_string());
+                (PathBuf::from("main.rs"), parser)
+            };
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
+                updated: false,
                 source_map: parse_sess.source_map(),
-                fn_permissions: fn_permissions.get(&path),
-                local_origins: local_origins.get(&path),
-                call_file_args: call_file_args.get(&path),
+                fn_permissions: fn_permissions.get(&file.name),
+                local_origins: local_origins.get(&file.name),
+                call_file_args: call_file_args.get(&file.name),
             };
             visitor.visit_crate(&mut krate);
-            let s = pprust::crate_to_string_for_macros(&krate);
-            fs::write(path, s).unwrap();
+            if visitor.updated {
+                let s = pprust::crate_to_string_for_macros(&krate);
+                updated.push((path, s));
+            }
         }
+
+        updated
     }
 }
 
 struct TransformVisitor<'a> {
+    updated: bool,
     source_map: &'a SourceMap,
     fn_permissions: Option<&'a FxHashMap<LoHi, Vec<&'a BitSet<Permission>>>>,
     local_origins: Option<&'a FxHashMap<LoHi, &'a BitSet<Origin>>>,
@@ -142,7 +175,7 @@ impl MutVisitor for TransformVisitor<'_> {
         mut_visit::noop_visit_item_kind(item, self);
 
         if let ItemKind::Fn(f) = item {
-            let (_, lh) = compile_util::span_to_plh(f.sig.span, self.source_map).unwrap();
+            let (_, lh) = compile_util::span_to_flh(f.sig.span, self.source_map);
             if let Some(permissions) = self.fn_permissions(lh) {
                 let mut ps = BitSet::new_empty(Permission::NUM);
                 for (param, perm) in f.sig.decl.inputs.iter_mut().zip(permissions) {
@@ -152,6 +185,7 @@ impl MutVisitor for TransformVisitor<'_> {
                     }
                 }
                 if !ps.is_empty() {
+                    self.updated = true;
                     let mut param = "TTT: ".to_string();
                     for (i, p) in ps.iter().enumerate() {
                         if i > 0 {
@@ -169,9 +203,10 @@ impl MutVisitor for TransformVisitor<'_> {
     fn visit_local(&mut self, local: &mut P<Local>) {
         mut_visit::noop_visit_local(local, self);
 
-        let (_, lh) = compile_util::span_to_plh(local.pat.span, self.source_map).unwrap();
+        let (_, lh) = compile_util::span_to_flh(local.pat.span, self.source_map);
         if let Some(origins) = self.local_origins(lh) {
             if !origins.is_empty() {
+                self.updated = true;
                 let origins: Vec<_> = origins.iter().collect();
                 let [origin] = &origins[..] else { panic!() };
                 match origin {
@@ -189,13 +224,14 @@ impl MutVisitor for TransformVisitor<'_> {
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
         mut_visit::noop_visit_expr(expr, self);
-        let (_, lh) = compile_util::span_to_plh(expr.span, self.source_map).unwrap();
+        let (_, lh) = compile_util::span_to_flh(expr.span, self.source_map);
         if let ExprKind::Call(callee, args) = &mut expr.kind {
             if let ExprKind::Path(None, path) = &callee.kind {
                 if let [seg] = &path.segments[..] {
                     let symbol = seg.ident.name;
                     match symbol.as_str() {
                         "fopen" => {
+                            self.updated = true;
                             let [path, mode] = &args[..] else { panic!() };
                             let mode = normalize_open_mode(mode);
                             match mode {
@@ -219,9 +255,11 @@ impl MutVisitor for TransformVisitor<'_> {
                             }
                         }
                         "fclose" => {
+                            self.updated = true;
                             *callee.deref_mut() = expr!("drop");
                         }
                         "fgetc" | "getc" => {
+                            self.updated = true;
                             let [stream] = &args[..] else { panic!() };
                             let stream = pprust::expr_to_string(stream);
                             let new_expr = expr!("{{
@@ -238,6 +276,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                     let new_expr = expr!("({}).as_mut()", a);
                                     *arg = P(new_expr);
                                 }
+                                self.updated = true;
                             }
                         }
                     }
@@ -270,3 +309,6 @@ fn normalize_open_mode(expr: &Expr) -> OpenMode<'_> {
         _ => OpenMode::Other(expr),
     }
 }
+
+#[cfg(test)]
+mod tests;
