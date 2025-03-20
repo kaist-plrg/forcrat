@@ -1,6 +1,4 @@
 use std::{
-    collections::HashMap,
-    fs,
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
@@ -35,7 +33,6 @@ use rustc_span::{
     source_map::{FileName, SourceMap},
     RealFileName, Span, Symbol,
 };
-use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 
 use crate::rustc_middle::ty::{TypeSuperVisitable, TypeVisitable};
 
@@ -125,91 +122,6 @@ pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
         Some(p)
     } else {
         None
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LoHi {
-    lo_line: usize,
-    lo_col: usize,
-    hi_line: usize,
-    hi_col: usize,
-}
-
-impl std::fmt::Debug for LoHi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{}-{}:{}",
-            self.lo_line, self.lo_col, self.hi_line, self.hi_col
-        )
-    }
-}
-
-pub fn span_to_flh(span: Span, source_map: &SourceMap) -> (FileName, LoHi) {
-    let fname = source_map.span_to_filename(span);
-    let file = source_map.get_source_file(&fname).unwrap();
-    let lo = file.lookup_file_pos_with_col_display(span.lo());
-    let hi = file.lookup_file_pos_with_col_display(span.hi());
-    let lo_hi = LoHi {
-        lo_line: lo.0,
-        lo_col: lo.2,
-        hi_line: hi.0,
-        hi_col: hi.2,
-    };
-    (fname, lo_hi)
-}
-
-pub type Suggestions = HashMap<PathBuf, Vec<Suggestion>>;
-
-pub fn apply_suggestions(suggestions: &Suggestions) {
-    for (path, suggestions) in suggestions {
-        if suggestions.is_empty() {
-            continue;
-        }
-        let code = String::from_utf8(fs::read(path).unwrap()).unwrap();
-        let fixed = rustfix::apply_suggestions(&code, suggestions).unwrap();
-        fs::write(path, fixed.as_bytes()).unwrap();
-    }
-}
-
-pub fn make_suggestion(snippet: Snippet, replacement: String) -> Suggestion {
-    let replacement = Replacement {
-        snippet: snippet.clone(),
-        replacement,
-    };
-    let solution = Solution {
-        message: "".into(),
-        replacements: vec![replacement],
-    };
-    Suggestion {
-        message: "".into(),
-        snippets: vec![snippet],
-        solutions: vec![solution],
-    }
-}
-
-pub fn span_to_snippet(span: Span, source_map: &SourceMap) -> Snippet {
-    let fname = source_map.span_to_filename(span);
-    let file = source_map.get_source_file(&fname).unwrap();
-    let lo = file.lookup_file_pos_with_col_display(span.lo());
-    let hi = file.lookup_file_pos_with_col_display(span.hi());
-    let line_range = LineRange {
-        start: LinePosition {
-            line: lo.0,
-            column: lo.2,
-        },
-        end: LinePosition {
-            line: hi.0,
-            column: hi.2,
-        },
-    };
-    let lo_offset = file.original_relative_byte_pos(span.lo()).0;
-    let hi_offset = file.original_relative_byte_pos(span.hi()).0;
-    Snippet {
-        file_name: fname.prefer_remapped().to_string(),
-        line_range,
-        range: (lo_offset as usize)..(hi_offset as usize),
     }
 }
 

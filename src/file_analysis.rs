@@ -384,7 +384,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let sig = self.tcx.fn_sig(callee).skip_binder().skip_binder();
         for (i, (t, arg)) in sig.inputs().iter().zip(args).enumerate() {
             if let Some(variance) = file_type_variance(*t, self.tcx) {
-                println!("{:?} {:?}", ctx.function, callee);
                 let l = Loc::Var(callee, Local::new(i + 1));
                 let l = self.loc_ind_map[&l];
                 let r = self.transfer_operand(arg, ctx).unwrap();

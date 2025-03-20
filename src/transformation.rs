@@ -1,48 +1,42 @@
-use std::{fs, ops::DerefMut, path::PathBuf};
+use std::{fs, ops::DerefMut};
 
-use etrace::{ok_or, some_or};
+use etrace::some_or;
 use rustc_ast::{ast::*, mut_visit, mut_visit::MutVisitor, ptr::P};
 use rustc_ast_pretty::pprust;
 use rustc_hash::FxHashMap;
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{mir, ty::TyCtxt};
-use rustc_span::{source_map::SourceMap, FileName, RealFileName, Symbol};
+use rustc_span::{FileName, RealFileName, Span, Symbol};
 
 use crate::{
     api_list::{is_symbol_api, Origin, Permission},
     ast_maker::*,
-    compile_util::{self, contains_file_ty, LoHi, Pass},
+    compile_util::{self, Pass},
     file_analysis::{self, Loc},
 };
+
+pub fn write_to_files(fss: &[(FileName, String)]) -> std::io::Result<()> {
+    for (f, s) in fss {
+        let FileName::Real(RealFileName::LocalPath(p)) = f else { panic!() };
+        fs::write(p, s)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Transformation;
 
 impl Pass for Transformation {
-    type Out = Vec<(PathBuf, String)>;
+    type Out = Vec<(FileName, String)>;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
+        let analysis_result = file_analysis::FileAnalysis.run(tcx);
+        let hir = tcx.hir();
         let source_map = tcx.sess.source_map();
 
-        let files = source_map.files();
-        let lib = files.iter().next().unwrap();
-        let dir = match &lib.name {
-            // normal input
-            FileName::Real(RealFileName::LocalPath(lib_path)) => {
-                Some(fs::canonicalize(lib_path.parent().unwrap()).unwrap())
-            }
-            // test input
-            FileName::Custom(_) => None,
-            _ => panic!(),
-        };
-        drop(files);
-
-        let analysis_result = file_analysis::FileAnalysis.run(tcx);
-
-        let hir = tcx.hir();
-        let mut fn_permissions: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
-        let mut local_origins: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
-        let mut call_file_args: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
+        let mut fn_permissions: FxHashMap<_, _> = FxHashMap::default();
+        let mut local_origins: FxHashMap<_, _> = FxHashMap::default();
+        let mut call_file_args: FxHashMap<_, _> = FxHashMap::default();
 
         for item_id in hir.items() {
             let item = hir.item(item_id);
@@ -65,16 +59,10 @@ impl Pass for Transformation {
                         permissions.push(p);
                     } else {
                         let o = &analysis_result.origins[*loc_id];
-                        let span = local.source_info.span;
-                        let (fname, lh) = compile_util::span_to_flh(span, source_map);
-                        local_origins.entry(fname).or_default().insert(lh, o);
+                        local_origins.insert(local.source_info.span, o);
                     }
                 }
-                let (fname, lh) = compile_util::span_to_flh(sig.span, source_map);
-                fn_permissions
-                    .entry(fname)
-                    .or_default()
-                    .insert(lh, permissions);
+                fn_permissions.insert(sig.span, permissions);
 
                 for bbd in body.basic_blocks.iter() {
                     let terminator = bbd.terminator();
@@ -85,7 +73,7 @@ impl Pass for Transformation {
                         .enumerate()
                         .filter_map(|(i, arg)| {
                             let ty = arg.ty(&body.local_decls, tcx);
-                            if contains_file_ty(ty, tcx) {
+                            if compile_util::contains_file_ty(ty, tcx) {
                                 Some(i)
                             } else {
                                 None
@@ -95,49 +83,38 @@ impl Pass for Transformation {
                     if file_args.is_empty() {
                         continue;
                     }
-                    let (fname, lh) = compile_util::span_to_flh(span, source_map);
-                    call_file_args
-                        .entry(fname)
-                        .or_default()
-                        .insert(lh, file_args);
+                    call_file_args.insert(span, file_args);
                 }
             }
         }
 
+        let parse_sess = new_parse_sess();
         let mut updated = vec![];
+
         for file in source_map.files().iter() {
-            let parse_sess = new_parse_sess();
-            let (path, mut parser) = if let Some(dir) = &dir {
-                // normal input
-                let FileName::Real(RealFileName::LocalPath(path)) = &file.name else { continue };
-                let path = ok_or!(fs::canonicalize(path), continue);
-                if !path.starts_with(dir) {
-                    continue;
-                }
-                let parser = rustc_parse::new_parser_from_file(&parse_sess, &path, None);
-                (path, parser)
-            } else {
-                // test input
-                let FileName::Custom(path) = &file.name else { continue };
-                if path != "main.rs" {
-                    continue;
-                }
-                let code = file.src.as_ref().unwrap();
-                let parser = new_parser_from_str(&parse_sess, code.to_string());
-                (PathBuf::from("main.rs"), parser)
-            };
+            if !matches!(
+                file.name,
+                FileName::Real(RealFileName::LocalPath(_)) | FileName::Custom(_)
+            ) {
+                continue;
+            }
+            let src = some_or!(file.src.as_ref(), continue);
+            let mut parser = rustc_parse::new_parser_from_source_str(
+                &parse_sess,
+                file.name.clone(),
+                src.to_string(),
+            );
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
                 updated: false,
-                source_map: parse_sess.source_map(),
-                fn_permissions: fn_permissions.get(&file.name),
-                local_origins: local_origins.get(&file.name),
-                call_file_args: call_file_args.get(&file.name),
+                fn_permissions: &fn_permissions,
+                local_origins: &local_origins,
+                call_file_args: &call_file_args,
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
                 let s = pprust::crate_to_string_for_macros(&krate);
-                updated.push((path, s));
+                updated.push((file.name.clone(), s));
             }
         }
 
@@ -147,27 +124,9 @@ impl Pass for Transformation {
 
 struct TransformVisitor<'a> {
     updated: bool,
-    source_map: &'a SourceMap,
-    fn_permissions: Option<&'a FxHashMap<LoHi, Vec<&'a BitSet<Permission>>>>,
-    local_origins: Option<&'a FxHashMap<LoHi, &'a BitSet<Origin>>>,
-    call_file_args: Option<&'a FxHashMap<LoHi, Vec<usize>>>,
-}
-
-impl<'a> TransformVisitor<'a> {
-    #[inline]
-    fn fn_permissions(&self, lh: LoHi) -> Option<&[&'a BitSet<Permission>]> {
-        self.fn_permissions?.get(&lh).map(|v| &v[..])
-    }
-
-    #[inline]
-    fn local_origins(&self, lh: LoHi) -> Option<&'a BitSet<Origin>> {
-        self.local_origins?.get(&lh).copied()
-    }
-
-    #[inline]
-    fn call_file_args(&self, lh: LoHi) -> Option<&[usize]> {
-        self.call_file_args?.get(&lh).map(|v| &v[..])
-    }
+    fn_permissions: &'a FxHashMap<Span, Vec<&'a BitSet<Permission>>>,
+    local_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
+    call_file_args: &'a FxHashMap<Span, Vec<usize>>,
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -175,8 +134,7 @@ impl MutVisitor for TransformVisitor<'_> {
         mut_visit::noop_visit_item_kind(item, self);
 
         if let ItemKind::Fn(f) = item {
-            let (_, lh) = compile_util::span_to_flh(f.sig.span, self.source_map);
-            if let Some(permissions) = self.fn_permissions(lh) {
+            if let Some(permissions) = self.fn_permissions.get(&f.sig.span) {
                 let mut ps = BitSet::new_empty(Permission::NUM);
                 for (param, perm) in f.sig.decl.inputs.iter_mut().zip(permissions) {
                     if !perm.is_empty() {
@@ -203,8 +161,7 @@ impl MutVisitor for TransformVisitor<'_> {
     fn visit_local(&mut self, local: &mut P<Local>) {
         mut_visit::noop_visit_local(local, self);
 
-        let (_, lh) = compile_util::span_to_flh(local.pat.span, self.source_map);
-        if let Some(origins) = self.local_origins(lh) {
+        if let Some(origins) = self.local_origins.get(&local.pat.span) {
             if !origins.is_empty() {
                 self.updated = true;
                 let origins: Vec<_> = origins.iter().collect();
@@ -224,7 +181,7 @@ impl MutVisitor for TransformVisitor<'_> {
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
         mut_visit::noop_visit_expr(expr, self);
-        let (_, lh) = compile_util::span_to_flh(expr.span, self.source_map);
+        let expr_span = expr.span;
         if let ExprKind::Call(callee, args) = &mut expr.kind {
             if let ExprKind::Path(None, path) = &callee.kind {
                 if let [seg] = &path.segments[..] {
@@ -269,7 +226,7 @@ impl MutVisitor for TransformVisitor<'_> {
                             *expr.deref_mut() = new_expr;
                         }
                         _ => {
-                            if let Some(pos) = self.call_file_args(lh) {
+                            if let Some(pos) = self.call_file_args.get(&expr_span) {
                                 for i in pos {
                                     let arg = &mut args[*i];
                                     let a = pprust::expr_to_string(arg);
