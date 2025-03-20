@@ -41,20 +41,29 @@ pub trait Pass: Sync {
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out;
 
+    #[inline]
+    fn config(input: Input) -> Config {
+        make_silent_config(input)
+    }
+
+    #[inline]
     fn run_on_input(&self, input: Input) -> Self::Out {
-        let config = make_config(input);
+        let config = Self::config(input);
         run_compiler(config, |tcx| self.run(tcx)).unwrap()
     }
 
+    #[inline]
     fn run_on_path(&self, path: &Path) -> Self::Out {
         self.run_on_input(path_to_input(path))
     }
 
+    #[inline]
     fn run_on_str(&self, code: &str) -> Self::Out {
         self.run_on_input(str_to_input(code))
     }
 }
 
+#[inline]
 pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(config: Config, f: F) -> Option<R> {
     rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config, |compiler| {
@@ -64,6 +73,7 @@ pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(config: Config, 
     .ok()?
 }
 
+#[inline]
 pub fn make_config(input: Input) -> Config {
     let opts = find_deps();
     Config {
@@ -86,14 +96,31 @@ pub fn make_config(input: Input) -> Config {
         file_loader: None,
         locale_resources: rustc_driver_impl::DEFAULT_LOCALE_RESOURCES,
         lint_caps: FxHashMap::default(),
-        parse_sess_created: Some(Box::new(|ps| {
-            ps.span_diagnostic = Handler::with_emitter(Box::new(SilentEmitter));
-        })),
+        parse_sess_created: None,
         register_lints: None,
         override_queries: None,
         make_codegen_backend: None,
         registry: Registry::new(rustc_error_codes::DIAGNOSTICS),
     }
+}
+
+pub fn make_no_warning_config(input: Input) -> Config {
+    let mut config = make_config(input);
+    config.parse_sess_created = Some(Box::new(|ps| {
+        let mut dummy = Handler::with_emitter(Box::new(SilentEmitter));
+        std::mem::swap(&mut ps.span_diagnostic, &mut dummy);
+        dummy = dummy.disable_warnings();
+        std::mem::swap(&mut ps.span_diagnostic, &mut dummy);
+    }));
+    config
+}
+
+pub fn make_silent_config(input: Input) -> Config {
+    let mut config = make_config(input);
+    config.parse_sess_created = Some(Box::new(|ps| {
+        ps.span_diagnostic = Handler::with_emitter(Box::new(SilentEmitter));
+    }));
+    config
 }
 
 pub fn make_counting_config(input: Input) -> (Config, Arc<Mutex<usize>>) {

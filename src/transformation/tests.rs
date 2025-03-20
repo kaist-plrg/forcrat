@@ -1,21 +1,36 @@
-use crate::compile_util::Pass;
+use lazy_static::lazy_static;
+
+use crate::{compile_util::Pass, formatter, ty_checker};
+
+#[inline]
+fn run_test<F: FnOnce(&str)>(s: &str, f: F) {
+    let mut code = PREAMBLE.to_string();
+    code.push_str(s);
+    let v = super::Transformation.run_on_str(&code);
+    let [(_, s)] = &v[..] else { panic!() };
+    f(s.strip_prefix(FORMATTED_PREAMBLE.as_str()).unwrap());
+    assert!(ty_checker::TyChecker.run_on_str(&s));
+}
 
 #[test]
 fn test_fgetc() {
-    let code = format!(
-        "{}
+    run_test(
+        "
 unsafe fn f(mut stream: *mut FILE) -> libc::c_int {{
+    fgetc(stream);
     return fgetc(stream);
 }}",
-        PREAMBLE
+        |s| {
+            assert!(s.contains("Read"));
+            assert!(s.contains("read_exact"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("fgetc"));
+        },
     );
-    let v = super::Transformation.run_on_str(&code);
-    let [(_, s)] = &v[..] else { panic!() };
-    assert!(s.contains("Read"));
-    assert!(s.contains("read_exact"));
 }
 
 const PREAMBLE: &str = r#"
+#![feature(extern_types)]
 use ::libc;
 extern "C" {
     pub type _IO_wide_data;
@@ -61,3 +76,7 @@ pub struct _IO_FILE {
 }
 pub type _IO_lock_t = ();
 pub type FILE = _IO_FILE;"#;
+
+lazy_static! {
+    static ref FORMATTED_PREAMBLE: String = formatter::Formatter.run_on_str(PREAMBLE);
+}
