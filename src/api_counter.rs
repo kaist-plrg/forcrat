@@ -14,6 +14,7 @@ use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use crate::{
     api_list::{is_symbol_api, normalize_api_name, API_MAP},
     compile_util::{def_id_to_value_symbol, is_std_io_expr, Pass},
+    printf,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -79,12 +80,13 @@ impl<'tcx> ApiVisitor<'tcx> {
             &mut self.counts
         };
         *counts.entry(*name).or_default() += 1;
-        if *name == "fseek" || *name == "fseeko" {
-            // if let OpenMode::Path(p, r) = normalize_open_mode(args[1], self.tcx) {
-            //     println!("{} {:?}", p, r);
-            // }
-            let source_map = self.tcx.sess.source_map();
-            println!("{}", source_map.span_to_snippet(args[2].span).unwrap());
+        if *name == "printf" || *name == "fprintf" {
+            let arg = if *name == "printf" { args[0] } else { args[1] };
+            if let OpenMode::Lit(lit) = normalize_open_mode(arg, self.tcx) {
+                println!("{:?}", String::from_utf8_lossy(&lit));
+                let (f, casts) = printf::to_rust_format(&lit);
+                println!("\"{}\" {:?}", f, casts);
+            }
         }
         true
     }
@@ -122,6 +124,7 @@ pub enum OpenMode {
     Lit(Rc<[u8]>),
     If(String, Box<OpenMode>, Box<OpenMode>),
     Path(String, Res),
+    Other(String),
 }
 
 pub fn normalize_open_mode<'tcx>(expr: Expr<'tcx>, tcx: TyCtxt<'tcx>) -> OpenMode {
@@ -143,6 +146,6 @@ pub fn normalize_open_mode<'tcx>(expr: Expr<'tcx>, tcx: TyCtxt<'tcx>) -> OpenMod
             let s = tcx.sess.source_map().span_to_snippet(path.span).unwrap();
             OpenMode::Path(s, path.res)
         }
-        _ => panic!(),
+        _ => OpenMode::Other(tcx.sess.source_map().span_to_snippet(expr.span).unwrap()),
     }
 }

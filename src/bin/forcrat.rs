@@ -48,16 +48,16 @@ fn main() {
 
     match args.command {
         Command::CountApis => {
-            let (counts, std_arg_counts) = api_counter::ApiCounter.run_on_path(&file);
-            for (name, api_kind) in API_LIST {
-                let v = counts.get(name).copied().unwrap_or(0);
-                print!("{} ", v);
-                if api_kind.is_read() || api_kind.is_write() {
-                    let v = std_arg_counts.get(name).copied().unwrap_or(0);
-                    print!("{} ", v);
-                }
+            let (_counts, _std_arg_counts) = api_counter::ApiCounter.run_on_path(&file);
+            for (_name, _api_kind) in API_LIST {
+                // let v = counts.get(name).copied().unwrap_or(0);
+                // print!("{} ", v);
+                // if api_kind.is_read() || api_kind.is_write() {
+                //     let v = std_arg_counts.get(name).copied().unwrap_or(0);
+                //     print!("{} ", v);
+                // }
             }
-            println!();
+            // println!();
         }
         Command::CountReturnValues => {
             let counts = retval_use_counter::RetValCounter.run_on_path(&file);
