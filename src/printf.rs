@@ -1,26 +1,13 @@
-pub fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>) {
+pub fn to_rust_format(mut remaining: &str) -> (String, Vec<&'static str>) {
     let mut format = String::new();
     let mut casts = vec![];
     loop {
         let res = parse_format(remaining);
-        for c in res.prefix {
-            match *c {
-                b'{' => format.push_str("{{"),
-                b'}' => format.push_str("}}"),
-                b'\n' => format.push_str("\\n"),
-                b'\r' => format.push_str("\\r"),
-                b'\t' => format.push_str("\\t"),
-                b'\\' => format.push_str("\\\\"),
-                b'\0' => {}
-                b'\"' => format.push_str("\\\""),
-                _ => {
-                    if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || *c == b' ' {
-                        format.push(*c as char);
-                    } else {
-                        use std::fmt::Write;
-                        write!(format, "\\u{{{:x}}}", *c).unwrap();
-                    }
-                }
+        for c in res.prefix.chars() {
+            match c {
+                '{' => format.push_str("{{"),
+                '}' => format.push_str("}}"),
+                _ => format.push(c),
             }
         }
         if let Some(cs) = res.conversion_spec {
@@ -85,14 +72,16 @@ pub fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>) {
             break;
         }
     }
+    assert!(format.ends_with("\\0"));
+    format.pop();
+    format.pop();
     (format, casts)
 }
 
 pub struct ParseResult<'a> {
-    #[allow(unused)]
-    pub prefix: &'a [u8],
+    pub prefix: &'a str,
     pub conversion_spec: Option<ConversionSpec>,
-    pub remaining: Option<&'a [u8]>,
+    pub remaining: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,9 +97,7 @@ enum State {
     Conversion,
 }
 
-pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
-    let err = |i: usize| String::from_utf8_lossy(&s[i..]);
-
+pub fn parse_format(s: &str) -> ParseResult<'_> {
     let mut start_idx = None;
     let mut state = State::Percent;
     let mut flags = vec![];
@@ -118,32 +105,32 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
     let mut precision = None;
     let mut length = None;
     let mut conversion = None;
-    for (i, c) in s.iter().enumerate() {
+    for (i, c) in s.chars().enumerate() {
         if state == State::Percent {
-            if *c == b'%' {
+            if c == '%' {
                 start_idx = Some(i);
                 state = State::Flag;
             }
-        } else if (b'1'..=b'9').contains(c) || (*c == b'0' && state != State::Flag) {
+        } else if ('1'..='9').contains(&c) || (c == '0' && state != State::Flag) {
             match state {
                 State::Flag => {
-                    width = Some(Width::Decimal((c - b'0') as usize));
+                    width = Some(Width::Decimal(c as usize - '0' as usize));
                     state = State::Width;
                 }
                 State::Width => {
                     let Some(Width::Decimal(n)) = &mut width else { unreachable!() };
-                    *n = *n * 10 + (c - b'0') as usize;
+                    *n = *n * 10 + (c as usize - '0' as usize);
                 }
                 State::Precision => match &mut precision {
-                    None => precision = Some(Width::Decimal((c - b'0') as usize)),
-                    Some(Width::Decimal(n)) => *n = *n * 10 + (c - b'0') as usize,
+                    None => precision = Some(Width::Decimal(c as usize - '0' as usize)),
+                    Some(Width::Decimal(n)) => *n = *n * 10 + (c as usize - '0' as usize),
                     _ => unreachable!(),
                 },
-                _ => panic!("{}", err(start_idx.unwrap())),
+                _ => panic!("{}", s),
             }
-        } else if let Some(flag) = FlagChar::from_u8(*c) {
+        } else if let Some(flag) = FlagChar::from_char(c) {
             flags.push(flag);
-        } else if *c == b'*' {
+        } else if c == '*' {
             match state {
                 State::Flag => {
                     width = Some(Width::Asterisk);
@@ -153,15 +140,15 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                     precision = Some(Width::Asterisk);
                     state = State::Length;
                 }
-                _ => panic!("{}", err(start_idx.unwrap())),
+                _ => panic!("{}", s),
             }
-        } else if *c == b'.' {
+        } else if c == '.' {
             if matches!(state, State::Flag | State::Width | State::Period) {
                 state = State::Precision;
             } else {
-                err(start_idx.unwrap());
+                panic!("{}", s);
             }
-        } else if let Some(len) = LengthMod::from_u8(*c) {
+        } else if let Some(len) = LengthMod::from_char(c) {
             match len {
                 LengthMod::Short => match state {
                     State::Flag
@@ -175,7 +162,7 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                         length = Some(LengthMod::Char);
                         state = State::Conversion;
                     }
-                    _ => panic!("{}", err(start_idx.unwrap())),
+                    _ => panic!("{}", s),
                 },
                 LengthMod::Long => match state {
                     State::Flag
@@ -189,14 +176,14 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                         length = Some(LengthMod::LongLong);
                         state = State::Conversion;
                     }
-                    _ => panic!("{}", err(start_idx.unwrap())),
+                    _ => panic!("{}", s),
                 },
                 _ => {
                     length = Some(len);
                     state = State::Conversion;
                 }
             }
-        } else if let Some(conv) = Conversion::from_u8(*c) {
+        } else if let Some(conv) = Conversion::from_char(c) {
             match state {
                 State::Flag
                 | State::Width
@@ -236,7 +223,7 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                 remaining: Some(&s[last_idx + 1..]),
             }
         } else {
-            panic!("{}", err(start_idx));
+            panic!("{}", s);
         }
     } else {
         ParseResult {
@@ -272,14 +259,14 @@ impl std::fmt::Display for FlagChar {
 
 impl FlagChar {
     #[inline]
-    fn from_u8(c: u8) -> Option<Self> {
+    fn from_char(c: char) -> Option<Self> {
         match c {
-            b'\'' => Some(Self::Apostrophe),
-            b'-' => Some(Self::Minus),
-            b'+' => Some(Self::Plus),
-            b' ' => Some(Self::Space),
-            b'#' => Some(Self::Hash),
-            b'0' => Some(Self::Zero),
+            '\'' => Some(Self::Apostrophe),
+            '-' => Some(Self::Minus),
+            '+' => Some(Self::Plus),
+            ' ' => Some(Self::Space),
+            '#' => Some(Self::Hash),
+            '0' => Some(Self::Zero),
             _ => None,
         }
     }
@@ -329,14 +316,14 @@ impl std::fmt::Display for LengthMod {
 
 impl LengthMod {
     #[inline]
-    fn from_u8(c: u8) -> Option<Self> {
+    fn from_char(c: char) -> Option<Self> {
         match c {
-            b'h' => Some(Self::Short),
-            b'l' => Some(Self::Long),
-            b'j' => Some(Self::IntMax),
-            b'z' => Some(Self::Size),
-            b't' => Some(Self::PtrDiff),
-            b'L' => Some(Self::LongDouble),
+            'h' => Some(Self::Short),
+            'l' => Some(Self::Long),
+            'j' => Some(Self::IntMax),
+            'z' => Some(Self::Size),
+            't' => Some(Self::PtrDiff),
+            'L' => Some(Self::LongDouble),
             _ => None,
         }
     }
@@ -387,24 +374,24 @@ impl std::fmt::Display for Conversion {
 
 impl Conversion {
     #[inline]
-    fn from_u8(c: u8) -> Option<Self> {
+    fn from_char(c: char) -> Option<Self> {
         match c {
-            b'd' | b'i' => Some(Self::Int),
-            b'o' => Some(Self::Octal),
-            b'u' => Some(Self::Unsigned),
-            b'x' => Some(Self::Hexadecimal),
-            b'X' => Some(Self::HexadecimalUpper),
-            b'f' | b'F' => Some(Self::Double),
-            b'e' | b'E' => Some(Self::DoubleExp),
-            b'g' | b'G' => Some(Self::DoubleAuto),
-            b'a' | b'A' => Some(Self::DoubleError),
-            b'c' => Some(Self::Char),
-            b's' => Some(Self::Str),
-            b'p' => Some(Self::Pointer),
-            b'n' => Some(Self::Num),
-            b'C' => Some(Self::C),
-            b'S' => Some(Self::S),
-            b'%' => Some(Self::Percent),
+            'd' | 'i' => Some(Self::Int),
+            'o' => Some(Self::Octal),
+            'u' => Some(Self::Unsigned),
+            'x' => Some(Self::Hexadecimal),
+            'X' => Some(Self::HexadecimalUpper),
+            'f' | 'F' => Some(Self::Double),
+            'e' | 'E' => Some(Self::DoubleExp),
+            'g' | 'G' => Some(Self::DoubleAuto),
+            'a' | 'A' => Some(Self::DoubleError),
+            'c' => Some(Self::Char),
+            's' => Some(Self::Str),
+            'p' => Some(Self::Pointer),
+            'n' => Some(Self::Num),
+            'C' => Some(Self::C),
+            'S' => Some(Self::S),
+            '%' => Some(Self::Percent),
             _ => None,
         }
     }

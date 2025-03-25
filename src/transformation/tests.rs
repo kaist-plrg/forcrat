@@ -163,6 +163,22 @@ unsafe fn f() -> libc::c_int {
 }
 
 #[test]
+fn test_printf() {
+    run_test(
+        r#"
+unsafe fn f(mut stream: *mut FILE) {
+    fprintf(stream, b"%d\0" as *const u8 as *const libc::c_char, 0 as libc::c_int);
+}"#,
+        |s| {
+            assert!(s.contains("write!"));
+            assert!(s.contains("i32"));
+            assert!(!s.contains("fprintf"));
+            assert!(!s.contains("%d"));
+        },
+    );
+}
+
+#[test]
 fn test_fputc() {
     run_test(
         "

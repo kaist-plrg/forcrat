@@ -336,7 +336,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     .var_ty(self.steensgaard.local(ctx.function, callee.local));
                 if let Some(callees) = self.fn_ty_functions.get(&ty.fn_ty) {
                     for callee in callees.clone() {
-                        assert!(is_def_id_api(callee, self.tcx));
+                        assert!(!is_def_id_api(callee, self.tcx));
                         self.transfer_non_api_call(callee, args, *destination, ctx);
                     }
                 }

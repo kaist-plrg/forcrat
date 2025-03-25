@@ -1,4 +1,7 @@
-use std::{fs, ops::DerefMut};
+use std::{
+    fs,
+    ops::{Deref, DerefMut},
+};
 
 use etrace::some_or;
 use rustc_ast::{ast::*, mut_visit, mut_visit::MutVisitor, ptr::P};
@@ -13,6 +16,7 @@ use crate::{
     ast_maker::*,
     compile_util::{self, Pass},
     file_analysis::{self, Loc},
+    printf,
 };
 
 pub fn write_to_files(fss: &[(FileName, String)]) -> std::io::Result<()> {
@@ -166,15 +170,14 @@ impl MutVisitor for TransformVisitor<'_> {
                 self.updated = true;
                 let origins: Vec<_> = origins.iter().collect();
                 let [origin] = &origins[..] else { panic!() };
-                match origin {
-                    Origin::File => {
-                        *local.ty.as_mut().unwrap() = P(ty!("Option<std::fs::File>"));
-                    }
-                    Origin::Stdin => todo!(),
-                    Origin::Stdout => todo!(),
-                    Origin::Stderr => todo!(),
+                let ty = match origin {
+                    Origin::File => ty!("Option<std::fs::File>"),
+                    Origin::Stdin => ty!("Option<std::io::Stdin>"),
+                    Origin::Stdout => ty!("Option<std::io::Stdout>"),
+                    Origin::Stderr => ty!("Option<std::io::Stderr>"),
                     _ => panic!(),
-                }
+                };
+                *local.ty.as_mut().unwrap() = P(ty);
             }
         }
     }
@@ -190,39 +193,8 @@ impl MutVisitor for TransformVisitor<'_> {
                         match symbol.as_str() {
                             "fopen" => {
                                 self.updated = true;
-                                let [path, mode] = &args[..] else { panic!() };
-                                let mode = normalize_open_mode(mode);
-                                match mode {
-                                    OpenMode::Lit(mode) => {
-                                        let (prefix, _suffix) = mode.as_str().split_at(1);
-                                        match prefix {
-                                            "r" => {
-                                                let new_expr = expr!(
-                                                "std::fs::File::open(std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()).ok()",
-                                                pprust::expr_to_string(path)
-                                            );
-                                                *expr.deref_mut() = new_expr;
-                                            }
-                                            "w" => {
-                                                let new_expr = expr!(
-                                                "std::fs::File::create(std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()).ok()",
-                                                pprust::expr_to_string(path)
-                                            );
-                                                *expr.deref_mut() = new_expr;
-                                            }
-                                            "a" => {
-                                                let new_expr = expr!(
-                                                "OpenOptions::new().append(true).create(true).open(std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()).ok()",
-                                                pprust::expr_to_string(path)
-                                            );
-                                                *expr.deref_mut() = new_expr;
-                                            }
-                                            _ => panic!("{:?}", mode),
-                                        }
-                                    }
-                                    OpenMode::If(_c, _t, _f) => todo!(),
-                                    OpenMode::Other(_e) => todo!(),
-                                }
+                                let new_expr = transform_fopen(&args[0], &args[1]);
+                                *expr.deref_mut() = new_expr;
                             }
                             "fclose" => {
                                 self.updated = true;
@@ -231,134 +203,72 @@ impl MutVisitor for TransformVisitor<'_> {
                             "fscanf" => todo!(),
                             "fgetc" | "getc" => {
                                 self.updated = true;
-                                let [stream] = &args[..] else { panic!() };
-                                let stream = pprust::expr_to_string(stream);
-                                let new_expr = expr!("{{
-                                use std::io::Read;
-                                let mut buf = [0];
-                                ({}).as_mut().unwrap().read_exact(&mut buf).map_or(libc::EOF, |_| buf[0] as _)
-                            }}", stream);
+                                let stream = pprust::expr_to_string(&args[0]);
+                                let new_expr = transform_fgetc(&stream);
                                 *expr.deref_mut() = new_expr;
                             }
                             "getchar" => {
                                 self.updated = true;
-                                let new_expr = expr!("{{
-                                use std::io::Read;
-                                let mut buf = [0];
-                                std::io::stdin().read_exact(&mut buf).map_or(libc::EOF, |_| buf[0] as _)
-                            }}");
+                                let stream = "Some(std::io::stdin())";
+                                let new_expr = transform_fgetc(stream);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fgets" => todo!(),
                             "fread" => todo!(),
                             "getdelim" => todo!(),
                             "getline" => todo!(),
-                            "fprintf" => todo!(),
-                            "printf" => todo!(),
+                            "fprintf" => {
+                                self.updated = true;
+                                let stream = pprust::expr_to_string(&args[0]);
+                                let new_expr = transform_fprintf(&stream, &args[1..]);
+                                *expr.deref_mut() = new_expr;
+                            }
+                            "printf" => {
+                                self.updated = true;
+                                let stream = "Some(std::io::stdout())";
+                                let new_expr = transform_fprintf(stream, args);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "wprintf" => todo!(),
                             "vfprintf" => todo!(),
                             "vprintf" => todo!(),
                             "fputc" | "putc" => {
                                 self.updated = true;
-                                let [c, stream] = &args[..] else { panic!() };
-                                let c = pprust::expr_to_string(c);
-                                let stream = pprust::expr_to_string(stream);
-                                let new_expr = expr!("{{
-                                use std::io::Write;
-                                let c = {};
-                                ({}).as_mut().unwrap().write_all(&[c as u8]).map_or(libc::EOF, |_| c)
-                            }}",
-                                c, stream
-                            );
+                                let stream = pprust::expr_to_string(&args[1]);
+                                let new_expr = transform_fputc(&stream, &args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "putchar" => {
                                 self.updated = true;
-                                let [c] = &args[..] else { panic!() };
-                                let c = pprust::expr_to_string(c);
-                                let new_expr = expr!(
-                                    "{{
-                                use std::io::Write;
-                                let c = {};
-                                std::io::stdout().write_all(&[c as u8]).map_or(libc::EOF, |_| c)
-                            }}",
-                                    c
-                                );
+                                let stream = "Some(std::io::stdout())";
+                                let new_expr = transform_fputc(stream, &args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fputs" => {
                                 self.updated = true;
-                                let [s, stream] = &args[..] else { panic!() };
-                                let s = pprust::expr_to_string(s);
-                                let stream = pprust::expr_to_string(stream);
-                                let new_expr = expr!(
-                                    "{{
-                                use std::io::Write;
-                                ({}).as_mut().unwrap()
-                                    .write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
-                                    .map_or(libc::EOF, |_| 0)
-                                }}",
-                                    stream,
-                                    s
-                                );
+                                let new_expr = transform_fputs(&args[1], &args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "puts" => {
                                 self.updated = true;
-                                let [s] = &args[..] else { panic!() };
-                                let s = pprust::expr_to_string(s);
-                                let new_expr = expr!(
-                                    r#"{{
-                                use std::io::Write;
-                                let mut stream = std::io::stdout();
-                                stream
-                                    .write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
-                                    .and_then(|_| stream.write_all(b"\n"))
-                                    .map_or(libc::EOF, |_| 0)
-                            }}"#,
-                                    s
-                                );
+                                let new_expr = transform_puts(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fwrite" => todo!(),
                             "fflush" => {
                                 self.updated = true;
-                                let [stream] = &args[..] else { panic!() };
-                                let stream = pprust::expr_to_string(stream);
-                                let new_expr = expr!(
-                                    "{{
-                                use std::io::Write;
-                                ({}).as_mut().unwrap().flush().map_or(libc::EOF, |_| 0)
-                            }}",
-                                    stream
-                                );
+                                let new_expr = transform_fflush(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fseek" | "fseeko" => todo!(),
                             "ftell" | "ftello" => {
                                 self.updated = true;
-                                let [stream] = &args[..] else { panic!() };
-                                let stream = pprust::expr_to_string(stream);
-                                let new_expr = expr!(
-                                    "{{
-                                use std::io::Seek;
-                                ({}).as_mut().unwrap().stream_position().map_or(-1, |p| p as i64)
-                            }}",
-                                    stream
-                                );
+                                let new_expr = transform_ftell(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "rewind" => {
                                 self.updated = true;
-                                let [stream] = &args[..] else { panic!() };
-                                let stream = pprust::expr_to_string(stream);
-                                let new_expr = expr!(
-                                    "{{
-                                use std::io::Seek;
-                                ({}).as_mut().unwrap().rewind()
-                            }}",
-                                    stream
-                                );
+                                let new_expr = transform_rewind(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fgetpos" => todo!(),
@@ -393,27 +303,233 @@ impl MutVisitor for TransformVisitor<'_> {
     }
 }
 
+#[inline]
+fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
+    let path = pprust::expr_to_string(path);
+    let path = format!(
+        "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
+        path
+    );
+    let mode = StringArg::from_expr(mode);
+    match mode {
+        StringArg::Lit(mode) => {
+            let (prefix, suffix) = mode.as_str().split_at(1);
+            let plus = suffix.contains('+');
+            match prefix {
+                "r" => {
+                    if plus {
+                        expr!(
+                            "std::fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .open({})
+                                .ok()",
+                            path
+                        )
+                    } else {
+                        expr!("std::fs::File::open({}).ok()", path)
+                    }
+                }
+                "w" => {
+                    if plus {
+                        expr!(
+                            "std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .read(true)
+                                .open({})
+                                .ok()",
+                            path
+                        )
+                    } else {
+                        expr!("std::fs::File::create({}).ok()", path)
+                    }
+                }
+                "a" => {
+                    if plus {
+                        expr!(
+                            "std::fs::OpenOptions::new()
+                                .append(true)
+                                .create(true)
+                                .read(true)
+                                .open({})
+                                .ok()",
+                            path
+                        )
+                    } else {
+                        expr!(
+                            "std::fs::OpenOptions::new()
+                                .append(true)
+                                .create(true)
+                                .open({})
+                                .ok()",
+                            path
+                        )
+                    }
+                }
+                _ => panic!("{:?}", mode),
+            }
+        }
+        StringArg::If(_c, _t, _f) => todo!(),
+        StringArg::Other(_e) => todo!(),
+    }
+}
+
+#[inline]
+fn transform_fgetc(stream: &str) -> Expr {
+    expr!(
+        "{{
+    use std::io::Read;
+    let mut buf = [0];
+    ({}).as_mut().unwrap().read_exact(&mut buf).map_or(libc::EOF, |_| buf[0] as _)
+}}",
+        stream
+    )
+}
+
+fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, args: &[E]) -> Expr {
+    let [fmt, args @ ..] = args else { panic!() };
+    let fmt = StringArg::from_expr(fmt);
+    match fmt {
+        StringArg::Lit(fmt) => {
+            let (fmt, casts) = printf::to_rust_format(fmt.as_str());
+            assert!(args.len() == casts.len());
+            let mut new_args = String::new();
+            for (arg, cast) in args.iter().zip(casts) {
+                use std::fmt::Write;
+                let arg = pprust::expr_to_string(arg);
+                if cast == "&str" {
+                    write!(
+                        new_args,
+                        "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap(), ",
+                        arg
+                    )
+                    .unwrap();
+                } else {
+                    write!(new_args, "({}) as {}", arg, cast).unwrap();
+                }
+            }
+            expr!(
+                "{{
+    use std::io::Write;
+    write!(({}).as_mut().unwrap(), \"{}\", {})
+}}",
+                stream,
+                fmt,
+                new_args
+            )
+        }
+        StringArg::If(_, _, _) => todo!(),
+        StringArg::Other(_) => todo!(),
+    }
+}
+
+#[inline]
+fn transform_fputc(stream: &str, c: &Expr) -> Expr {
+    let c = pprust::expr_to_string(c);
+    expr!(
+        "{{
+    use std::io::Write;
+    let c = {};
+    ({}).as_mut().unwrap().write_all(&[c as u8]).map_or(libc::EOF, |_| c)
+}}",
+        c,
+        stream
+    )
+}
+
+#[inline]
+fn transform_fputs(stream: &Expr, s: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    let s = pprust::expr_to_string(s);
+    expr!(
+        "{{
+    use std::io::Write;
+    ({}).as_mut().unwrap()
+        .write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
+        .map_or(libc::EOF, |_| 0)
+}}",
+        stream,
+        s
+    )
+}
+
+#[inline]
+fn transform_fflush(stream: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    expr!(
+        "{{
+    use std::io::Write;
+    ({}).as_mut().unwrap().flush().map_or(libc::EOF, |_| 0)
+}}",
+        stream
+    )
+}
+
+#[inline]
+fn transform_puts(s: &Expr) -> Expr {
+    let s = pprust::expr_to_string(s);
+    expr!(
+        r#"{{
+    use std::io::Write;
+    let mut stream = std::io::stdout();
+    stream
+        .write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .map_or(libc::EOF, |_| 0)
+}}"#,
+        s
+    )
+}
+
+#[inline]
+fn transform_ftell(stream: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    expr!(
+        "{{
+    use std::io::Seek;
+    ({}).as_mut().unwrap().stream_position().map_or(-1, |p| p as i64)
+}}",
+        stream
+    )
+}
+
+#[inline]
+fn transform_rewind(stream: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    expr!(
+        "{{
+    use std::io::Seek;
+    ({}).as_mut().unwrap().rewind();
+}}",
+        stream
+    )
+}
+
 #[derive(Debug)]
-enum OpenMode<'a> {
+enum StringArg<'a> {
     Lit(Symbol),
-    If(&'a Expr, Box<OpenMode<'a>>, Box<OpenMode<'a>>),
+    If(&'a Expr, Box<StringArg<'a>>, Box<StringArg<'a>>),
     Other(&'a Expr),
 }
 
-fn normalize_open_mode(expr: &Expr) -> OpenMode<'_> {
-    match &expr.kind {
-        ExprKind::MethodCall(box MethodCall { receiver: e, .. }) | ExprKind::Cast(e, _) => {
-            normalize_open_mode(e)
+impl<'a> StringArg<'a> {
+    fn from_expr(expr: &'a Expr) -> Self {
+        match &expr.kind {
+            ExprKind::MethodCall(box MethodCall { receiver: e, .. }) | ExprKind::Cast(e, _) => {
+                Self::from_expr(e)
+            }
+            ExprKind::Lit(lit) => StringArg::Lit(lit.symbol),
+            ExprKind::If(c, t, Some(f)) => {
+                let [t] = &t.stmts[..] else { panic!() };
+                let StmtKind::Expr(t) = &t.kind else { panic!() };
+                let t = Self::from_expr(t);
+                let f = Self::from_expr(f);
+                StringArg::If(c, Box::new(t), Box::new(f))
+            }
+            _ => StringArg::Other(expr),
         }
-        ExprKind::Lit(lit) => OpenMode::Lit(lit.symbol),
-        ExprKind::If(c, t, Some(f)) => {
-            let [t] = &t.stmts[..] else { panic!() };
-            let StmtKind::Expr(t) = &t.kind else { panic!() };
-            let t = normalize_open_mode(t);
-            let f = normalize_open_mode(f);
-            OpenMode::If(c, Box::new(t), Box::new(f))
-        }
-        _ => OpenMode::Other(expr),
     }
 }
 

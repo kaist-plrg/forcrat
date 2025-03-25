@@ -14,7 +14,6 @@ use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use crate::{
     api_list::{is_symbol_api, normalize_api_name, API_MAP},
     compile_util::{def_id_to_value_symbol, is_std_io_expr, Pass},
-    printf,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -81,12 +80,12 @@ impl<'tcx> ApiVisitor<'tcx> {
         };
         *counts.entry(*name).or_default() += 1;
         if *name == "printf" || *name == "fprintf" {
-            let arg = if *name == "printf" { args[0] } else { args[1] };
-            if let OpenMode::Lit(lit) = normalize_open_mode(arg, self.tcx) {
-                println!("{:?}", String::from_utf8_lossy(&lit));
-                let (f, casts) = printf::to_rust_format(&lit);
-                println!("\"{}\" {:?}", f, casts);
-            }
+            // let arg = if *name == "printf" { args[0] } else { args[1] };
+            // if let OpenMode::Lit(lit) = normalize_open_mode(arg, self.tcx) {
+            // println!("{:?}", String::from_utf8_lossy(&lit));
+            // let (f, casts) = printf::to_rust_format(&lit);
+            // println!("\"{}\" {:?}", f, casts);
+            // }
         }
         true
     }
