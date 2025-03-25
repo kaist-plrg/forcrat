@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     ops::{Deref, DerefMut},
 };
@@ -6,9 +7,13 @@ use std::{
 use etrace::some_or;
 use rustc_ast::{ast::*, mut_visit, mut_visit::MutVisitor, ptr::P};
 use rustc_ast_pretty::pprust;
+use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::BitSet;
-use rustc_middle::{mir, ty::TyCtxt};
+use rustc_middle::{
+    mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue, TerminatorKind},
+    ty::TyCtxt,
+};
 use rustc_span::{symbol::Ident, FileName, RealFileName, Span, Symbol};
 
 use crate::{
@@ -17,6 +22,7 @@ use crate::{
     compile_util::{self, Pass},
     file_analysis::{self, Loc},
     printf,
+    rustc_middle::mir::visit::Visitor as _,
 };
 
 pub fn write_to_files(fss: &[(FileName, String)]) -> std::io::Result<()> {
@@ -42,6 +48,7 @@ impl Pass for Transformation {
         let mut local_origins = FxHashMap::default();
         let mut call_file_args = FxHashMap::default();
         let mut null_checks = FxHashSet::default();
+        let mut null_casts = FxHashSet::default();
 
         for item_id in hir.items() {
             let item = hir.item(item_id);
@@ -71,7 +78,7 @@ impl Pass for Transformation {
 
                 for bbd in body.basic_blocks.iter() {
                     let terminator = bbd.terminator();
-                    let mir::TerminatorKind::Call { func, args, .. } = &terminator.kind else {
+                    let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
                         continue;
                     };
                     let span = terminator.source_info.span;
@@ -97,7 +104,7 @@ impl Pass for Transformation {
                         continue;
                     }
                     let constant = some_or!(func.constant(), continue);
-                    let mir::ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+                    let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
                     let rustc_middle::ty::TyKind::FnDef(def_id, _) = ty.kind() else {
                         unreachable!()
                     };
@@ -106,6 +113,16 @@ impl Pass for Transformation {
                     if sym.as_str() == "is_null" {
                         null_checks.insert(span);
                     }
+                }
+
+                let mut visitor = MirVisitor {
+                    tcx,
+                    nulls: FxHashSet::default(),
+                };
+                visitor.visit_body(body);
+                for location in visitor.nulls {
+                    let stmt = body.stmt_at(location).left().unwrap();
+                    null_casts.insert(stmt.source_info.span);
                 }
             }
         }
@@ -133,6 +150,7 @@ impl Pass for Transformation {
                 local_origins: &local_origins,
                 call_file_args: &call_file_args,
                 null_checks: &null_checks,
+                null_casts: &null_casts,
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
@@ -145,12 +163,37 @@ impl Pass for Transformation {
     }
 }
 
+struct MirVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    nulls: FxHashSet<Location>,
+}
+
+impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
+    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
+        if let Rvalue::Cast(
+            CastKind::PointerFromExposedAddress,
+            Operand::Constant(box Constant {
+                literal: ConstantKind::Val(ConstValue::Scalar(Scalar::Int(i)), _),
+                ..
+            }),
+            ty,
+        ) = rvalue
+        {
+            if i.try_to_u64() == Ok(0) && compile_util::contains_file_ty(*ty, self.tcx) {
+                self.nulls.insert(location);
+            }
+        }
+        self.super_rvalue(rvalue, location);
+    }
+}
+
 struct TransformVisitor<'a> {
     updated: bool,
     fn_permissions: &'a FxHashMap<Span, Vec<&'a BitSet<Permission>>>,
     local_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
     call_file_args: &'a FxHashMap<Span, Vec<usize>>,
     null_checks: &'a FxHashSet<Span>,
+    null_casts: &'a FxHashSet<Span>,
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -173,7 +216,6 @@ impl MutVisitor for TransformVisitor<'_> {
                         if i > 0 {
                             param.push_str(" + ");
                         }
-                        use std::fmt::Write;
                         write!(param, "std::io::{:?}", p).unwrap();
                     }
                     f.generics.params.push(parse_ty_param(param));
@@ -325,16 +367,32 @@ impl MutVisitor for TransformVisitor<'_> {
             ExprKind::Path(None, path) => {
                 if let [seg] = &path.segments[..] {
                     match seg.ident.name.as_str() {
-                        "stdin" => *expr = P(expr!("Some(std::io::stdin())")),
-                        "stdout" => *expr = P(expr!("Some(std::io::stdout())")),
-                        "stderr" => *expr = P(expr!("Some(std::io::stderr())")),
+                        "stdin" => {
+                            self.updated = true;
+                            *expr = P(expr!("Some(std::io::stdin())"));
+                        }
+                        "stdout" => {
+                            self.updated = true;
+                            *expr = P(expr!("Some(std::io::stdout())"));
+                        }
+                        "stderr" => {
+                            self.updated = true;
+                            *expr = P(expr!("Some(std::io::stderr())"));
+                        }
                         _ => {}
                     }
                 }
             }
             ExprKind::MethodCall(box MethodCall { seg, .. }) => {
                 if self.null_checks.contains(&expr_span) {
+                    self.updated = true;
                     seg.ident = Ident::from_str("is_none");
+                }
+            }
+            ExprKind::Cast(_, _) => {
+                if self.null_casts.contains(&expr_span) {
+                    self.updated = true;
+                    *expr = P(expr!("None"));
                 }
             }
             _ => {}
@@ -465,7 +523,6 @@ fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, args: &[E]) -> Expr 
             assert!(args.len() == casts.len());
             let mut new_args = String::new();
             for (arg, cast) in args.iter().zip(casts) {
-                use std::fmt::Write;
                 let arg = pprust::expr_to_string(arg);
                 if cast == "&str" {
                     write!(
