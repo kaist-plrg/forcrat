@@ -6,13 +6,13 @@ use std::{
 use etrace::some_or;
 use rustc_ast::{ast::*, mut_visit, mut_visit::MutVisitor, ptr::P};
 use rustc_ast_pretty::pprust;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{mir, ty::TyCtxt};
-use rustc_span::{FileName, RealFileName, Span, Symbol};
+use rustc_span::{symbol::Ident, FileName, RealFileName, Span, Symbol};
 
 use crate::{
-    api_list::{is_symbol_api, Origin, Permission},
+    api_list::{self, Origin, Permission},
     ast_maker::*,
     compile_util::{self, Pass},
     file_analysis::{self, Loc},
@@ -38,15 +38,16 @@ impl Pass for Transformation {
         let hir = tcx.hir();
         let source_map = tcx.sess.source_map();
 
-        let mut fn_permissions: FxHashMap<_, _> = FxHashMap::default();
-        let mut local_origins: FxHashMap<_, _> = FxHashMap::default();
-        let mut call_file_args: FxHashMap<_, _> = FxHashMap::default();
+        let mut fn_permissions = FxHashMap::default();
+        let mut local_origins = FxHashMap::default();
+        let mut call_file_args = FxHashMap::default();
+        let mut null_checks = FxHashSet::default();
 
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
             if let rustc_hir::ItemKind::Fn(sig, _, _) = item.kind {
-                if is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
+                if api_list::is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
                     continue;
                 }
                 let body = tcx.optimized_mir(local_def_id);
@@ -70,7 +71,9 @@ impl Pass for Transformation {
 
                 for bbd in body.basic_blocks.iter() {
                     let terminator = bbd.terminator();
-                    let mir::TerminatorKind::Call { args, .. } = &terminator.kind else { continue };
+                    let mir::TerminatorKind::Call { func, args, .. } = &terminator.kind else {
+                        continue;
+                    };
                     let span = terminator.source_info.span;
                     let file_args: Vec<_> = args
                         .iter()
@@ -84,10 +87,25 @@ impl Pass for Transformation {
                             }
                         })
                         .collect();
-                    if file_args.is_empty() {
+                    if !file_args.is_empty() {
+                        call_file_args.insert(span, file_args);
+                    }
+
+                    let [arg] = &args[..] else { continue };
+                    let ty = arg.ty(&body.local_decls, tcx);
+                    if !compile_util::contains_file_ty(ty, tcx) {
                         continue;
                     }
-                    call_file_args.insert(span, file_args);
+                    let constant = some_or!(func.constant(), continue);
+                    let mir::ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+                    let rustc_middle::ty::TyKind::FnDef(def_id, _) = ty.kind() else {
+                        unreachable!()
+                    };
+                    let sym = compile_util::def_id_to_value_symbol(def_id, tcx);
+                    let sym = some_or!(sym, continue);
+                    if sym.as_str() == "is_null" {
+                        null_checks.insert(span);
+                    }
                 }
             }
         }
@@ -114,6 +132,7 @@ impl Pass for Transformation {
                 fn_permissions: &fn_permissions,
                 local_origins: &local_origins,
                 call_file_args: &call_file_args,
+                null_checks: &null_checks,
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
@@ -131,6 +150,7 @@ struct TransformVisitor<'a> {
     fn_permissions: &'a FxHashMap<Span, Vec<&'a BitSet<Permission>>>,
     local_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
     call_file_args: &'a FxHashMap<Span, Vec<usize>>,
+    null_checks: &'a FxHashSet<Span>,
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -214,7 +234,12 @@ impl MutVisitor for TransformVisitor<'_> {
                                 *expr.deref_mut() = new_expr;
                             }
                             "fgets" => todo!(),
-                            "fread" => todo!(),
+                            "fread" => {
+                                self.updated = true;
+                                let new_expr =
+                                    transform_fread(&args[3], &args[0], &args[1], &args[2]);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "getdelim" => todo!(),
                             "getline" => todo!(),
                             "fprintf" => {
@@ -254,13 +279,22 @@ impl MutVisitor for TransformVisitor<'_> {
                                 let new_expr = transform_puts(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
-                            "fwrite" => todo!(),
+                            "fwrite" => {
+                                self.updated = true;
+                                let new_expr =
+                                    transform_fwrite(&args[3], &args[0], &args[1], &args[2]);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "fflush" => {
                                 self.updated = true;
                                 let new_expr = transform_fflush(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
-                            "fseek" | "fseeko" => todo!(),
+                            "fseek" | "fseeko" => {
+                                self.updated = true;
+                                let new_expr = transform_fseek(&args[0], &args[1], &args[2]);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "ftell" | "ftello" => {
                                 self.updated = true;
                                 let new_expr = transform_ftell(&args[0]);
@@ -298,6 +332,11 @@ impl MutVisitor for TransformVisitor<'_> {
                     }
                 }
             }
+            ExprKind::MethodCall(box MethodCall { seg, .. }) => {
+                if self.null_checks.contains(&expr_span) {
+                    seg.ident = Ident::from_str("is_none");
+                }
+            }
             _ => {}
         }
     }
@@ -310,9 +349,9 @@ fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
         "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
         path
     );
-    let mode = StringArg::from_expr(mode);
+    let mode = LikelyLit::from_expr(mode);
     match mode {
-        StringArg::Lit(mode) => {
+        LikelyLit::Lit(mode) => {
             let (prefix, suffix) = mode.as_str().split_at(1);
             let plus = suffix.contains('+');
             match prefix {
@@ -371,8 +410,8 @@ fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
                 _ => panic!("{:?}", mode),
             }
         }
-        StringArg::If(_c, _t, _f) => todo!(),
-        StringArg::Other(_e) => todo!(),
+        LikelyLit::If(_c, _t, _f) => todo!(),
+        LikelyLit::Other(_e) => todo!(),
     }
 }
 
@@ -388,11 +427,39 @@ fn transform_fgetc(stream: &str) -> Expr {
     )
 }
 
+#[inline]
+fn transform_fread(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    let ptr = pprust::expr_to_string(ptr);
+    let size = pprust::expr_to_string(size);
+    let nitems = pprust::expr_to_string(nitems);
+    expr!(
+        "{{
+    use std::io::Read;
+    let stream = ({}).as_mut().unwrap();
+    let size = {};
+    let ptr: &mut [u8] = std::slice::from_raw_parts_mut(({}) as _, (size * ({})) as usize);
+    let mut i = 0;
+    for data in ptr.chunks_mut(size as usize) {{
+        if stream.read_exact(data).is_err() {{
+            break;
+        }}
+        i += 1;
+    }}
+    i
+}}",
+        stream,
+        size,
+        ptr,
+        nitems,
+    )
+}
+
 fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, args: &[E]) -> Expr {
     let [fmt, args @ ..] = args else { panic!() };
-    let fmt = StringArg::from_expr(fmt);
+    let fmt = LikelyLit::from_expr(fmt);
     match fmt {
-        StringArg::Lit(fmt) => {
+        LikelyLit::Lit(fmt) => {
             let fmt = fmt.to_string().into_bytes();
             let (fmt, casts) = printf::to_rust_format(&fmt);
             assert!(args.len() == casts.len());
@@ -421,8 +488,8 @@ fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, args: &[E]) -> Expr 
                 new_args
             )
         }
-        StringArg::If(_, _, _) => todo!(),
-        StringArg::Other(_) => todo!(),
+        LikelyLit::If(_, _, _) => todo!(),
+        LikelyLit::Other(_) => todo!(),
     }
 }
 
@@ -457,6 +524,34 @@ fn transform_fputs(stream: &Expr, s: &Expr) -> Expr {
 }
 
 #[inline]
+fn transform_fwrite(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    let ptr = pprust::expr_to_string(ptr);
+    let size = pprust::expr_to_string(size);
+    let nitems = pprust::expr_to_string(nitems);
+    expr!(
+        "{{
+    use std::io::Write;
+    let stream = ({}).as_mut().unwrap();
+    let size = {};
+    let ptr: &[u8] = std::slice::from_raw_parts({} as _, (size * ({})) as usize);
+    let mut i = 0;
+    for data in ptr.chunks(size as usize) {{
+        if stream.write_all(data).is_err() {{
+            break;
+        }}
+        i += 1;
+    }}
+    i
+}}",
+        stream,
+        size,
+        ptr,
+        nitems
+    )
+}
+
+#[inline]
 fn transform_fflush(stream: &Expr) -> Expr {
     let stream = pprust::expr_to_string(stream);
     expr!(
@@ -485,6 +580,34 @@ fn transform_puts(s: &Expr) -> Expr {
 }
 
 #[inline]
+fn transform_fseek(stream: &Expr, off: &Expr, whence: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    let off = pprust::expr_to_string(off);
+    let whence = LikelyLit::from_expr(whence);
+    match whence {
+        LikelyLit::Lit(lit) => {
+            let v = match lit.as_str() {
+                "0" => "Start",
+                "1" => "Current",
+                "2" => "End",
+                lit => panic!("{}", lit),
+            };
+            expr!(
+                "{{
+    use std::io::Seek;
+    ({}).as_mut().unwrap().seek(std::io::SeekFrom::{}(({}) as _)).map_or(-1, |_| 0)
+}}",
+                stream,
+                v,
+                off
+            )
+        }
+        LikelyLit::If(_, _, _) => todo!(),
+        LikelyLit::Other(_) => todo!(),
+    }
+}
+
+#[inline]
 fn transform_ftell(stream: &Expr) -> Expr {
     let stream = pprust::expr_to_string(stream);
     expr!(
@@ -509,27 +632,27 @@ fn transform_rewind(stream: &Expr) -> Expr {
 }
 
 #[derive(Debug)]
-enum StringArg<'a> {
+enum LikelyLit<'a> {
     Lit(Symbol),
-    If(&'a Expr, Box<StringArg<'a>>, Box<StringArg<'a>>),
+    If(&'a Expr, Box<LikelyLit<'a>>, Box<LikelyLit<'a>>),
     Other(&'a Expr),
 }
 
-impl<'a> StringArg<'a> {
+impl<'a> LikelyLit<'a> {
     fn from_expr(expr: &'a Expr) -> Self {
         match &expr.kind {
             ExprKind::MethodCall(box MethodCall { receiver: e, .. }) | ExprKind::Cast(e, _) => {
                 Self::from_expr(e)
             }
-            ExprKind::Lit(lit) => StringArg::Lit(lit.symbol),
+            ExprKind::Lit(lit) => LikelyLit::Lit(lit.symbol),
             ExprKind::If(c, t, Some(f)) => {
                 let [t] = &t.stmts[..] else { panic!() };
                 let StmtKind::Expr(t) = &t.kind else { panic!() };
                 let t = Self::from_expr(t);
                 let f = Self::from_expr(f);
-                StringArg::If(c, Box::new(t), Box::new(f))
+                LikelyLit::If(c, Box::new(t), Box::new(f))
             }
-            _ => StringArg::Other(expr),
+            _ => LikelyLit::Other(expr),
         }
     }
 }
