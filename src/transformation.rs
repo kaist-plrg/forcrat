@@ -393,7 +393,8 @@ fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, args: &[E]) -> Expr 
     let fmt = StringArg::from_expr(fmt);
     match fmt {
         StringArg::Lit(fmt) => {
-            let (fmt, casts) = printf::to_rust_format(fmt.as_str());
+            let fmt = fmt.to_string().into_bytes();
+            let (fmt, casts) = printf::to_rust_format(&fmt);
             assert!(args.len() == casts.len());
             let mut new_args = String::new();
             for (arg, cast) in args.iter().zip(casts) {
@@ -407,7 +408,7 @@ fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, args: &[E]) -> Expr 
                     )
                     .unwrap();
                 } else {
-                    write!(new_args, "({}) as {}", arg, cast).unwrap();
+                    write!(new_args, "({}) as {}, ", arg, cast).unwrap();
                 }
             }
             expr!(
