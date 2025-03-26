@@ -65,6 +65,37 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_file_buf_read() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut buf: [libc::c_char; 1024] = [0; 1024];
+    fgets(
+        buf.as_mut_ptr(),
+        ::std::mem::size_of::<[libc::c_char; 1024]>() as libc::c_ulong as libc::c_int,
+        stream,
+    );
+    fclose(stream);
+}"#,
+        |s| {
+            assert!(s.contains("BufRead"));
+            assert!(s.contains("open"));
+            assert!(s.contains("fill_buf"));
+            assert!(s.contains("consume"));
+            assert!(s.contains("drop"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("fopen"));
+            assert!(!s.contains("fgets"));
+            assert!(!s.contains("fclose"));
+        },
+    );
+}
+
+#[test]
 fn test_file_write() {
     run_test(
         r#"

@@ -9,8 +9,10 @@ use rustc_ast::{ast::*, mut_visit, mut_visit::MutVisitor, ptr::P};
 use rustc_ast_pretty::pprust;
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{def::Res, intravisit, HirId};
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
+    hir::nested_filter,
     mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue, TerminatorKind},
     ty::TyCtxt,
 };
@@ -45,8 +47,17 @@ impl Pass for Transformation {
         let hir = tcx.hir();
         let source_map = tcx.sess.source_map();
 
+        let mut hir_visitor = HirVisitor {
+            tcx,
+            rhs_span_to_lhs_id: FxHashMap::default(),
+            pat_span_to_id: FxHashMap::default(),
+        };
+        hir.visit_all_item_likes_in_crate(&mut hir_visitor);
+
         let mut fn_permissions = FxHashMap::default();
         let mut local_origins = FxHashMap::default();
+        let mut local_permissions = FxHashMap::default();
+        let mut hir_id_permissions = FxHashMap::default();
         let mut call_file_args = FxHashMap::default();
         let mut null_checks = FxHashSet::default();
         let mut null_casts = FxHashSet::default();
@@ -58,6 +69,7 @@ impl Pass for Transformation {
                 if api_list::is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
                     continue;
                 }
+
                 let body = tcx.optimized_mir(local_def_id);
                 let mut permissions = vec![];
                 for (i, local) in body.local_decls.iter_enumerated() {
@@ -71,8 +83,16 @@ impl Pass for Transformation {
                         let p = &analysis_result.permissions[*loc_id];
                         permissions.push(p);
                     } else {
+                        let span = local.source_info.span;
+
                         let o = &analysis_result.origins[*loc_id];
-                        local_origins.insert(local.source_info.span, o);
+                        local_origins.insert(span, o);
+
+                        let p = &analysis_result.permissions[*loc_id];
+                        local_permissions.insert(span, p);
+                        if let Some(hid_id) = hir_visitor.pat_span_to_id.get(&span) {
+                            hir_id_permissions.insert(*hid_id, p);
+                        }
                     }
                 }
                 fn_permissions.insert(sig.span, permissions);
@@ -149,6 +169,9 @@ impl Pass for Transformation {
                 updated: false,
                 fn_permissions: &fn_permissions,
                 local_origins: &local_origins,
+                local_permissions: &local_permissions,
+                hir_id_permissions: &hir_id_permissions,
+                rhs_span_to_lhs_id: &hir_visitor.rhs_span_to_lhs_id,
                 call_file_args: &call_file_args,
                 null_checks: &null_checks,
                 null_casts: &null_casts,
@@ -188,10 +211,55 @@ impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
     }
 }
 
+struct HirVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    rhs_span_to_lhs_id: FxHashMap<Span, HirId>,
+    pat_span_to_id: FxHashMap<Span, HirId>,
+}
+
+impl<'tcx> HirVisitor<'tcx> {
+    fn handle_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
+        let rustc_hir::PatKind::Binding(_, hir_id, _, _) = local.pat.kind else { return };
+        self.pat_span_to_id.insert(local.pat.span, hir_id);
+        let init = some_or!(local.init, return);
+        self.rhs_span_to_lhs_id.insert(init.span, hir_id);
+    }
+
+    fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+        let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expr.kind else { return };
+        let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = lhs.kind else {
+            return;
+        };
+        let Res::Local(hir_id) = path.res else { return };
+        self.rhs_span_to_lhs_id.insert(rhs.span, hir_id);
+    }
+}
+
+impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
+        self.handle_local(local);
+        intravisit::walk_local(self, local);
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+        self.handle_expr(expr);
+        intravisit::walk_expr(self, expr);
+    }
+}
+
 struct TransformVisitor<'a> {
     updated: bool,
     fn_permissions: &'a FxHashMap<Span, Vec<&'a BitSet<Permission>>>,
     local_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
+    local_permissions: &'a FxHashMap<Span, &'a BitSet<Permission>>,
+    hir_id_permissions: &'a FxHashMap<HirId, &'a BitSet<Permission>>,
+    rhs_span_to_lhs_id: &'a FxHashMap<Span, HirId>,
     call_file_args: &'a FxHashMap<Span, Vec<usize>>,
     null_checks: &'a FxHashSet<Span>,
     null_casts: &'a FxHashSet<Span>,
@@ -234,7 +302,14 @@ impl MutVisitor for TransformVisitor<'_> {
                 let origins: Vec<_> = origins.iter().collect();
                 let [origin] = &origins[..] else { panic!() };
                 let ty = match origin {
-                    Origin::File => ty!("Option<std::fs::File>"),
+                    Origin::File => {
+                        let permissions = self.local_permissions[&local.pat.span];
+                        if permissions.contains(Permission::Write) {
+                            ty!("Option<std::io::BufWriter<std::fs::File>>")
+                        } else {
+                            ty!("Option<std::io::BufReader<std::fs::File>>")
+                        }
+                    }
                     Origin::Stdin => ty!("Option<std::io::Stdin>"),
                     Origin::Stdout => ty!("Option<std::io::Stdout>"),
                     Origin::Stderr => ty!("Option<std::io::Stderr>"),
@@ -259,7 +334,9 @@ impl MutVisitor for TransformVisitor<'_> {
                         match symbol.as_str() {
                             "fopen" => {
                                 self.updated = true;
-                                let new_expr = transform_fopen(&args[0], &args[1]);
+                                let lhs_id = self.rhs_span_to_lhs_id[&expr_span];
+                                let permissions = self.hir_id_permissions[&lhs_id];
+                                let new_expr = transform_fopen(&args[0], &args[1], permissions);
                                 *expr.deref_mut() = new_expr;
                             }
                             "popen" => {
@@ -413,13 +490,18 @@ impl MutVisitor for TransformVisitor<'_> {
     }
 }
 
-fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
+fn transform_fopen(path: &Expr, mode: &Expr, permissions: &BitSet<Permission>) -> Expr {
     let path = pprust::expr_to_string(path);
     let path = format!(
         "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
         path
     );
     let mode = LikelyLit::from_expr(mode);
+    let wrapper = if permissions.contains(Permission::Write) {
+        "std::io::BufWriter"
+    } else {
+        "std::io::BufReader"
+    };
     match mode {
         LikelyLit::Lit(mode) => {
             let (prefix, suffix) = mode.as_str().split_at(1);
@@ -432,11 +514,13 @@ fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
                                 .read(true)
                                 .write(true)
                                 .open({})
-                                .ok()",
-                            path
+                                .ok()
+                                .map({}::new)",
+                            path,
+                            wrapper
                         )
                     } else {
-                        expr!("std::fs::File::open({}).ok()", path)
+                        expr!("std::fs::File::open({}).ok().map({}::new)", path, wrapper)
                     }
                 }
                 "w" => {
@@ -448,11 +532,13 @@ fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
                                 .truncate(true)
                                 .read(true)
                                 .open({})
-                                .ok()",
-                            path
+                                .ok()
+                                .map({}::new)",
+                            path,
+                            wrapper
                         )
                     } else {
-                        expr!("std::fs::File::create({}).ok()", path)
+                        expr!("std::fs::File::create({}).ok().map({}::new)", path, wrapper)
                     }
                 }
                 "a" => {
@@ -463,8 +549,10 @@ fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
                                 .create(true)
                                 .read(true)
                                 .open({})
-                                .ok()",
-                            path
+                                .ok()
+                                .map({}::new)",
+                            path,
+                            wrapper
                         )
                     } else {
                         expr!(
@@ -472,8 +560,10 @@ fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
                                 .append(true)
                                 .create(true)
                                 .open({})
-                                .ok()",
-                            path
+                                .ok()
+                                .map({}::new)",
+                            path,
+                            wrapper
                         )
                     }
                 }
