@@ -191,6 +191,34 @@ unsafe fn f(mut stream: *mut FILE) {
 }
 
 #[test]
+fn test_fgets_stdin() {
+    run_test(
+        "
+unsafe fn f() {
+    let mut buf1: [libc::c_char; 1024] = [0; 1024];
+    let mut buf2: [libc::c_char; 1024] = [0; 1024];
+    fgets(
+        buf1.as_mut_ptr(),
+        ::std::mem::size_of::<[libc::c_char; 1024]>() as libc::c_ulong as libc::c_int,
+        stdin,
+    );
+    fgets(
+        buf2.as_mut_ptr(),
+        ::std::mem::size_of::<[libc::c_char; 1024]>() as libc::c_ulong as libc::c_int,
+        stdin,
+    );
+}",
+        |s| {
+            assert!(s.contains("BufRead"));
+            assert!(s.contains("fill_buf"));
+            assert!(s.contains("consume"));
+            assert!(s.contains("lock"));
+            assert!(!s.contains("fgets"));
+        },
+    );
+}
+
+#[test]
 fn test_printf() {
     run_test(
         r#"

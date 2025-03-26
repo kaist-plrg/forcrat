@@ -43,7 +43,7 @@ pub trait Pass: Sync {
 
     #[inline]
     fn config(input: Input) -> Config {
-        make_silent_config(input)
+        make_no_warning_config(input)
     }
 
     #[inline]

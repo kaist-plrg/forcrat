@@ -41,6 +41,7 @@ impl Pass for Transformation {
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let analysis_result = file_analysis::FileAnalysis.run(tcx);
+
         let hir = tcx.hir();
         let source_map = tcx.sess.source_map();
 
@@ -261,7 +262,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                 let new_expr = transform_fopen(&args[0], &args[1]);
                                 *expr.deref_mut() = new_expr;
                             }
-                            "fclose" => {
+                            "fclose" | "pclose" => {
                                 self.updated = true;
                                 *callee.deref_mut() = expr!("drop");
                             }
@@ -493,14 +494,32 @@ fn transform_fgetc(stream: &str) -> Expr {
 }
 
 #[inline]
+fn is_transformed_stdin(expr: &Expr) -> bool {
+    let ExprKind::Call(callee, args) = &expr.kind else { return false };
+    let ExprKind::Path(None, path) = &callee.kind else { return false };
+    if path.segments.last().unwrap().ident.name.as_str() != "Some" {
+        return false;
+    }
+    let [arg] = &args[..] else { return false };
+    let ExprKind::Call(callee, _) = &arg.kind else { return false };
+    let ExprKind::Path(None, path) = &callee.kind else { return false };
+    path.segments.last().unwrap().ident.name.as_str() == "stdin"
+}
+
+#[inline]
 fn transform_fgets(stream: &Expr, s: &Expr, n: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+    let stream_def = if is_transformed_stdin(stream) {
+        "let stream = std::io::stdin(); let mut stream = stream.lock();".to_string()
+    } else {
+        let stream = pprust::expr_to_string(stream);
+        format!("let stream = ({}).as_mut().unwrap();", stream)
+    };
     let s = pprust::expr_to_string(s);
     let n = pprust::expr_to_string(n);
     expr!(
         "{{
     use std::io::BufRead;
-    let stream = ({}).as_mut().unwrap();
+    {}
     let s = {};
     let n = ({}) as usize;
     let buf: &mut [u8] = std::slice::from_raw_parts_mut(s as _, n);
@@ -530,7 +549,7 @@ fn transform_fgets(stream: &Expr, s: &Expr, n: &Expr) -> Expr {
         s
     }}
 }}",
-        stream,
+        stream_def,
         s,
         n
     )
