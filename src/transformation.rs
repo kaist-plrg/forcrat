@@ -441,13 +441,22 @@ impl MutVisitor for TransformVisitor<'_> {
                             "fsetpos" => todo!(),
                             _ => {
                                 if let Some(pos) = self.call_file_args.get(&expr_span) {
+                                    let mut none = false;
                                     for i in pos {
                                         let arg = &mut args[*i];
                                         let a = pprust::expr_to_string(arg);
+                                        if a == "None" {
+                                            none = true;
+                                        }
                                         let new_expr = expr!("({}).as_mut()", a);
                                         *arg = P(new_expr);
                                     }
                                     self.updated = true;
+                                    if none {
+                                        let c = pprust::expr_to_string(callee);
+                                        let new_expr = expr!("{}::<&mut std::fs::File>", c);
+                                        *callee = P(new_expr);
+                                    }
                                 }
                             }
                         }

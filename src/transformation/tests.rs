@@ -463,6 +463,27 @@ unsafe fn f(mut stream: *mut FILE) {
     );
 }
 
+#[test]
+fn test_null_arg() {
+    run_test(
+        "
+unsafe fn g(mut f: *mut FILE) {
+    if !f.is_null() {
+        fputc('a' as i32, f);
+    }
+}
+unsafe fn f() {
+    g(0 as *mut FILE);
+}",
+        |s| {
+            assert!(s.contains("None"));
+            assert!(s.contains("is_none"));
+            assert!(!s.contains("0"));
+            assert!(!s.contains("is_null"));
+        },
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
