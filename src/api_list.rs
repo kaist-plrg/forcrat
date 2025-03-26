@@ -57,7 +57,7 @@ impl Permission {
 impl Idx for Permission {
     #[inline]
     fn new(idx: usize) -> Self {
-        if idx > 5 {
+        if idx >= Self::NUM {
             panic!()
         }
         unsafe { std::mem::transmute(idx as u8) }
@@ -76,18 +76,20 @@ pub enum Origin {
     Stdout = 1,
     Stderr = 2,
     File = 3,
-    Pipe = 4,
-    Buffer = 5,
+    PipeRead = 4,
+    PipeWrite = 5,
+    PipeDyn = 6,
+    Buffer = 7,
 }
 
 impl Origin {
-    pub const NUM: usize = 6;
+    pub const NUM: usize = 8;
 }
 
 impl Idx for Origin {
     #[inline]
     fn new(idx: usize) -> Self {
-        if idx > 5 {
+        if idx >= Self::NUM {
             panic!()
         }
         unsafe { std::mem::transmute(idx as u8) }
@@ -102,6 +104,7 @@ impl Idx for Origin {
 #[derive(Debug, Clone, Copy)]
 pub enum ApiKind {
     Open(Origin),
+    PipeOpen,
     Operation(Option<Permission>),
     StdioOperation,
     NotIO,
@@ -130,7 +133,7 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("fopen", Open(File)),
     ("fdopen", Open(File)),
     ("tmpfile", Open(File)),
-    ("popen", Open(Pipe)),
+    ("popen", PipeOpen),
     ("fmemopen", Open(Buffer)),
     ("open_memstream", Open(Buffer)),
     // Close (2)

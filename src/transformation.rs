@@ -237,7 +237,10 @@ impl MutVisitor for TransformVisitor<'_> {
                     Origin::Stdin => ty!("Option<std::io::Stdin>"),
                     Origin::Stdout => ty!("Option<std::io::Stdout>"),
                     Origin::Stderr => ty!("Option<std::io::Stderr>"),
-                    _ => panic!(),
+                    Origin::PipeRead => ty!("Option<std::process::ChildStdout>"),
+                    Origin::PipeWrite => ty!("Option<std::process::ChildStdin>"),
+                    Origin::PipeDyn => todo!(),
+                    Origin::Buffer => todo!(),
                 };
                 *local.ty.as_mut().unwrap() = P(ty);
             }
@@ -275,7 +278,11 @@ impl MutVisitor for TransformVisitor<'_> {
                                 let new_expr = transform_fgetc(stream);
                                 *expr.deref_mut() = new_expr;
                             }
-                            "fgets" => todo!(),
+                            "fgets" => {
+                                self.updated = true;
+                                let new_expr = transform_fgets(&args[2], &args[0], &args[1]);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "fread" => {
                                 self.updated = true;
                                 let new_expr =
@@ -486,6 +493,50 @@ fn transform_fgetc(stream: &str) -> Expr {
 }
 
 #[inline]
+fn transform_fgets(stream: &Expr, s: &Expr, n: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    let s = pprust::expr_to_string(s);
+    let n = pprust::expr_to_string(n);
+    expr!(
+        "{{
+    use std::io::BufRead;
+    let stream = ({}).as_mut().unwrap();
+    let s = {};
+    let n = ({}) as usize;
+    let buf: &mut [u8] = std::slice::from_raw_parts_mut(s as _, n);
+    let mut pos = 0;
+    while pos < n - 1 {{
+        let available = match stream.fill_buf() {{
+            Ok(buf) => buf,
+            Err(_) => {{
+                pos = 0;
+                break
+            }}
+        }};
+        if available.is_empty() {{
+            break;
+        }}
+        buf[pos] = available[0];
+        stream.consume(1);
+        pos += 1;
+        if buf[pos - 1] == b'\\n' {{
+            break;
+        }}
+    }}
+    if pos == 0 {{
+        std::ptr::null_mut()
+    }} else {{
+        buf[pos] = 0;
+        s
+    }}
+}}",
+        stream,
+        s,
+        n
+    )
+}
+
+#[inline]
 fn transform_fread(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
     let stream = pprust::expr_to_string(stream);
     let ptr = pprust::expr_to_string(ptr);
@@ -689,14 +740,14 @@ fn transform_rewind(stream: &Expr) -> Expr {
 }
 
 #[derive(Debug)]
-enum LikelyLit<'a> {
+pub enum LikelyLit<'a> {
     Lit(Symbol),
     If(&'a Expr, Box<LikelyLit<'a>>, Box<LikelyLit<'a>>),
     Other(&'a Expr),
 }
 
 impl<'a> LikelyLit<'a> {
-    fn from_expr(expr: &'a Expr) -> Self {
+    pub fn from_expr(expr: &'a Expr) -> Self {
         match &expr.kind {
             ExprKind::MethodCall(box MethodCall { receiver: e, .. }) | ExprKind::Cast(e, _) => {
                 Self::from_expr(e)

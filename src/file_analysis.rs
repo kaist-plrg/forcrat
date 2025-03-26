@@ -1,3 +1,5 @@
+use std::ops::Deref as _;
+
 use rustc_abi::{FieldIdx, FIRST_VARIANT};
 use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
 use rustc_data_structures::graph::{
@@ -29,7 +31,9 @@ use tracing::info;
 use crate::{
     api_list::{def_id_api_kind, is_def_id_api, is_symbol_api, ApiKind, Origin, Permission},
     compile_util::{contains_file_ty, is_file_ty, is_std_io_expr, Pass},
+    rustc_ast::visit::Visitor as _,
     steensgaard,
+    transformation::LikelyLit,
 };
 
 #[derive(Debug)]
@@ -47,6 +51,26 @@ impl Pass for FileAnalysis {
     type Out = AnalysisResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
+        let krate = tcx.resolver_for_lowering(());
+        let krate_ref = krate.borrow();
+        let (_, krate) = krate_ref.deref();
+        let mut ast_visitor = AstVisitor::default();
+        ast_visitor.visit_crate(krate);
+        let popen_read: FxHashMap<_, _> = ast_visitor
+            .popen_args
+            .into_iter()
+            .filter_map(|(span, arg)| match arg {
+                LikelyLit::Lit(lit) => match &lit.as_str()[..1] {
+                    "r" => Some((span, true)),
+                    "w" => Some((span, false)),
+                    _ => panic!("{:?}", lit),
+                },
+                LikelyLit::If(_, _, _) => todo!(),
+                LikelyLit::Other(_) => todo!(),
+            })
+            .collect();
+        drop(krate_ref);
+
         let steensgaard = steensgaard::Steensgaard.run(tcx);
         info!("\n{:?}", steensgaard);
         let hir = tcx.hir();
@@ -127,6 +151,7 @@ impl Pass for FileAnalysis {
         origin_graph.add_solution(loc_ind_map[&Loc::Stderr], Origin::Stderr);
         let mut analyzer = Analyzer {
             tcx,
+            popen_read,
             steensgaard: &steensgaard,
             fn_ty_functions,
             stdio_arg_locs,
@@ -183,6 +208,7 @@ impl Pass for FileAnalysis {
 
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    popen_read: FxHashMap<Span, bool>,
     stdio_arg_locs: FxHashSet<Loc>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
@@ -350,6 +376,19 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         ApiKind::Open(origin) => {
                             let x = self.transfer_place(*destination, ctx).unwrap();
                             self.add_origin(x, origin);
+                        }
+                        ApiKind::PipeOpen => {
+                            let x = self.transfer_place(*destination, ctx).unwrap();
+                            if let Some(read) = self.popen_read.get(&term.source_info.span) {
+                                let origin = if *read {
+                                    Origin::PipeRead
+                                } else {
+                                    Origin::PipeWrite
+                                };
+                                self.add_origin(x, origin);
+                            } else {
+                                todo!()
+                            }
                         }
                         ApiKind::Operation(Some(permission)) => {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
@@ -714,5 +753,25 @@ impl<'tcx> intravisit::Visitor<'tcx> for StdioArgVisitor<'tcx> {
     fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
         self.handle_expr(expr);
         intravisit::walk_expr(self, expr);
+    }
+}
+
+#[derive(Default)]
+struct AstVisitor<'ast> {
+    popen_args: Vec<(Span, LikelyLit<'ast>)>,
+}
+
+impl<'ast> rustc_ast::visit::Visitor<'ast> for AstVisitor<'ast> {
+    fn visit_expr(&mut self, expr: &'ast rustc_ast::Expr) {
+        rustc_ast::visit::walk_expr(self, expr);
+
+        use rustc_ast::ExprKind;
+        let ExprKind::Call(callee, args) = &expr.kind else { return };
+        let ExprKind::Path(_, path) = &callee.kind else { return };
+        if path.segments.last().unwrap().ident.name.as_str() != "popen" {
+            return;
+        }
+        self.popen_args
+            .push((expr.span, LikelyLit::from_expr(&args[1])));
     }
 }
