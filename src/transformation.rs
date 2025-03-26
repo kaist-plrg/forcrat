@@ -262,6 +262,11 @@ impl MutVisitor for TransformVisitor<'_> {
                                 let new_expr = transform_fopen(&args[0], &args[1]);
                                 *expr.deref_mut() = new_expr;
                             }
+                            "popen" => {
+                                self.updated = true;
+                                let new_expr = transform_popen(&args[0], &args[1]);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "fclose" | "pclose" => {
                                 self.updated = true;
                                 *callee.deref_mut() = expr!("drop");
@@ -408,7 +413,6 @@ impl MutVisitor for TransformVisitor<'_> {
     }
 }
 
-#[inline]
 fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
     let path = pprust::expr_to_string(path);
     let path = format!(
@@ -475,6 +479,38 @@ fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
                 }
                 _ => panic!("{:?}", mode),
             }
+        }
+        LikelyLit::If(_c, _t, _f) => todo!(),
+        LikelyLit::Other(_e) => todo!(),
+    }
+}
+
+fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
+    let command = pprust::expr_to_string(command);
+    let command = format!(
+        "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
+        command
+    );
+    let mode = LikelyLit::from_expr(mode);
+    match mode {
+        LikelyLit::Lit(mode) => {
+            let field = match &mode.as_str()[..1] {
+                "r" => "stdout",
+                "w" => "stdin",
+                _ => panic!("{:?}", mode),
+            };
+            expr!(
+                r#"std::process::Command::new("sh")
+                .arg("-c")
+                .arg("--")
+                .arg({})
+                .{1}(std::process::Stdio::piped())
+                .spawn()
+                .ok()
+                .and_then(|child| child.{1})"#,
+                command,
+                field
+            )
         }
         LikelyLit::If(_c, _t, _f) => todo!(),
         LikelyLit::Other(_e) => todo!(),

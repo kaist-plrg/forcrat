@@ -114,6 +114,56 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_pipe_read() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut f: *mut FILE = popen(
+        b"ls\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(f);
+    pclose(f);
+}"#,
+        |s| {
+            assert!(s.contains("Read"));
+            assert!(s.contains("Command"));
+            assert!(s.contains("ChildStdout"));
+            assert!(s.contains("stdout"));
+            assert!(s.contains("drop"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("popen"));
+            assert!(!s.contains("pclose"));
+        },
+    );
+}
+
+#[test]
+fn test_pipe_write() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut f: *mut FILE = popen(
+        b"/bin/bash\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    fputs(b"echo hello\n\0" as *const u8 as *const libc::c_char, f);
+    pclose(f);
+}"#,
+        |s| {
+            assert!(s.contains("Write"));
+            assert!(s.contains("Command"));
+            assert!(s.contains("ChildStdin"));
+            assert!(s.contains("stdin"));
+            assert!(s.contains("drop"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("popen"));
+            assert!(!s.contains("pclose"));
+        },
+    );
+}
+
+#[test]
 fn test_fgetc() {
     run_test(
         "
