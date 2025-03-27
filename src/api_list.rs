@@ -46,12 +46,25 @@ pub enum Permission {
     BufRead = 1,
     Write = 2,
     Seek = 3,
-    Lock = 4,
-    Close = 5,
+    AsRawFd = 4,
+    Lock = 5,
+    Close = 6,
 }
 
 impl Permission {
-    pub const NUM: usize = 6;
+    pub const NUM: usize = 7;
+
+    #[inline]
+    pub fn full_name(self) -> &'static str {
+        match self {
+            Self::Read => "std::io::Read",
+            Self::BufRead => "std::io::BufRead",
+            Self::Write => "std::io::Write",
+            Self::Seek => "std::io::Seek",
+            Self::AsRawFd => "std::os::fd::AsRawFd",
+            _ => panic!(),
+        }
+    }
 }
 
 impl Idx for Permission {
@@ -200,7 +213,7 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("setbuf", Unsupported),
     // Other (2)
     ("freopen", Unsupported),
-    ("fileno", Unsupported),
+    ("fileno", Operation(Some(AsRawFd))),
     // File system (6)
     ("rename", NotIO),
     ("renameat", NotIO),

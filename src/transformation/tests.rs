@@ -641,6 +641,23 @@ unsafe fn f(mut stream: *mut FILE) {
 }
 
 #[test]
+fn test_fileno() {
+    run_test(
+        "
+unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
+    fileno(stream);
+    return fileno(stream);
+}",
+        |s| {
+            assert!(s.contains("AsRawFd"));
+            assert!(s.contains("as_raw_fd"));
+            assert!(!s.contains("FILE"), "{}", s);
+            assert!(!s.contains("fileno"));
+        },
+    );
+}
+
+#[test]
 fn test_null_arg() {
     run_test(
         "

@@ -291,7 +291,7 @@ impl MutVisitor for TransformVisitor<'_> {
                         if i > 0 {
                             param.push_str(" + ");
                         }
-                        write!(param, "std::io::{:?}", p).unwrap();
+                        param.push_str(p.full_name());
                     }
                     f.generics.params.push(parse_ty_param(param));
                 }
@@ -454,6 +454,11 @@ impl MutVisitor for TransformVisitor<'_> {
                             }
                             "fgetpos" => todo!(),
                             "fsetpos" => todo!(),
+                            "fileno" => {
+                                self.updated = true;
+                                let new_expr = transform_fileno(&args[0]);
+                                *expr.deref_mut() = new_expr;
+                            }
                             _ => {
                                 if let Some(pos) = self.call_file_args.get(&expr_span) {
                                     let mut none = false;
@@ -1024,6 +1029,18 @@ fn transform_rewind(stream: &Expr) -> Expr {
         "{{
     use std::io::Seek;
     ({}).as_mut().unwrap().rewind();
+}}",
+        stream
+    )
+}
+
+#[inline]
+fn transform_fileno(stream: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    expr!(
+        "{{
+    use std::os::fd::AsRawFd;
+    ({}).as_ref().unwrap().as_raw_fd()
 }}",
         stream
     )
