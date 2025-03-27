@@ -381,6 +381,11 @@ impl MutVisitor for TransformVisitor<'_> {
                             }
                             "getdelim" => todo!(),
                             "getline" => todo!(),
+                            "feof" => {
+                                self.updated = true;
+                                let new_expr = transform_feof(&args[0]);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "fprintf" => {
                                 self.updated = true;
                                 let stream = pprust::expr_to_string(&args[0]);
@@ -734,6 +739,19 @@ fn transform_fread(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Exp
         size,
         ptr,
         nitems,
+    )
+}
+
+#[inline]
+fn transform_feof(stream: &Expr) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    expr!(
+        "{{
+    use std::io::Read;
+    let mut buf = [0];
+    ({}).as_mut().unwrap().read_exact(&mut buf).map_or(1, |_| 0)
+}}",
+        stream
     )
 }
 

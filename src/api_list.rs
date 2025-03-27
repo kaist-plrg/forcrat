@@ -189,7 +189,7 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("fsetpos", Operation(Some(Seek))),
     // Error (3)
     ("clearerr", Unsupported),
-    ("feof", Unsupported),
+    ("feof", Operation(Some(Read))),
     ("ferror", Unsupported),
     // Locking (3)
     ("flockfile", Operation(Some(Lock))),
