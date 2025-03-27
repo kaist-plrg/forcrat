@@ -484,6 +484,22 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_second_arg() {
+    run_test(
+        "
+unsafe fn f(mut c: libc::c_int, mut stream: *mut FILE) {
+    fputc(c, stream);
+}",
+        |s| {
+            assert!(s.contains("Write"));
+            assert!(s.contains("write_all"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("fputc"));
+        },
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

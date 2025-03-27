@@ -74,15 +74,19 @@ impl Pass for Transformation {
                 let mut permissions = vec![];
                 for (i, local) in body.local_decls.iter_enumerated() {
                     let loc = Loc::Var(local_def_id, i);
-                    let loc_id = some_or!(analysis_result.loc_ind_map.get(&loc), continue);
                     let i = i.as_usize();
                     if i == 0 {
                         // return value
                     } else if i <= sig.decl.inputs.len() {
                         // parameters
-                        let p = &analysis_result.permissions[*loc_id];
+                        let p = analysis_result
+                            .loc_ind_map
+                            .get(&loc)
+                            .map(|loc_id| &analysis_result.permissions[*loc_id]);
                         permissions.push(p);
                     } else {
+                        let loc_id = some_or!(analysis_result.loc_ind_map.get(&loc), continue);
+
                         let span = local.source_info.span;
 
                         let o = &analysis_result.origins[*loc_id];
@@ -95,7 +99,9 @@ impl Pass for Transformation {
                         }
                     }
                 }
-                fn_permissions.insert(sig.span, permissions);
+                if permissions.iter().any(|p| p.is_some()) {
+                    fn_permissions.insert(sig.span, permissions);
+                }
 
                 for bbd in body.basic_blocks.iter() {
                     let terminator = bbd.terminator();
@@ -255,7 +261,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
 struct TransformVisitor<'a> {
     updated: bool,
-    fn_permissions: &'a FxHashMap<Span, Vec<&'a BitSet<Permission>>>,
+    fn_permissions: &'a FxHashMap<Span, Vec<Option<&'a BitSet<Permission>>>>,
     local_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
     local_permissions: &'a FxHashMap<Span, &'a BitSet<Permission>>,
     hir_id_permissions: &'a FxHashMap<HirId, &'a BitSet<Permission>>,
@@ -273,6 +279,7 @@ impl MutVisitor for TransformVisitor<'_> {
             if let Some(permissions) = self.fn_permissions.get(&f.sig.span) {
                 let mut ps = BitSet::new_empty(Permission::NUM);
                 for (param, perm) in f.sig.decl.inputs.iter_mut().zip(permissions) {
+                    let perm = some_or!(perm, continue);
                     if !perm.is_empty() {
                         *param.ty = ty!("Option<TTT>");
                         ps.union(*perm);
