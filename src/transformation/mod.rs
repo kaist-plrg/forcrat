@@ -23,7 +23,6 @@ use crate::{
     ast_maker::*,
     compile_util::{self, Pass},
     file_analysis::{self, Loc},
-    printf,
     rustc_middle::mir::visit::Visitor as _,
 };
 
@@ -355,7 +354,11 @@ impl MutVisitor for TransformVisitor<'_> {
                                 self.updated = true;
                                 *callee.deref_mut() = expr!("drop");
                             }
-                            "fscanf" => todo!(),
+                            "fscanf" => {
+                                self.updated = true;
+                                let new_expr = transform_fscanf(&args[0], &args[1], &args[2..]);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "fgetc" | "getc" => {
                                 self.updated = true;
                                 let stream = pprust::expr_to_string(&args[0]);
@@ -389,13 +392,13 @@ impl MutVisitor for TransformVisitor<'_> {
                             "fprintf" => {
                                 self.updated = true;
                                 let stream = pprust::expr_to_string(&args[0]);
-                                let new_expr = transform_fprintf(&stream, &args[1..]);
+                                let new_expr = transform_fprintf(&stream, &args[1], &args[2..]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "printf" => {
                                 self.updated = true;
                                 let stream = "Some(std::io::stdout())";
-                                let new_expr = transform_fprintf(stream, args);
+                                let new_expr = transform_fprintf(stream, &args[0], &args[1..]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "wprintf" => todo!(),
@@ -535,6 +538,17 @@ fn make_stream_def(stream: &Expr) -> String {
     }
 }
 
+#[inline]
+fn make_buf_stream_def(stream: &Expr) -> String {
+    if let Some(stream) = unwrap_some_call(stream) {
+        let stream = pprust::expr_to_string(stream);
+        format!("let stream = {}(); let mut stream = stream.lock();", stream)
+    } else {
+        let stream = pprust::expr_to_string(stream);
+        format!("let stream = ({}).as_mut().unwrap();", stream)
+    }
+}
+
 fn transform_fopen(path: &Expr, mode: &Expr, permissions: &BitSet<Permission>) -> Expr {
     let path = pprust::expr_to_string(path);
     let path = format!(
@@ -652,6 +666,98 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
     }
 }
 
+fn transform_fscanf<E: Deref<Target = Expr>>(stream: &Expr, fmt: &Expr, args: &[E]) -> Expr {
+    let stream_def = make_buf_stream_def(stream);
+    let fmt = LikelyLit::from_expr(fmt);
+    match fmt {
+        LikelyLit::Lit(fmt) => {
+            let fmt = fmt.to_string().into_bytes();
+            let specs = scanf::parse_specs(&fmt);
+            let mut i = 0;
+            let mut code = String::new();
+            for spec in specs {
+                let arg = if spec.assign {
+                    i += 1;
+                    Some(pprust::expr_to_string(&args[i - 1]))
+                } else {
+                    None
+                };
+                let check_width = if let Some(width) = spec.width {
+                    format!("if chars.len() == {} {{ break; }}", width)
+                } else {
+                    "".to_string()
+                };
+                if let Some(_scan_set) = spec.scan_set() {
+                    todo!();
+                } else {
+                    let assign = if let Some(arg) = arg {
+                        let ty = spec.ty();
+                        if ty == "&str" {
+                            format!(
+                                "
+    let bytes = s.as_bytes();
+    let buf: &mut [u8] = std::slice::from_raw_parts_mut(({}) as _, bytes.len() + 1);
+    buf.copy_from_slice(bytes);
+    buf[bytes.len()] = 0;",
+                                arg
+                            )
+                        } else {
+                            format!(
+                                "
+    *(({}) as *mut {}) = s.parse().unwrap();
+    count += 1;",
+                                arg, ty
+                            )
+                        }
+                    } else {
+                        "".to_string()
+                    };
+                    write!(
+                        code,
+                        "{{
+    let mut chars = vec![];
+    loop {{
+        {}
+        let available = match stream.fill_buf() {{
+            Ok(buf) => buf,
+            Err(_) => break,
+        }};
+        if available.is_empty() {{
+            break;
+        }}
+        let c = available[0];
+        if !c.is_ascii_whitespace() {{
+            chars.push(c);
+        }} else if !chars.is_empty() {{
+            break;
+        }}
+        stream.consume(1);
+    }}
+    let s = String::from_utf8(chars).unwrap();
+    {}
+}}",
+                        check_width, assign
+                    )
+                    .unwrap();
+                }
+            }
+            expr!(
+                "{{
+    use std::io::BufRead;
+    {}
+    let mut count = 0i32;
+    {}
+    count
+}}",
+                stream_def,
+                code
+            )
+        }
+        LikelyLit::If(_, _, _) => todo!(),
+        LikelyLit::Other(_) => todo!(),
+    }
+}
+
 #[inline]
 fn transform_fgetc(stream: &str) -> Expr {
     expr!(
@@ -666,13 +772,7 @@ fn transform_fgetc(stream: &str) -> Expr {
 
 #[inline]
 fn transform_fgets(stream: &Expr, s: &Expr, n: &Expr) -> Expr {
-    let stream_def = if let Some(stream) = unwrap_some_call(stream) {
-        let stream = pprust::expr_to_string(stream);
-        format!("let stream = {}(); let mut stream = stream.lock();", stream)
-    } else {
-        let stream = pprust::expr_to_string(stream);
-        format!("let stream = ({}).as_mut().unwrap();", stream)
-    };
+    let stream_def = make_buf_stream_def(stream);
     let s = pprust::expr_to_string(s);
     let n = pprust::expr_to_string(n);
     expr!(
@@ -755,8 +855,7 @@ fn transform_feof(stream: &Expr) -> Expr {
     )
 }
 
-fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, args: &[E]) -> Expr {
-    let [fmt, args @ ..] = args else { panic!() };
+fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, fmt: &Expr, args: &[E]) -> Expr {
     let fmt = LikelyLit::from_expr(fmt);
     match fmt {
         LikelyLit::Lit(fmt) => {
@@ -955,6 +1054,9 @@ impl<'a> LikelyLit<'a> {
         }
     }
 }
+
+mod printf;
+mod scanf;
 
 #[cfg(test)]
 mod tests;

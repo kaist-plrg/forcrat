@@ -85,6 +85,7 @@ unsafe fn f() {
             assert!(s.contains("BufRead"));
             assert!(s.contains("open"));
             assert!(s.contains("fill_buf"));
+            assert!(s.contains("available"));
             assert!(s.contains("consume"));
             assert!(s.contains("drop"));
             assert!(!s.contains("FILE"));
@@ -195,6 +196,70 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_fscanf_numbers() {
+    run_test(
+        r#"
+unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
+    let mut a: libc::c_int = 0;
+    let mut b: libc::c_short = 0;
+    let mut c: libc::c_long = 0;
+    let mut d: libc::c_uint = 0;
+    let mut e: libc::c_ushort = 0;
+    let mut f_0: libc::c_ulong = 0;
+    let mut g: libc::c_float = 0.;
+    let mut h: libc::c_double = 0.;
+    return fscanf(
+        stream,
+        b"%d %hd %ld %u %hu %lu %g %lg\0" as *const u8 as *const libc::c_char,
+        &mut a as *mut libc::c_int,
+        &mut b as *mut libc::c_short,
+        &mut c as *mut libc::c_long,
+        &mut d as *mut libc::c_uint,
+        &mut e as *mut libc::c_ushort,
+        &mut f_0 as *mut libc::c_ulong,
+        &mut g as *mut libc::c_float,
+        &mut h as *mut libc::c_double,
+    );
+}"#,
+        |s| {
+            assert!(s.contains("BufRead"));
+            assert!(s.contains("fill_buf"));
+            assert!(s.contains("available"));
+            assert!(s.contains("consume"));
+            assert!(s.contains("parse"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("fscanf"));
+        },
+    );
+}
+
+#[test]
+fn test_fscanf_strings() {
+    run_test(
+        r#"
+unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
+    let mut buf1: [libc::c_char; 1024] = [0; 1024];
+    let mut buf2: [libc::c_char; 1024] = [0; 1024];
+    return fscanf(
+        stream,
+        b"%*s %s %10s\0" as *const u8 as *const libc::c_char,
+        buf1.as_mut_ptr(),
+        buf2.as_mut_ptr(),
+    );
+}"#,
+        |s| {
+            assert!(s.contains("BufRead"));
+            assert!(s.contains("fill_buf"));
+            assert!(s.contains("available"));
+            assert!(s.contains("consume"));
+            assert!(s.contains("copy_from_slice"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("fscanf"));
+        },
+    );
+}
+
+#[test]
 fn test_fgetc() {
     run_test(
         "
@@ -264,6 +329,7 @@ unsafe fn f(mut stream: *mut FILE) {
         |s| {
             assert!(s.contains("BufRead"));
             assert!(s.contains("fill_buf"));
+            assert!(s.contains("available"));
             assert!(s.contains("consume"));
             assert!(!s.contains("FILE"));
             assert!(!s.contains("fgets"));
@@ -292,6 +358,7 @@ unsafe fn f() {
         |s| {
             assert!(s.contains("BufRead"));
             assert!(s.contains("fill_buf"));
+            assert!(s.contains("available"));
             assert!(s.contains("consume"));
             assert!(s.contains("lock"));
             assert!(!s.contains("fgets"));

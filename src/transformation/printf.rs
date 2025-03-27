@@ -1,4 +1,4 @@
-pub fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>) {
+pub(super) fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>) {
     let mut format = String::new();
     let mut casts = vec![];
     loop {
@@ -88,11 +88,10 @@ pub fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>) {
     (format, casts)
 }
 
-pub struct ParseResult<'a> {
-    #[allow(unused)]
-    pub prefix: &'a [u8],
-    pub conversion_spec: Option<ConversionSpec>,
-    pub remaining: Option<&'a [u8]>,
+struct ParseResult<'a> {
+    prefix: &'a [u8],
+    conversion_spec: Option<ConversionSpec>,
+    remaining: Option<&'a [u8]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,9 +107,11 @@ enum State {
     Conversion,
 }
 
-pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
-    let err = |i: usize| String::from_utf8_lossy(&s[i..]);
+fn err(s: &[u8], i: Option<usize>) -> ! {
+    panic!("{}", String::from_utf8_lossy(&s[i.unwrap()..]));
+}
 
+fn parse_format(s: &[u8]) -> ParseResult<'_> {
     let mut start_idx = None;
     let mut state = State::Percent;
     let mut flags = vec![];
@@ -139,7 +140,7 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                     Some(Width::Decimal(n)) => *n = *n * 10 + (c - b'0') as usize,
                     _ => unreachable!(),
                 },
-                _ => panic!("{}", err(start_idx.unwrap())),
+                _ => err(s, start_idx),
             }
         } else if let Some(flag) = FlagChar::from_u8(*c) {
             flags.push(flag);
@@ -153,13 +154,13 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                     precision = Some(Width::Asterisk);
                     state = State::Length;
                 }
-                _ => panic!("{}", err(start_idx.unwrap())),
+                _ => err(s, start_idx),
             }
         } else if *c == b'.' {
             if matches!(state, State::Flag | State::Width | State::Period) {
                 state = State::Precision;
             } else {
-                err(start_idx.unwrap());
+                err(s, start_idx);
             }
         } else if let Some(len) = LengthMod::from_u8(*c) {
             match len {
@@ -175,7 +176,7 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                         length = Some(LengthMod::Char);
                         state = State::Conversion;
                     }
-                    _ => panic!("{}", err(start_idx.unwrap())),
+                    _ => err(s, start_idx),
                 },
                 LengthMod::Long => match state {
                     State::Flag
@@ -189,7 +190,7 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                         length = Some(LengthMod::LongLong);
                         state = State::Conversion;
                     }
-                    _ => panic!("{}", err(start_idx.unwrap())),
+                    _ => err(s, start_idx),
                 },
                 _ => {
                     length = Some(len);
@@ -219,6 +220,8 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                 }
                 _ => unreachable!(),
             }
+        } else {
+            err(s, start_idx);
         }
     }
 
@@ -236,7 +239,7 @@ pub fn parse_format(s: &[u8]) -> ParseResult<'_> {
                 remaining: Some(&s[last_idx + 1..]),
             }
         } else {
-            panic!("{}", err(start_idx));
+            err(s, Some(start_idx));
         }
     } else {
         ParseResult {
@@ -445,7 +448,7 @@ impl Conversion {
 }
 
 #[derive(Debug, Clone)]
-pub struct ConversionSpec {
+struct ConversionSpec {
     flags: Vec<FlagChar>,
     width: Option<Width>,
     precision: Option<Width>,
