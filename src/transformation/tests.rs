@@ -300,6 +300,63 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_fread() {
+    run_test(
+        "
+unsafe fn f(mut stream: *mut FILE) {
+    let mut buf1: [libc::c_char; 16] = [0; 16];
+    let mut buf2: [libc::c_char; 16] = [0; 16];
+    fread(
+        buf1.as_mut_ptr() as *mut libc::c_void,
+        1 as libc::c_int as libc::c_ulong,
+        16 as libc::c_int as libc::c_ulong,
+        stream,
+    );
+    fread(
+        buf2.as_mut_ptr() as *mut libc::c_void,
+        1 as libc::c_int as libc::c_ulong,
+        16 as libc::c_int as libc::c_ulong,
+        stream,
+    );
+}",
+        |s| {
+            assert!(s.contains("Read"));
+            assert!(s.contains("read_exact"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("fread"));
+        },
+    );
+}
+
+#[test]
+fn test_fread_stdin() {
+    run_test(
+        "
+unsafe fn f() {
+    let mut buf1: [libc::c_char; 16] = [0; 16];
+    let mut buf2: [libc::c_char; 16] = [0; 16];
+    fread(
+        buf1.as_mut_ptr() as *mut libc::c_void,
+        1 as libc::c_int as libc::c_ulong,
+        16 as libc::c_int as libc::c_ulong,
+        stdin,
+    );
+    fread(
+        buf2.as_mut_ptr() as *mut libc::c_void,
+        1 as libc::c_int as libc::c_ulong,
+        16 as libc::c_int as libc::c_ulong,
+        stdin,
+    );
+}",
+        |s| {
+            assert!(s.contains("Read"));
+            assert!(s.contains("read_exact"));
+            assert!(!s.contains("fread"));
+        },
+    );
+}
+
+#[test]
 fn test_printf() {
     run_test(
         r#"
@@ -392,6 +449,59 @@ unsafe fn f() -> libc::c_int {
         |s| {
             assert!(s.contains("write_all"));
             assert!(!s.contains("puts"));
+        },
+    );
+}
+
+#[test]
+fn test_fwrite() {
+    run_test(
+        r#"
+unsafe fn f(mut stream: *mut FILE) {
+    fwrite(
+        b"a\0" as *const u8 as *const libc::c_char as *const libc::c_void,
+        1 as libc::c_int as libc::c_ulong,
+        1 as libc::c_int as libc::c_ulong,
+        stream,
+    );
+    fwrite(
+        b"b\0" as *const u8 as *const libc::c_char as *const libc::c_void,
+        1 as libc::c_int as libc::c_ulong,
+        1 as libc::c_int as libc::c_ulong,
+        stream,
+    );
+}"#,
+        |s| {
+            assert!(s.contains("Write"));
+            assert!(s.contains("write_all"));
+            assert!(!s.contains("FILE"));
+            assert!(!s.contains("fwrite"));
+        },
+    );
+}
+
+#[test]
+fn test_fwrite_stdout() {
+    run_test(
+        r#"
+unsafe fn f() {
+    fwrite(
+        b"a\0" as *const u8 as *const libc::c_char as *const libc::c_void,
+        1 as libc::c_int as libc::c_ulong,
+        1 as libc::c_int as libc::c_ulong,
+        stdout,
+    );
+    fwrite(
+        b"b\0" as *const u8 as *const libc::c_char as *const libc::c_void,
+        1 as libc::c_int as libc::c_ulong,
+        1 as libc::c_int as libc::c_ulong,
+        stdout,
+    );
+}"#,
+        |s| {
+            assert!(s.contains("Write"));
+            assert!(s.contains("write_all"));
+            assert!(!s.contains("fwrite"));
         },
     );
 }

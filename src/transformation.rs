@@ -506,6 +506,30 @@ impl MutVisitor for TransformVisitor<'_> {
     }
 }
 
+#[inline]
+fn unwrap_some_call(expr: &Expr) -> Option<&Expr> {
+    let ExprKind::Call(callee, args) = &expr.kind else { return None };
+    let ExprKind::Path(None, path) = &callee.kind else { return None };
+    if path.segments.last().unwrap().ident.name.as_str() != "Some" {
+        return None;
+    }
+    let [arg] = &args[..] else { return None };
+    let ExprKind::Call(callee, _) = &arg.kind else { return None };
+    let ExprKind::Path(None, _) = &callee.kind else { return None };
+    Some(callee)
+}
+
+#[inline]
+fn make_stream_def(stream: &Expr) -> String {
+    if let Some(stream) = unwrap_some_call(stream) {
+        let stream = pprust::expr_to_string(stream);
+        format!("let mut stream = {}();", stream)
+    } else {
+        let stream = pprust::expr_to_string(stream);
+        format!("let stream = ({}).as_mut().unwrap();", stream)
+    }
+}
+
 fn transform_fopen(path: &Expr, mode: &Expr, permissions: &BitSet<Permission>) -> Expr {
     let path = pprust::expr_to_string(path);
     let path = format!(
@@ -636,22 +660,10 @@ fn transform_fgetc(stream: &str) -> Expr {
 }
 
 #[inline]
-fn is_transformed_stdin(expr: &Expr) -> bool {
-    let ExprKind::Call(callee, args) = &expr.kind else { return false };
-    let ExprKind::Path(None, path) = &callee.kind else { return false };
-    if path.segments.last().unwrap().ident.name.as_str() != "Some" {
-        return false;
-    }
-    let [arg] = &args[..] else { return false };
-    let ExprKind::Call(callee, _) = &arg.kind else { return false };
-    let ExprKind::Path(None, path) = &callee.kind else { return false };
-    path.segments.last().unwrap().ident.name.as_str() == "stdin"
-}
-
-#[inline]
 fn transform_fgets(stream: &Expr, s: &Expr, n: &Expr) -> Expr {
-    let stream_def = if is_transformed_stdin(stream) {
-        "let stream = std::io::stdin(); let mut stream = stream.lock();".to_string()
+    let stream_def = if let Some(stream) = unwrap_some_call(stream) {
+        let stream = pprust::expr_to_string(stream);
+        format!("let stream = {}(); let mut stream = stream.lock();", stream)
     } else {
         let stream = pprust::expr_to_string(stream);
         format!("let stream = ({}).as_mut().unwrap();", stream)
@@ -699,14 +711,14 @@ fn transform_fgets(stream: &Expr, s: &Expr, n: &Expr) -> Expr {
 
 #[inline]
 fn transform_fread(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+    let stream_def = make_stream_def(stream);
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
     expr!(
         "{{
     use std::io::Read;
-    let stream = ({}).as_mut().unwrap();
+    {}
     let size = {};
     let ptr: &mut [u8] = std::slice::from_raw_parts_mut(({}) as _, (size * ({})) as usize);
     let mut i = 0;
@@ -718,7 +730,7 @@ fn transform_fread(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Exp
     }}
     i
 }}",
-        stream,
+        stream_def,
         size,
         ptr,
         nitems,
@@ -794,14 +806,14 @@ fn transform_fputs(stream: &Expr, s: &Expr) -> Expr {
 
 #[inline]
 fn transform_fwrite(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+    let stream_def = make_stream_def(stream);
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
     expr!(
         "{{
     use std::io::Write;
-    let stream = ({}).as_mut().unwrap();
+    {}
     let size = {};
     let ptr: &[u8] = std::slice::from_raw_parts({} as _, (size * ({})) as usize);
     let mut i = 0;
@@ -813,7 +825,7 @@ fn transform_fwrite(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Ex
     }}
     i
 }}",
-        stream,
+        stream_def,
         size,
         ptr,
         nitems
