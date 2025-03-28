@@ -694,6 +694,42 @@ unsafe fn f(mut c: libc::c_int, mut stream: *mut FILE) {
     );
 }
 
+#[test]
+fn test_file_to_void() {
+    run_test(
+        "
+unsafe fn f(mut stream: *mut FILE) {
+    let mut p: *mut libc::c_void = stream as *mut libc::c_void;
+    fputc('a' as i32, stream);
+    putchar('a' as i32);
+}",
+        |s| {
+            assert!(s.contains("Write"));
+            assert!(s.contains("write_all"));
+            assert!(s.contains("FILE"));
+            assert!(s.contains("fputc"));
+        },
+    );
+}
+
+#[test]
+fn test_void_to_file() {
+    run_test(
+        "
+unsafe fn f(mut p: *mut libc::c_void) {
+    let mut stream: *mut FILE = p as *mut FILE;
+    fputc('a' as i32, stream);
+    putchar('a' as i32);
+}",
+        |s| {
+            assert!(s.contains("Write"));
+            assert!(s.contains("write_all"));
+            assert!(s.contains("FILE"));
+            assert!(s.contains("fputc"));
+        },
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

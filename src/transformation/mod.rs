@@ -46,12 +46,39 @@ impl Pass for Transformation {
         let hir = tcx.hir();
         let source_map = tcx.sess.source_map();
 
+        let mut unsupported: FxHashSet<_> = analysis_result
+            .unsupported
+            .iter()
+            .filter_map(|loc_id| {
+                let loc = analysis_result.locs[loc_id];
+                match loc {
+                    Loc::Var(def_id, local) => {
+                        let body = tcx.optimized_mir(def_id);
+                        let local_decl = &body.local_decls[local];
+                        let span = local_decl.source_info.span;
+                        Some(span)
+                    }
+                    Loc::Field(_, _) => todo!(),
+                    Loc::Stdin | Loc::Stdout | Loc::Stderr => None,
+                }
+            })
+            .collect();
         let mut hir_visitor = HirVisitor {
             tcx,
             rhs_span_to_lhs_id: FxHashMap::default(),
             pat_span_to_id: FxHashMap::default(),
+            path_id_to_spans: FxHashMap::default(),
         };
         hir.visit_all_item_likes_in_crate(&mut hir_visitor);
+        for (span, hir_id) in &hir_visitor.pat_span_to_id {
+            if !unsupported.contains(span) {
+                continue;
+            }
+            let spans = some_or!(hir_visitor.path_id_to_spans.get(hir_id), continue);
+            for span in spans {
+                unsupported.insert(*span);
+            }
+        }
 
         let mut fn_permissions = FxHashMap::default();
         let mut local_origins = FxHashMap::default();
@@ -180,6 +207,7 @@ impl Pass for Transformation {
                 call_file_args: &call_file_args,
                 null_checks: &null_checks,
                 null_casts: &null_casts,
+                unsupported: &unsupported,
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
@@ -220,12 +248,12 @@ struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     rhs_span_to_lhs_id: FxHashMap<Span, HirId>,
     pat_span_to_id: FxHashMap<Span, HirId>,
+    path_id_to_spans: FxHashMap<HirId, Vec<Span>>,
 }
 
 impl<'tcx> HirVisitor<'tcx> {
     fn handle_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
         let rustc_hir::PatKind::Binding(_, hir_id, _, _) = local.pat.kind else { return };
-        self.pat_span_to_id.insert(local.pat.span, hir_id);
         let init = some_or!(local.init, return);
         self.rhs_span_to_lhs_id.insert(init.span, hir_id);
     }
@@ -237,6 +265,11 @@ impl<'tcx> HirVisitor<'tcx> {
         };
         let Res::Local(hir_id) = path.res else { return };
         self.rhs_span_to_lhs_id.insert(rhs.span, hir_id);
+    }
+
+    fn handle_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
+        let rustc_hir::PatKind::Binding(_, hir_id, _, _) = pat.kind else { return };
+        self.pat_span_to_id.insert(pat.span, hir_id);
     }
 }
 
@@ -256,6 +289,18 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         self.handle_expr(expr);
         intravisit::walk_expr(self, expr);
     }
+
+    fn visit_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
+        self.handle_pat(pat);
+        intravisit::walk_pat(self, pat);
+    }
+
+    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, _: HirId) {
+        if let Res::Local(id) = path.res {
+            self.path_id_to_spans.entry(id).or_default().push(path.span);
+        }
+        intravisit::walk_path(self, path);
+    }
 }
 
 struct TransformVisitor<'a> {
@@ -268,6 +313,18 @@ struct TransformVisitor<'a> {
     call_file_args: &'a FxHashMap<Span, Vec<usize>>,
     null_checks: &'a FxHashSet<Span>,
     null_casts: &'a FxHashSet<Span>,
+    unsupported: &'a FxHashSet<Span>,
+}
+
+impl TransformVisitor<'_> {
+    fn is_unsupported(&self, expr: &Expr) -> bool {
+        self.unsupported.contains(&expr.span) || self.unsupported.contains(&remove_cast(expr).span)
+    }
+}
+
+fn remove_cast(expr: &Expr) -> &Expr {
+    let ExprKind::Cast(expr, _) = &expr.kind else { return expr };
+    remove_cast(expr)
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -278,6 +335,9 @@ impl MutVisitor for TransformVisitor<'_> {
             if let Some(permissions) = self.fn_permissions.get(&f.sig.span) {
                 let mut ps = BitSet::new_empty(Permission::NUM);
                 for (param, perm) in f.sig.decl.inputs.iter_mut().zip(permissions) {
+                    if self.unsupported.contains(&param.pat.span) {
+                        continue;
+                    }
                     let perm = some_or!(perm, continue);
                     if !perm.is_empty() {
                         *param.ty = ty!("Option<TTT>");
@@ -301,6 +361,10 @@ impl MutVisitor for TransformVisitor<'_> {
 
     fn visit_local(&mut self, local: &mut P<Local>) {
         mut_visit::noop_visit_local(local, self);
+
+        if self.unsupported.contains(&local.pat.span) {
+            return;
+        }
 
         if let Some(origins) = self.local_origins.get(&local.pat.span) {
             if !origins.is_empty() {
@@ -332,6 +396,9 @@ impl MutVisitor for TransformVisitor<'_> {
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
         mut_visit::noop_visit_expr(expr, self);
         let expr_span = expr.span;
+        if self.is_unsupported(expr) {
+            return;
+        }
         match &mut expr.kind {
             ExprKind::Call(callee, args) => {
                 if let ExprKind::Path(None, path) = &callee.kind {
@@ -351,15 +418,24 @@ impl MutVisitor for TransformVisitor<'_> {
                                 *expr.deref_mut() = new_expr;
                             }
                             "fclose" | "pclose" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 *callee.deref_mut() = expr!("drop");
                             }
                             "fscanf" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_fscanf(&args[0], &args[1], &args[2..]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fgetc" | "getc" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let stream = pprust::expr_to_string(&args[0]);
                                 let new_expr = transform_fgetc(&stream);
@@ -372,11 +448,17 @@ impl MutVisitor for TransformVisitor<'_> {
                                 *expr.deref_mut() = new_expr;
                             }
                             "fgets" => {
+                                if self.is_unsupported(&args[2]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_fgets(&args[2], &args[0], &args[1]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fread" => {
+                                if self.is_unsupported(&args[3]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr =
                                     transform_fread(&args[3], &args[0], &args[1], &args[2]);
@@ -385,11 +467,17 @@ impl MutVisitor for TransformVisitor<'_> {
                             "getdelim" => todo!(),
                             "getline" => todo!(),
                             "feof" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_feof(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fprintf" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let stream = pprust::expr_to_string(&args[0]);
                                 let new_expr = transform_fprintf(&stream, &args[1], &args[2..]);
@@ -405,6 +493,9 @@ impl MutVisitor for TransformVisitor<'_> {
                             "vfprintf" => todo!(),
                             "vprintf" => todo!(),
                             "fputc" | "putc" => {
+                                if self.is_unsupported(&args[1]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let stream = pprust::expr_to_string(&args[1]);
                                 let new_expr = transform_fputc(&stream, &args[0]);
@@ -417,6 +508,9 @@ impl MutVisitor for TransformVisitor<'_> {
                                 *expr.deref_mut() = new_expr;
                             }
                             "fputs" => {
+                                if self.is_unsupported(&args[1]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_fputs(&args[1], &args[0]);
                                 *expr.deref_mut() = new_expr;
@@ -427,27 +521,42 @@ impl MutVisitor for TransformVisitor<'_> {
                                 *expr.deref_mut() = new_expr;
                             }
                             "fwrite" => {
+                                if self.is_unsupported(&args[3]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr =
                                     transform_fwrite(&args[3], &args[0], &args[1], &args[2]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fflush" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_fflush(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "fseek" | "fseeko" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_fseek(&args[0], &args[1], &args[2]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "ftell" | "ftello" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_ftell(&args[0]);
                                 *expr.deref_mut() = new_expr;
                             }
                             "rewind" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_rewind(&args[0]);
                                 *expr.deref_mut() = new_expr;
@@ -455,6 +564,9 @@ impl MutVisitor for TransformVisitor<'_> {
                             "fgetpos" => todo!(),
                             "fsetpos" => todo!(),
                             "fileno" => {
+                                if self.is_unsupported(&args[0]) {
+                                    return;
+                                }
                                 self.updated = true;
                                 let new_expr = transform_fileno(&args[0]);
                                 *expr.deref_mut() = new_expr;
@@ -464,14 +576,17 @@ impl MutVisitor for TransformVisitor<'_> {
                                     let mut none = false;
                                     for i in pos {
                                         let arg = &mut args[*i];
+                                        if self.is_unsupported(arg) {
+                                            continue;
+                                        }
                                         let a = pprust::expr_to_string(arg);
+                                        let new_expr = expr!("({}).as_mut()", a);
+                                        *arg = P(new_expr);
+                                        self.updated = true;
                                         if a == "None" {
                                             none = true;
                                         }
-                                        let new_expr = expr!("({}).as_mut()", a);
-                                        *arg = P(new_expr);
                                     }
-                                    self.updated = true;
                                     if none {
                                         let c = pprust::expr_to_string(callee);
                                         let new_expr = expr!("{}::<&mut std::fs::File>", c);

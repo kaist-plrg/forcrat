@@ -203,17 +203,8 @@ impl Pass for FileAnalysis {
         }
 
         let unsupported = analyzer.unsupported.compute_all(locs.len());
-        let source_map = tcx.sess.source_map();
         for loc_id in unsupported.iter() {
-            let loc = locs[loc_id];
-            info!("{:?}", loc);
-            if let Loc::Var(def_id, local) = loc {
-                let body = tcx.optimized_mir(def_id);
-                let local_decl = &body.local_decls[local];
-                let span = local_decl.source_info.span;
-                info!("{:?}", span);
-                info!("{}", source_map.span_to_snippet(span).unwrap());
-            }
+            info!("{:?}", locs[loc_id]);
         }
 
         AnalysisResult {
