@@ -1,4 +1,4 @@
-use std::ops::Deref as _;
+use std::{collections::hash_map::Entry, ops::Deref as _};
 
 use rustc_abi::{FieldIdx, FIRST_VARIANT};
 use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
@@ -27,10 +27,12 @@ use rustc_middle::{
 };
 use rustc_span::Span;
 use tracing::info;
+use typed_arena::Arena;
 
 use crate::{
     api_list::{def_id_api_kind, is_def_id_api, is_symbol_api, ApiKind, Origin, Permission},
     compile_util::{contains_file_ty, is_file_ty, is_std_io_expr, Pass},
+    disjoint_set::DisjointSet,
     rustc_ast::visit::Visitor as _,
     steensgaard,
     transformation::LikelyLit,
@@ -42,6 +44,7 @@ pub struct AnalysisResult {
     pub loc_ind_map: FxHashMap<Loc, LocId>,
     pub permissions: IndexVec<LocId, BitSet<Permission>>,
     pub origins: IndexVec<LocId, BitSet<Origin>>,
+    pub unsupported: HybridBitSet<LocId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +152,7 @@ impl Pass for FileAnalysis {
         origin_graph.add_solution(loc_ind_map[&Loc::Stdin], Origin::Stdin);
         origin_graph.add_solution(loc_ind_map[&Loc::Stdout], Origin::Stdout);
         origin_graph.add_solution(loc_ind_map[&Loc::Stderr], Origin::Stderr);
+        let arena = Arena::new();
         let mut analyzer = Analyzer {
             tcx,
             popen_read,
@@ -158,6 +162,7 @@ impl Pass for FileAnalysis {
             loc_ind_map: &loc_ind_map,
             permission_graph: Graph::new(locs.len(), Permission::NUM),
             origin_graph,
+            unsupported: UnsupportedTracker::new(&arena),
         };
 
         for item_id in hir.items() {
@@ -197,11 +202,26 @@ impl Pass for FileAnalysis {
             info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
         }
 
+        let unsupported = analyzer.unsupported.compute_all(locs.len());
+        let source_map = tcx.sess.source_map();
+        for loc_id in unsupported.iter() {
+            let loc = locs[loc_id];
+            info!("{:?}", loc);
+            if let Loc::Var(def_id, local) = loc {
+                let body = tcx.optimized_mir(def_id);
+                let local_decl = &body.local_decls[local];
+                let span = local_decl.source_info.span;
+                info!("{:?}", span);
+                info!("{}", source_map.span_to_snippet(span).unwrap());
+            }
+        }
+
         AnalysisResult {
             locs,
             loc_ind_map,
             permissions,
             origins,
+            unsupported,
         }
     }
 }
@@ -215,6 +235,7 @@ struct Analyzer<'a, 'tcx> {
     steensgaard: &'a steensgaard::AnalysisResult,
     permission_graph: Graph<LocId, Permission>,
     origin_graph: Graph<LocId, Origin>,
+    unsupported: UnsupportedTracker<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -227,7 +248,34 @@ impl<'tcx> Analyzer<'_, 'tcx> {
     fn transfer_stmt(&mut self, stmt: &Statement<'tcx>, ctx: Ctx<'_, 'tcx>) {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         let ty = l.ty(ctx.local_decls, self.tcx).ty;
-        if let Some(variance) = file_type_variance(ty, self.tcx) {
+        let variance = file_type_variance(ty, self.tcx);
+        if let Rvalue::Cast(kind, op, _) = r {
+            match kind {
+                CastKind::PtrToPtr => {
+                    let rty = op.ty(ctx.local_decls, self.tcx);
+                    match (variance, contains_file_ty(rty, self.tcx)) {
+                        (Some(variance), true) => {
+                            let l = self.transfer_place(*l, ctx).unwrap();
+                            let r = self.transfer_operand(op, ctx).unwrap();
+                            self.assign(l, r, variance);
+                        }
+                        (Some(_), false) => {
+                            println!("{:?}", rty);
+                            let l = self.transfer_place(*l, ctx).unwrap();
+                            self.unsupported.add(l);
+                        }
+                        (None, true) => {
+                            println!("{:?}", ty);
+                            let r = self.transfer_operand(op, ctx).unwrap();
+                            self.unsupported.add(r);
+                        }
+                        (None, false) => {}
+                    }
+                }
+                CastKind::PointerFromExposedAddress => {}
+                _ => assert!(variance.is_none()),
+            }
+        } else if let Some(variance) = variance {
             if let Some(l) = self.transfer_place(*l, ctx) {
                 match r {
                     Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
@@ -235,22 +283,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             self.assign(l, r, variance);
                         }
                     }
-                    Rvalue::Cast(kind, op, _) => match kind {
-                        CastKind::PtrToPtr => {
-                            let rty = op.ty(ctx.local_decls, self.tcx);
-                            if contains_file_ty(rty, self.tcx) {
-                                let r = self.transfer_operand(op, ctx).unwrap();
-                                self.assign(l, r, variance);
-                            } else {
-                                println!("{:?}", rty);
-                            }
-                        }
-                        CastKind::PointerFromExposedAddress => {}
-                        // self.add_origin(l, Origin::Null);
-                        _ => {
-                            assert!(!contains_file_ty(ty, self.tcx));
-                        }
-                    },
+                    Rvalue::Cast(_, _, _) => unreachable!(),
                     Rvalue::Ref(_, _, place)
                     | Rvalue::AddressOf(_, place)
                     | Rvalue::CopyForDeref(place) => {
@@ -401,10 +434,19 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 }
                             }
                         }
-                        ApiKind::Operation(None) | ApiKind::StdioOperation | ApiKind::NotIO => {}
                         ApiKind::Unsupported => {
                             println!("{:?}", def_id);
+                            let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
+                            for (t, arg) in sig.inputs().iter().zip(args) {
+                                if contains_file_ty(*t, self.tcx) {
+                                    if let Some(x) = self.transfer_operand(arg, ctx) {
+                                        self.unsupported.add(x);
+                                    }
+                                    break;
+                                }
+                            }
                         }
+                        ApiKind::Operation(None) | ApiKind::StdioOperation | ApiKind::NotIO => {}
                     }
                 } else if let Some(callee) = def_id.as_local() {
                     self.transfer_non_api_call(callee, args, *destination, ctx);
@@ -464,6 +506,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 self.origin_graph.add_edge(rhs, lhs);
             }
         }
+        self.unsupported.union(lhs, rhs);
     }
 }
 
@@ -710,6 +753,57 @@ impl<'a, T: Idx> GraphSuccessors<'_> for VecBitSet<'a, T> {
 impl<T: Idx> WithSuccessors for VecBitSet<'_, T> {
     fn successors(&self, node: Self::Node) -> <Self as GraphSuccessors<'_>>::Iter {
         self.0[node].iter()
+    }
+}
+
+struct UnsupportedTracker<'a> {
+    arena: &'a Arena<DisjointSet<'a, LocId>>,
+    locs: FxHashMap<LocId, &'a DisjointSet<'a, LocId>>,
+    unsupported: FxHashSet<LocId>,
+}
+
+impl<'a> UnsupportedTracker<'a> {
+    fn new(arena: &'a Arena<DisjointSet<'a, LocId>>) -> Self {
+        Self {
+            arena,
+            locs: FxHashMap::default(),
+            unsupported: FxHashSet::default(),
+        }
+    }
+
+    fn union(&mut self, loc1: LocId, loc2: LocId) {
+        let loc1 = *self
+            .locs
+            .entry(loc1)
+            .or_insert_with(|| self.arena.alloc(DisjointSet::new(loc1)));
+        let loc2 = *self
+            .locs
+            .entry(loc2)
+            .or_insert_with(|| self.arena.alloc(DisjointSet::new(loc2)));
+        if loc1.find_set() != loc2.find_set() {
+            loc1.union(loc2);
+        }
+    }
+
+    fn add(&mut self, loc: LocId) {
+        if let Entry::Vacant(e) = self.locs.entry(loc) {
+            e.insert(self.arena.alloc(DisjointSet::new(loc)));
+        }
+        self.unsupported.insert(loc);
+    }
+
+    fn compute_all(&self, len: usize) -> HybridBitSet<LocId> {
+        let mut unsupported = HybridBitSet::new_empty(len);
+        for loc_id in &self.unsupported {
+            unsupported.insert(self.locs[loc_id].find_set().id());
+        }
+        for (loc, set) in &self.locs {
+            let root = set.find_set().id();
+            if unsupported.contains(root) {
+                unsupported.insert(*loc);
+            }
+        }
+        unsupported
     }
 }
 

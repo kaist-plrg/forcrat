@@ -154,7 +154,7 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("pclose", Operation(Some(Close))),
     // Read (10)
     ("fscanf", Operation(Some(BufRead))),
-    ("vfscanf", Operation(Some(BufRead))),
+    ("vfscanf", Unsupported),
     ("getc", Operation(Some(Read))), // unlocked
     ("fgetc", Operation(Some(Read))),
     ("fgets", Operation(Some(BufRead))),
@@ -172,7 +172,7 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("vsscanf", NotIO),
     // Write (8)
     ("fprintf", Operation(Some(Write))),
-    ("vfprintf", Operation(Some(Write))),
+    ("vfprintf", Unsupported),
     ("putc", Operation(Some(Write))), // unlocked
     ("fputc", Operation(Some(Write))),
     ("fputs", Operation(Some(Write))),
@@ -201,9 +201,9 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("fgetpos", Operation(Some(Seek))),
     ("fsetpos", Operation(Some(Seek))),
     // Error (3)
-    ("clearerr", Unsupported),
+    ("clearerr", Operation(None)),
     ("feof", Operation(Some(Read))),
-    ("ferror", Unsupported),
+    ("ferror", Operation(None)),
     // Locking (3)
     ("flockfile", Operation(Some(Lock))),
     ("ftrylockfile", Operation(Some(Lock))),
@@ -226,7 +226,7 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("open_wmemstream", Open(Buffer)),
     // Read (6)
     ("fwscanf", Operation(Some(BufRead))),
-    ("vfwscanf", Operation(Some(BufRead))),
+    ("vfwscanf", Unsupported),
     ("getwc", Operation(Some(Read))),
     ("fgetwc", Operation(Some(Read))),
     ("fgetws", Operation(Some(BufRead))),
@@ -240,7 +240,7 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("vswscanf", NotIO),
     // Write (5)
     ("fwprintf", Operation(Some(Write))),
-    ("vfwprintf", Operation(Some(Write))),
+    ("vfwprintf", Unsupported),
     ("putwc", Operation(Some(Write))),
     ("fputwc", Operation(Some(Write))),
     ("fputws", Operation(Some(Write))),
