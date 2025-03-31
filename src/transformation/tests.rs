@@ -730,6 +730,55 @@ unsafe fn f(mut p: *mut libc::c_void) {
     );
 }
 
+#[test]
+fn test_void_open_1() {
+    run_test(
+        r#"
+unsafe fn g(mut p: *mut libc::c_void) {}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream as *mut libc::c_void);
+    fputc('a' as i32, stream);
+    putchar('a' as i32);
+    fclose(stream);
+}"#,
+        |s| {
+            assert!(s.contains("Write"));
+            assert!(s.contains("write_all"));
+            assert!(s.contains("FILE"));
+            assert!(s.contains("fputc"));
+        },
+    );
+}
+
+#[test]
+fn test_void_open_2() {
+    run_test(
+        r#"
+unsafe fn g(mut p: *mut libc::c_void) {}
+unsafe fn f() {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    g(stream as *mut libc::c_void);
+    stream = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    fputc('a' as i32, stream);
+    putchar('a' as i32);
+    fclose(stream);
+}"#,
+        |s| {
+            assert!(s.contains("Write"));
+            assert!(s.contains("write_all"));
+            assert!(s.contains("FILE"));
+            assert!(s.contains("fputc"));
+        },
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

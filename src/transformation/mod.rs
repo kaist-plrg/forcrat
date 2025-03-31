@@ -46,6 +46,7 @@ impl Pass for Transformation {
         let hir = tcx.hir();
         let source_map = tcx.sess.source_map();
 
+        // all binding occurrences of unsupported
         let mut unsupported: FxHashSet<_> = analysis_result
             .unsupported
             .iter()
@@ -66,6 +67,7 @@ impl Pass for Transformation {
         let mut hir_visitor = HirVisitor {
             tcx,
             rhs_span_to_lhs_id: FxHashMap::default(),
+            lhs_id_to_rhs_spans: FxHashMap::default(),
             pat_span_to_id: FxHashMap::default(),
             path_id_to_spans: FxHashMap::default(),
         };
@@ -74,9 +76,17 @@ impl Pass for Transformation {
             if !unsupported.contains(span) {
                 continue;
             }
-            let spans = some_or!(hir_visitor.path_id_to_spans.get(hir_id), continue);
-            for span in spans {
-                unsupported.insert(*span);
+            // add all bound occurrences to unsupported
+            if let Some(spans) = hir_visitor.path_id_to_spans.get(hir_id) {
+                for span in spans {
+                    unsupported.insert(*span);
+                }
+            }
+            // add all rhs to unsupported
+            if let Some(spans) = hir_visitor.lhs_id_to_rhs_spans.get(hir_id) {
+                for span in spans {
+                    unsupported.insert(*span);
+                }
             }
         }
 
@@ -246,8 +256,13 @@ impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
 
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
+    /// for each x = rhs, maps rhs's span to x's hir_id
     rhs_span_to_lhs_id: FxHashMap<Span, HirId>,
+    /// for each x = rhs, maps x's hir_id to rhs's spans
+    lhs_id_to_rhs_spans: FxHashMap<HirId, Vec<Span>>,
+    /// for each x, maps binding's span to x's hir_id
     pat_span_to_id: FxHashMap<Span, HirId>,
+    /// for each x, maps x's hir_id to bound occurrences' spans
     path_id_to_spans: FxHashMap<HirId, Vec<Span>>,
 }
 
@@ -256,6 +271,10 @@ impl<'tcx> HirVisitor<'tcx> {
         let rustc_hir::PatKind::Binding(_, hir_id, _, _) = local.pat.kind else { return };
         let init = some_or!(local.init, return);
         self.rhs_span_to_lhs_id.insert(init.span, hir_id);
+        self.lhs_id_to_rhs_spans
+            .entry(hir_id)
+            .or_default()
+            .push(init.span);
     }
 
     fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
@@ -265,6 +284,10 @@ impl<'tcx> HirVisitor<'tcx> {
         };
         let Res::Local(hir_id) = path.res else { return };
         self.rhs_span_to_lhs_id.insert(rhs.span, hir_id);
+        self.lhs_id_to_rhs_spans
+            .entry(hir_id)
+            .or_default()
+            .push(rhs.span);
     }
 
     fn handle_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
