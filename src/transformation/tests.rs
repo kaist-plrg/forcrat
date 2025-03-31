@@ -2,41 +2,51 @@ use lazy_static::lazy_static;
 
 use crate::{compile_util::Pass, formatter, ty_checker};
 
-fn run_test<F: FnOnce(&str)>(s: &str, f: F) {
+fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
     let v = super::Transformation.run_on_str(&code);
     let [(_, s)] = &v[..] else { panic!() };
     let stripped = s.strip_prefix(FORMATTED_PREAMBLE.as_str()).unwrap();
-    f(stripped);
+    for s in includes {
+        assert!(stripped.contains(s), "{}\nmust contain {}", stripped, s);
+    }
+    for s in excludes {
+        assert!(
+            !stripped.contains(s),
+            "{}\nmust not contain {}",
+            stripped,
+            s
+        );
+    }
     assert!(ty_checker::TyChecker.run_on_str(&s), "{}", stripped);
 }
 
 #[test]
 fn test_stdin() {
-    run_test("unsafe fn f() { fgetc(stdin); }", |s| {
-        assert!(s.contains("read_exact"));
-        assert!(s.contains("std::io::stdin"));
-        assert!(!s.contains("fgetc"));
-    });
+    run_test(
+        "unsafe fn f() { fgetc(stdin); }",
+        &["read_exact", "std::io::stdin"],
+        &["fgetc"],
+    );
 }
 
 #[test]
 fn test_stdout() {
-    run_test("unsafe fn f() { fputc('a' as i32, stdout); }", |s| {
-        assert!(s.contains("write_all"));
-        assert!(s.contains("std::io::stdout"));
-        assert!(!s.contains("fputc"));
-    });
+    run_test(
+        "unsafe fn f() { fputc('a' as i32, stdout); }",
+        &["write_all", "std::io::stdout"],
+        &["fputc"],
+    );
 }
 
 #[test]
 fn test_stderr() {
-    run_test("unsafe fn f() { fputc('a' as i32, stderr); }", |s| {
-        assert!(s.contains("write_all"));
-        assert!(s.contains("std::io::stderr"));
-        assert!(!s.contains("fputc"));
-    });
+    run_test(
+        "unsafe fn f() { fputc('a' as i32, stderr); }",
+        &["write_all", "std::io::stderr"],
+        &["fputc"],
+    );
 }
 
 #[test]
@@ -51,16 +61,8 @@ unsafe fn f() {
     fgetc(stream);
     fclose(stream);
 }"#,
-        |s| {
-            assert!(s.contains("Read"));
-            assert!(s.contains("open"));
-            assert!(s.contains("read_exact"));
-            assert!(s.contains("drop"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fopen"));
-            assert!(!s.contains("fgetc"));
-            assert!(!s.contains("fclose"));
-        },
+        &["Read", "open", "read_exact", "drop"],
+        &["FILE", "fopen", "fgetc", "fclose"],
     );
 }
 
@@ -81,18 +83,15 @@ unsafe fn f() {
     );
     fclose(stream);
 }"#,
-        |s| {
-            assert!(s.contains("BufRead"));
-            assert!(s.contains("open"));
-            assert!(s.contains("fill_buf"));
-            assert!(s.contains("available"));
-            assert!(s.contains("consume"));
-            assert!(s.contains("drop"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fopen"));
-            assert!(!s.contains("fgets"));
-            assert!(!s.contains("fclose"));
-        },
+        &[
+            "BufRead",
+            "open",
+            "fill_buf",
+            "available",
+            "consume",
+            "drop",
+        ],
+        &["FILE", "fopen", "fgets", "fclose"],
     );
 }
 
@@ -108,16 +107,8 @@ unsafe fn f() {
     fputc('a' as i32, stream);
     fclose(stream);
 }"#,
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("create"));
-            assert!(s.contains("write_all"));
-            assert!(s.contains("drop"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fopen"));
-            assert!(!s.contains("fputc"));
-            assert!(!s.contains("fclose"));
-        },
+        &["Write", "create", "write_all", "drop"],
+        &["FILE", "fopen", "fputc", "fclose"],
     );
 }
 
@@ -133,15 +124,8 @@ unsafe fn f() {
     rewind(stream);
     fclose(stream);
 }"#,
-        |s| {
-            assert!(s.contains("Seek"));
-            assert!(s.contains("open"));
-            assert!(s.contains("rewind"));
-            assert!(s.contains("drop"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fopen"));
-            assert!(!s.contains("fclose"));
-        },
+        &["Seek", "open", "rewind", "drop"],
+        &["FILE", "fopen", "fclose"],
     );
 }
 
@@ -157,16 +141,8 @@ unsafe fn f() {
     fgetc(f);
     pclose(f);
 }"#,
-        |s| {
-            assert!(s.contains("Read"));
-            assert!(s.contains("Command"));
-            assert!(s.contains("ChildStdout"));
-            assert!(s.contains("stdout"));
-            assert!(s.contains("drop"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("popen"));
-            assert!(!s.contains("pclose"));
-        },
+        &["Read", "Command", "ChildStdout", "stdout", "drop"],
+        &["FILE", "popen", "pclose"],
     );
 }
 
@@ -182,16 +158,8 @@ unsafe fn f() {
     fputs(b"echo hello\n\0" as *const u8 as *const libc::c_char, f);
     pclose(f);
 }"#,
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("Command"));
-            assert!(s.contains("ChildStdin"));
-            assert!(s.contains("stdin"));
-            assert!(s.contains("drop"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("popen"));
-            assert!(!s.contains("pclose"));
-        },
+        &["Write", "Command", "ChildStdin", "stdin", "drop"],
+        &["FILE", "popen", "pclose"],
     );
 }
 
@@ -221,15 +189,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
         &mut h as *mut libc::c_double,
     );
 }"#,
-        |s| {
-            assert!(s.contains("BufRead"));
-            assert!(s.contains("fill_buf"));
-            assert!(s.contains("available"));
-            assert!(s.contains("consume"));
-            assert!(s.contains("parse"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fscanf"));
-        },
+        &["BufRead", "fill_buf", "available", "consume", "parse"],
+        &["FILE", "fscanf"],
     );
 }
 
@@ -247,15 +208,14 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
         buf2.as_mut_ptr(),
     );
 }"#,
-        |s| {
-            assert!(s.contains("BufRead"));
-            assert!(s.contains("fill_buf"));
-            assert!(s.contains("available"));
-            assert!(s.contains("consume"));
-            assert!(s.contains("copy_from_slice"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fscanf"));
-        },
+        &[
+            "BufRead",
+            "fill_buf",
+            "available",
+            "consume",
+            "copy_from_slice",
+        ],
+        &["FILE", "fscanf"],
     );
 }
 
@@ -267,12 +227,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fgetc(stream);
     return fgetc(stream);
 }",
-        |s| {
-            assert!(s.contains("Read"));
-            assert!(s.contains("read_exact"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fgetc"));
-        },
+        &["Read", "read_exact"],
+        &["FILE", "fgetc"],
     );
 }
 
@@ -284,12 +240,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     getc(stream);
     return getc(stream);
 }",
-        |s| {
-            assert!(s.contains("Read"));
-            assert!(s.contains("read_exact"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("getc"));
-        },
+        &["Read", "read_exact"],
+        &["FILE", "getc"],
     );
 }
 
@@ -301,10 +253,8 @@ unsafe fn f() -> libc::c_int {
     getchar();
     return getchar();
 }",
-        |s| {
-            assert!(s.contains("read_exact"));
-            assert!(!s.contains("getchar"));
-        },
+        &["Read", "read_exact"],
+        &["getchar"],
     );
 }
 
@@ -326,14 +276,8 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }",
-        |s| {
-            assert!(s.contains("BufRead"));
-            assert!(s.contains("fill_buf"));
-            assert!(s.contains("available"));
-            assert!(s.contains("consume"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fgets"));
-        },
+        &["BufRead", "fill_buf", "available", "consume"],
+        &["FILE", "fgets"],
     );
 }
 
@@ -355,14 +299,8 @@ unsafe fn f() {
         stdin,
     );
 }",
-        |s| {
-            assert!(s.contains("BufRead"));
-            assert!(s.contains("fill_buf"));
-            assert!(s.contains("available"));
-            assert!(s.contains("consume"));
-            assert!(s.contains("lock"));
-            assert!(!s.contains("fgets"));
-        },
+        &["BufRead", "fill_buf", "available", "consume", "lock"],
+        &["FILE", "fgets"],
     );
 }
 
@@ -386,12 +324,8 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }",
-        |s| {
-            assert!(s.contains("Read"));
-            assert!(s.contains("read_exact"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fread"));
-        },
+        &["Read", "read_exact"],
+        &["FILE", "fread"],
     );
 }
 
@@ -415,11 +349,8 @@ unsafe fn f() {
         stdin,
     );
 }",
-        |s| {
-            assert!(s.contains("Read"));
-            assert!(s.contains("read_exact"));
-            assert!(!s.contains("fread"));
-        },
+        &["Read", "read_exact"],
+        &["fread"],
     );
 }
 
@@ -430,12 +361,8 @@ fn test_printf() {
 unsafe fn f(mut stream: *mut FILE) {
     fprintf(stream, b"%d\0" as *const u8 as *const libc::c_char, 0 as libc::c_int);
 }"#,
-        |s| {
-            assert!(s.contains("write!"));
-            assert!(s.contains("i32"));
-            assert!(!s.contains("fprintf"));
-            assert!(!s.contains("%d"));
-        },
+        &["write!", "i32"],
+        &["fprintf", "%d"],
     );
 }
 
@@ -447,12 +374,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fputc('a' as i32, stream);
     return fputc('b' as i32, stream);
 }",
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fputc"));
-        },
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
     );
 }
 
@@ -464,12 +387,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     putc('a' as i32, stream);
     return putc('b' as i32, stream);
 }",
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("putc"));
-        },
+        &["Write", "write_all"],
+        &["FILE", "putc"],
     );
 }
 
@@ -481,10 +400,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     putchar('a' as i32);
     return putchar('b' as i32);
 }",
-        |s| {
-            assert!(s.contains("write_all"));
-            assert!(!s.contains("putchar"));
-        },
+        &["write_all"],
+        &["putchar"],
     );
 }
 
@@ -496,12 +413,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fputs(b"a\0" as *const u8 as *const libc::c_char, stream);
     return fputs(b"b\0" as *const u8 as *const libc::c_char, stream);
 }"#,
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fputs"));
-        },
+        &["Write", "write_all"],
+        &["FILE", "fputs"],
     );
 }
 
@@ -513,10 +426,8 @@ unsafe fn f() -> libc::c_int {
     puts(b"a\0" as *const u8 as *const libc::c_char);
     return puts(b"b\0" as *const u8 as *const libc::c_char);
 }"#,
-        |s| {
-            assert!(s.contains("write_all"));
-            assert!(!s.contains("puts"));
-        },
+        &["write_all"],
+        &["puts"],
     );
 }
 
@@ -538,12 +449,8 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }"#,
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fwrite"));
-        },
+        &["Write", "write_all"],
+        &["FILE", "fwrite"],
     );
 }
 
@@ -565,11 +472,8 @@ unsafe fn f() {
         stdout,
     );
 }"#,
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(!s.contains("fwrite"));
-        },
+        &["Write", "write_all"],
+        &["fwrite"],
     );
 }
 
@@ -581,12 +485,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fflush(stream);
     return fflush(stream);
 }",
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("flush"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fflush"));
-        },
+        &["Write", "flush"],
+        &["FILE", "fflush"],
     );
 }
 
@@ -598,12 +498,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_long {
     ftell(stream);
     return ftell(stream);
 }",
-        |s| {
-            assert!(s.contains("Seek"));
-            assert!(s.contains("stream_position"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("ftell"));
-        },
+        &["Seek", "stream_position"],
+        &["FILE", "ftell"],
     );
 }
 
@@ -615,12 +511,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_long {
     ftello(stream);
     return ftello(stream);
 }",
-        |s| {
-            assert!(s.contains("Seek"));
-            assert!(s.contains("stream_position"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("ftello"));
-        },
+        &["Seek", "stream_position"],
+        &["FILE", "ftello"],
     );
 }
 
@@ -632,11 +524,8 @@ unsafe fn f(mut stream: *mut FILE) {
     rewind(stream);
     rewind(stream);
 }",
-        |s| {
-            assert!(s.contains("Seek"));
-            assert!(s.contains("rewind"));
-            assert!(!s.contains("FILE"));
-        },
+        &["Seek", "rewind"],
+        &["FILE"],
     );
 }
 
@@ -648,12 +537,8 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fileno(stream);
     return fileno(stream);
 }",
-        |s| {
-            assert!(s.contains("AsRawFd"));
-            assert!(s.contains("as_raw_fd"));
-            assert!(!s.contains("FILE"), "{}", s);
-            assert!(!s.contains("fileno"));
-        },
+        &["AsRawFd", "as_raw_fd"],
+        &["FILE", "fileno"],
     );
 }
 
@@ -669,12 +554,8 @@ unsafe fn g(mut f: *mut FILE) {
 unsafe fn f() {
     g(0 as *mut FILE);
 }",
-        |s| {
-            assert!(s.contains("None"));
-            assert!(s.contains("is_none"));
-            assert!(!s.contains("0"));
-            assert!(!s.contains("is_null"));
-        },
+        &["None", "is_none"],
+        &["0", "is_null"],
     );
 }
 
@@ -685,12 +566,8 @@ fn test_second_arg() {
 unsafe fn f(mut c: libc::c_int, mut stream: *mut FILE) {
     fputc(c, stream);
 }",
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(!s.contains("FILE"));
-            assert!(!s.contains("fputc"));
-        },
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
     );
 }
 
@@ -703,12 +580,8 @@ unsafe fn f(mut stream: *mut FILE) {
     fputc('a' as i32, stream);
     putchar('a' as i32);
 }",
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(s.contains("FILE"));
-            assert!(s.contains("fputc"));
-        },
+        &["Write", "write_all", "FILE", "fputc"],
+        &[],
     );
 }
 
@@ -721,12 +594,8 @@ unsafe fn f(mut p: *mut libc::c_void) {
     fputc('a' as i32, stream);
     putchar('a' as i32);
 }",
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(s.contains("FILE"));
-            assert!(s.contains("fputc"));
-        },
+        &["Write", "write_all", "FILE", "fputc"],
+        &[],
     );
 }
 
@@ -745,12 +614,8 @@ unsafe fn f() {
     putchar('a' as i32);
     fclose(stream);
 }"#,
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(s.contains("FILE"));
-            assert!(s.contains("fputc"));
-        },
+        &["Write", "write_all", "FILE", "fputc"],
+        &[],
     );
 }
 
@@ -770,12 +635,41 @@ unsafe fn f() {
     putchar('a' as i32);
     fclose(stream);
 }"#,
-        |s| {
-            assert!(s.contains("Write"));
-            assert!(s.contains("write_all"));
-            assert!(s.contains("FILE"));
-            assert!(s.contains("fputc"));
-        },
+        &["Write", "write_all", "FILE", "fputc"],
+        &[],
+    );
+}
+
+#[test]
+fn test_void_is_null() {
+    run_test(
+        r#"
+unsafe fn f(mut p: *mut libc::c_void) {
+    let mut stream: *mut FILE = p as *mut FILE;
+    if stream.is_null() {
+        return;
+    }
+    fputc('a' as i32, stream);
+    putchar('a' as i32);
+}"#,
+        &["Write", "write_all", "FILE", "fputc"],
+        &[],
+    );
+}
+
+#[test]
+fn test_bin_op() {
+    run_test(
+        r#"
+unsafe fn f(mut stream: *mut FILE) {
+    if stream == stdout {
+        putchar('a' as i32);
+        return;
+    }
+    fputc('a' as i32, stream);
+}"#,
+        &["Write", "write_all", "FILE", "fputc"],
+        &[],
     );
 }
 

@@ -1,5 +1,6 @@
 use std::{collections::hash_map::Entry, ops::Deref as _};
 
+use etrace::some_or;
 use rustc_abi::{FieldIdx, FIRST_VARIANT};
 use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
 use rustc_data_structures::graph::{
@@ -203,6 +204,11 @@ impl Pass for FileAnalysis {
         }
 
         let unsupported = analyzer.unsupported.compute_all(locs.len());
+        if unsupported.is_empty() {
+            info!("No unsupported locations");
+        } else {
+            info!("Unsupported locations:");
+        }
         for loc_id in unsupported.iter() {
             info!("{:?}", locs[loc_id]);
         }
@@ -240,34 +246,67 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let StatementKind::Assign(box (l, r)) = &stmt.kind else { return };
         let ty = l.ty(ctx.local_decls, self.tcx).ty;
         let variance = file_type_variance(ty, self.tcx);
-        if let Rvalue::Cast(kind, op, _) = r {
-            match kind {
-                CastKind::PtrToPtr => {
-                    let rty = op.ty(ctx.local_decls, self.tcx);
-                    match (variance, contains_file_ty(rty, self.tcx)) {
-                        (Some(variance), true) => {
-                            let l = self.transfer_place(*l, ctx).unwrap();
-                            let r = self.transfer_operand(op, ctx).unwrap();
-                            self.assign(l, r, variance);
-                        }
-                        (Some(_), false) => {
-                            println!("{:?}", rty);
-                            let l = self.transfer_place(*l, ctx).unwrap();
-                            self.unsupported.add(l);
-                        }
-                        (None, true) => {
-                            println!("{:?}", ty);
-                            let r = self.transfer_operand(op, ctx).unwrap();
-                            self.unsupported.add(r);
-                        }
-                        (None, false) => {}
+        match r {
+            Rvalue::Cast(CastKind::PtrToPtr, op, _) => {
+                let rty = op.ty(ctx.local_decls, self.tcx);
+                match (variance, contains_file_ty(rty, self.tcx)) {
+                    (Some(variance), true) => {
+                        let l = self.transfer_place(*l, ctx).unwrap();
+                        let r = self.transfer_operand(op, ctx).unwrap();
+                        self.assign(l, r, variance);
+                    }
+                    (Some(_), false) => {
+                        println!("{:?}", rty);
+                        let l = self.transfer_place(*l, ctx).unwrap();
+                        self.unsupported.add(l);
+                    }
+                    (None, true) => {
+                        println!("{:?}", ty);
+                        let r = self.transfer_operand(op, ctx).unwrap();
+                        self.unsupported.add(r);
+                    }
+                    (None, false) => {}
+                }
+            }
+            Rvalue::Cast(CastKind::PointerFromExposedAddress, _, _) => {}
+            Rvalue::Cast(_, _, _) => assert!(variance.is_none()),
+            Rvalue::BinaryOp(_, box (op1, op2)) => {
+                let ty = op1.ty(ctx.local_decls, self.tcx);
+                if contains_file_ty(ty, self.tcx) {
+                    if let Some(op1) = self.transfer_operand(op1, ctx) {
+                        self.unsupported.add(op1);
+                    }
+                    if let Some(op2) = self.transfer_operand(op2, ctx) {
+                        self.unsupported.add(op2);
                     }
                 }
-                CastKind::PointerFromExposedAddress => {}
-                _ => assert!(variance.is_none()),
             }
-        } else if let Some(variance) = variance {
-            if let Some(l) = self.transfer_place(*l, ctx) {
+            Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, field_idx), fields) => {
+                assert!(variance.is_none());
+                if self.tcx.adt_def(def_id).is_union() {
+                    let f = &fields[FieldIdx::from_u32(0)];
+                    let ty = f.ty(ctx.local_decls, self.tcx);
+                    if let Some(variance) = file_type_variance(ty, self.tcx) {
+                        let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
+                        let l = self.loc_ind_map[&l];
+                        let r = self.transfer_operand(f, ctx).unwrap();
+                        self.assign(l, r, variance);
+                    }
+                } else {
+                    for (idx, f) in fields.iter_enumerated() {
+                        let ty = f.ty(ctx.local_decls, self.tcx);
+                        if let Some(variance) = file_type_variance(ty, self.tcx) {
+                            let l = Loc::Field(def_id.expect_local(), idx);
+                            let l = self.loc_ind_map[&l];
+                            let r = self.transfer_operand(f, ctx).unwrap();
+                            self.assign(l, r, variance);
+                        }
+                    }
+                }
+            }
+            _ => {
+                let variance = some_or!(variance, return);
+                let l = some_or!(self.transfer_place(*l, ctx), return);
                 match r {
                     Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
                         if let Some(r) = self.transfer_operand(op, ctx) {
@@ -289,31 +328,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         }
                     }
                     _ => {}
-                }
-            }
-        } else if let Rvalue::Aggregate(
-            box AggregateKind::Adt(def_id, _, _, _, field_idx),
-            fields,
-        ) = r
-        {
-            if self.tcx.adt_def(def_id).is_union() {
-                let f = &fields[FieldIdx::from_u32(0)];
-                let ty = f.ty(ctx.local_decls, self.tcx);
-                if let Some(variance) = file_type_variance(ty, self.tcx) {
-                    let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
-                    let l = self.loc_ind_map[&l];
-                    let r = self.transfer_operand(f, ctx).unwrap();
-                    self.assign(l, r, variance);
-                }
-            } else {
-                for (idx, f) in fields.iter_enumerated() {
-                    let ty = f.ty(ctx.local_decls, self.tcx);
-                    if let Some(variance) = file_type_variance(ty, self.tcx) {
-                        let l = Loc::Field(def_id.expect_local(), idx);
-                        let l = self.loc_ind_map[&l];
-                        let r = self.transfer_operand(f, ctx).unwrap();
-                        self.assign(l, r, variance);
-                    }
                 }
             }
         }

@@ -640,8 +640,8 @@ impl MutVisitor for TransformVisitor<'_> {
                     }
                 }
             }
-            ExprKind::MethodCall(box MethodCall { seg, .. }) => {
-                if self.null_checks.contains(&expr_span) {
+            ExprKind::MethodCall(box MethodCall { receiver, seg, .. }) => {
+                if !self.is_unsupported(receiver) && self.null_checks.contains(&expr_span) {
                     self.updated = true;
                     seg.ident = Ident::from_str("is_none");
                 }
