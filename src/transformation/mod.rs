@@ -61,6 +61,9 @@ impl Pass for Transformation {
         let hir = tcx.hir();
         let source_map = tcx.sess.source_map();
 
+        let is_stdin_unsupported = analysis_result
+            .unsupported
+            .contains(analysis_result.loc_ind_map[&Loc::Stdin]);
         // all binding occurrences of unsupported
         let mut unsupported: FxHashSet<_> = analysis_result
             .unsupported
@@ -107,6 +110,7 @@ impl Pass for Transformation {
             }
         }
 
+        let mut api_sig_spans = FxHashSet::default();
         let mut fn_permissions = FxHashMap::default();
         let mut local_origins = FxHashMap::default();
         let mut local_permissions = FxHashMap::default();
@@ -119,7 +123,11 @@ impl Pass for Transformation {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
             if let rustc_hir::ItemKind::Fn(sig, _, _) = item.kind {
-                if api_list::is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
+                if item.ident.name.as_str() == "main" {
+                    continue;
+                }
+                if api_list::is_symbol_api(item.ident.name) {
+                    api_sig_spans.insert(sig.span);
                     continue;
                 }
 
@@ -226,6 +234,7 @@ impl Pass for Transformation {
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
                 updated: false,
+                api_sig_spans: &api_sig_spans,
                 fn_permissions: &fn_permissions,
                 local_origins: &local_origins,
                 local_permissions: &local_permissions,
@@ -238,6 +247,7 @@ impl Pass for Transformation {
                 static_def_id_to_span: &hir_visitor.static_def_id_to_span,
                 static_span_to_lit: &ast_visitor.static_span_to_lit,
                 unsupported: &unsupported,
+                is_stdin_unsupported,
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
@@ -386,6 +396,7 @@ impl<'ast> Visitor<'ast> for AstVisitor {
 
 struct TransformVisitor<'a> {
     updated: bool,
+    api_sig_spans: &'a FxHashSet<Span>,
     fn_permissions: &'a FxHashMap<Span, Vec<Option<&'a BitSet<Permission>>>>,
     local_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
     local_permissions: &'a FxHashMap<Span, &'a BitSet<Permission>>,
@@ -398,6 +409,7 @@ struct TransformVisitor<'a> {
     static_def_id_to_span: &'a FxHashMap<LocalDefId, Span>,
     static_span_to_lit: &'a FxHashMap<Span, Symbol>,
     unsupported: &'a FxHashSet<Span>,
+    is_stdin_unsupported: bool,
 }
 
 impl TransformVisitor<'_> {
@@ -435,6 +447,12 @@ fn remove_cast(expr: &Expr) -> &Expr {
 
 impl MutVisitor for TransformVisitor<'_> {
     fn visit_item_kind(&mut self, item: &mut ItemKind) {
+        if let ItemKind::Fn(f) = item {
+            if self.api_sig_spans.contains(&f.sig.span) {
+                return;
+            }
+        }
+
         mut_visit::noop_visit_item_kind(item, self);
 
         if let ItemKind::Fn(f) = item {
@@ -548,6 +566,9 @@ impl MutVisitor for TransformVisitor<'_> {
                                 *expr.deref_mut() = new_expr;
                             }
                             "getchar" => {
+                                if self.is_stdin_unsupported {
+                                    return;
+                                }
                                 self.updated = true;
                                 let stream = "Some(std::io::stdin())";
                                 let new_expr = transform_fgetc(stream);
