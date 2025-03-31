@@ -9,7 +9,12 @@ use forcrat::{api_list::API_LIST, compile_util::Pass, *};
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    CountApis,
+    CountApis {
+        #[arg(short, long, default_value = "false")]
+        distinguish_std_args: bool,
+        #[arg(short, long, default_value = "false")]
+        show_api_names: bool,
+    },
     CountReturnValues,
     Steensgaard,
     Analyze,
@@ -47,14 +52,38 @@ fn main() {
     let file = args.input.join("c2rust-lib.rs");
 
     match args.command {
-        Command::CountApis => {
+        Command::CountApis {
+            distinguish_std_args,
+            show_api_names,
+        } => {
+            if show_api_names {
+                print!("total ");
+                for (name, api_kind) in API_LIST {
+                    print!("{} ", name);
+                    if distinguish_std_args && (api_kind.is_read() || api_kind.is_write()) {
+                        print!("{}_std ", name);
+                    }
+                }
+                println!();
+            }
             let (counts, std_arg_counts) = api_counter::ApiCounter.run_on_path(&file);
+            let sum = counts
+                .values()
+                .chain(std_arg_counts.values())
+                .sum::<usize>();
+            print!("{} ", sum);
             for (name, api_kind) in API_LIST {
-                let v = counts.get(name).copied().unwrap_or(0);
-                print!("{} ", v);
-                if api_kind.is_read() || api_kind.is_write() {
-                    let v = std_arg_counts.get(name).copied().unwrap_or(0);
+                if distinguish_std_args {
+                    let v = counts.get(name).copied().unwrap_or(0);
                     print!("{} ", v);
+                    if api_kind.is_read() || api_kind.is_write() {
+                        let v = std_arg_counts.get(name).copied().unwrap_or(0);
+                        print!("{} ", v);
+                    }
+                } else {
+                    let v1 = counts.get(name).copied().unwrap_or(0);
+                    let v2 = std_arg_counts.get(name).copied().unwrap_or(0);
+                    print!("{} ", v1 + v2);
                 }
             }
             println!();
