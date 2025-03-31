@@ -11,6 +11,7 @@ use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{def::Res, intravisit, HirId};
 use rustc_index::bit_set::BitSet;
+use rustc_lexer::unescape;
 use rustc_middle::{
     hir::nested_filter,
     mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue, TerminatorKind},
@@ -503,16 +504,24 @@ impl MutVisitor for TransformVisitor<'_> {
                                 }
                                 self.updated = true;
                                 let stream = pprust::expr_to_string(&args[0]);
-                                let new_expr = transform_fprintf(&stream, &args[1], &args[2..]);
+                                let new_expr =
+                                    transform_fprintf(&stream, &args[1], &args[2..], false);
                                 *expr.deref_mut() = new_expr;
                             }
                             "printf" => {
                                 self.updated = true;
                                 let stream = "Some(std::io::stdout())";
-                                let new_expr = transform_fprintf(stream, &args[0], &args[1..]);
+                                let new_expr =
+                                    transform_fprintf(stream, &args[0], &args[1..], false);
                                 *expr.deref_mut() = new_expr;
                             }
-                            "wprintf" => todo!(),
+                            "wprintf" => {
+                                self.updated = true;
+                                let stream = "Some(std::io::stdout())";
+                                let new_expr =
+                                    transform_fprintf(stream, &args[0], &args[1..], true);
+                                *expr.deref_mut() = new_expr;
+                            }
                             "vfprintf" => todo!(),
                             "vprintf" => todo!(),
                             "fputc" | "putc" => {
@@ -998,25 +1007,61 @@ fn transform_feof(stream: &Expr) -> Expr {
     )
 }
 
-fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, fmt: &Expr, args: &[E]) -> Expr {
+fn transform_fprintf<E: Deref<Target = Expr>>(
+    stream: &str,
+    fmt: &Expr,
+    args: &[E],
+    wide: bool,
+) -> Expr {
     let fmt = LikelyLit::from_expr(fmt);
     match fmt {
         LikelyLit::Lit(fmt) => {
-            let fmt = fmt.to_string().into_bytes();
-            let (fmt, casts) = printf::to_rust_format(&fmt);
+            // from rustc_ast/src/util/literal.rs
+            let s = fmt.as_str();
+            let mut buf = Vec::with_capacity(s.len());
+            unescape::unescape_literal(fmt.as_str(), unescape::Mode::ByteStr, &mut |_, c| {
+                buf.push(unescape::byte_from_char(c.unwrap()))
+            });
+
+            if wide {
+                let mut new_buf: Vec<u8> = vec![];
+                for c in buf.chunks_exact(4) {
+                    let c = u32::from_le_bytes(c.try_into().unwrap());
+                    new_buf.push(c.try_into().unwrap());
+                }
+                buf = new_buf;
+            }
+            let (fmt, casts) = printf::to_rust_format(&buf);
             assert!(args.len() == casts.len());
             let mut new_args = String::new();
             for (arg, cast) in args.iter().zip(casts) {
                 let arg = pprust::expr_to_string(arg);
-                if cast == "&str" {
-                    write!(
+                match cast {
+                    "&str" => write!(
                         new_args,
                         "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap(), ",
                         arg
                     )
-                    .unwrap();
-                } else {
-                    write!(new_args, "({}) as {}, ", arg, cast).unwrap();
+                    .unwrap(),
+                    "String" => write!(
+                        new_args,
+                        "{{
+    let mut p: *const u8 = {} as _;
+    let mut s: String = String::new();
+    loop {{
+        let slice = std::slice::from_raw_parts(p, 4);
+        let i = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+        if i == 0 {{
+            break s;
+        }}
+        s.push(std::char::from_u32(i).unwrap());
+        p = p.offset(4);
+    }}
+}}",
+                        arg
+                    )
+                    .unwrap(),
+                    _ => write!(new_args, "({}) as {}, ", arg, cast).unwrap(),
                 }
             }
             expr!(
@@ -1030,7 +1075,7 @@ fn transform_fprintf<E: Deref<Target = Expr>>(stream: &str, fmt: &Expr, args: &[
             )
         }
         LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Other(_) => todo!(),
+        LikelyLit::Other(e) => todo!("{:?}", e),
     }
 }
 
@@ -1205,6 +1250,20 @@ impl<'a> LikelyLit<'a> {
                 let f = Self::from_expr(f);
                 LikelyLit::If(c, Box::new(t), Box::new(f))
             }
+            ExprKind::Call(callee, args) => {
+                if let ExprKind::Path(_, path) = &callee.kind {
+                    let callee = path.segments.last().unwrap().ident.name.as_str();
+                    match callee {
+                        "dcgettext" => Self::from_expr(&args[1]),
+                        "transmute" => Self::from_expr(&args[0]),
+                        _ => LikelyLit::Other(expr),
+                    }
+                } else {
+                    LikelyLit::Other(expr)
+                }
+            }
+            ExprKind::Paren(e) => Self::from_expr(e),
+            ExprKind::Unary(UnOp::Deref, e) => Self::from_expr(e),
             _ => LikelyLit::Other(expr),
         }
     }

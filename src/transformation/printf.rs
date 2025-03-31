@@ -438,7 +438,11 @@ impl Conversion {
                 _ => panic!(),
             },
             Self::Char => "u8 as char",
-            Self::Str => "&str",
+            Self::Str => match length {
+                None => "&str",
+                Some(Long) => "String",
+                _ => panic!(),
+            },
             Self::Pointer => "usize",
             Self::C | Self::S => unimplemented!(),
             Self::Num | Self::Percent => return None,

@@ -355,7 +355,7 @@ unsafe fn f() {
 }
 
 #[test]
-fn test_printf() {
+fn test_fprintf() {
     run_test(
         r#"
 unsafe fn f(mut stream: *mut FILE) {
@@ -363,6 +363,30 @@ unsafe fn f(mut stream: *mut FILE) {
 }"#,
         &["write!", "i32"],
         &["fprintf", "%d"],
+    );
+}
+
+#[test]
+fn test_wprintf() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut s: *const wchar_t = (*::std::mem::transmute::<
+        &[u8; 12],
+        &[libc::c_int; 3],
+    >(b"H\xC5\0\0U\xB1\0\0\0\0\0\0"))
+        .as_ptr();
+    wprintf(
+        (*::std::mem::transmute::<
+            &[u8; 20],
+            &[libc::c_int; 5],
+        >(b"%\0\0\0l\0\0\0s\0\0\0\n\0\0\0\0\0\0\0"))
+            .as_ptr(),
+        s,
+    );
+}"#,
+        &["write!"],
+        &["wprintf"],
     );
 }
 
@@ -828,6 +852,7 @@ extern "C" {
     fn flockfile(__stream: *mut FILE);
     fn ftrylockfile(__stream: *mut FILE) -> libc::c_int;
     fn funlockfile(__stream: *mut FILE);
+    fn wprintf(__format: *const wchar_t, _: ...) -> libc::c_int;
 }
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -895,7 +920,8 @@ pub struct _IO_FILE {
 }
 pub type _IO_lock_t = ();
 pub type FILE = _IO_FILE;
-pub type fpos_t = __fpos_t;"#;
+pub type fpos_t = __fpos_t;
+pub type wchar_t = libc::c_int;"#;
 
 lazy_static! {
     static ref FORMATTED_PREAMBLE: String = formatter::Formatter.run_on_str(PREAMBLE);

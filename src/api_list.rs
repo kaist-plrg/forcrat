@@ -140,7 +140,7 @@ lazy_static! {
     pub static ref API_MAP: FxHashMap<&'static str, ApiKind> = API_LIST.iter().copied().collect();
 }
 
-pub static API_LIST: [(&str, ApiKind); 87] = [
+pub static API_LIST: [(&str, ApiKind); 91] = [
     // stdio.h
     // Open (6)
     ("fopen", Open(File)),
@@ -221,6 +221,11 @@ pub static API_LIST: [(&str, ApiKind); 87] = [
     ("tmpnam", NotIO),
     ("tempnam", NotIO), // removed
     ("ctermid", NotIO),
+    // GNU libc
+    ("__fpending", Unsupported),
+    ("__freading", Unsupported),
+    ("__fwriting", Unsupported),
+    ("fpurge", Unsupported),
     // wchar.h
     // Open (1)
     ("open_wmemstream", Open(Buffer)),
