@@ -367,6 +367,23 @@ unsafe fn f(mut stream: *mut FILE) {
 }
 
 #[test]
+fn test_printf_static() {
+    run_test(
+        r#"
+static mut fmt1: [libc::c_char; 4] = unsafe {
+    *::std::mem::transmute::<&[u8; 4], &[libc::c_char; 4]>(b"%d\n\0")
+};
+static mut fmt2: *const libc::c_char = b"%d\n\0" as *const u8 as *const libc::c_char;
+unsafe fn f() {
+    printf(fmt1.as_ptr(), 1 as libc::c_int);
+    printf(fmt2, 1 as libc::c_int);
+}"#,
+        &["write!"],
+        &["printf"],
+    );
+}
+
+#[test]
 fn test_wprintf() {
     run_test(
         r#"

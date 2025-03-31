@@ -5,7 +5,13 @@ use std::{
 };
 
 use etrace::some_or;
-use rustc_ast::{ast::*, mut_visit, mut_visit::MutVisitor, ptr::P};
+use rustc_ast::{
+    ast::*,
+    mut_visit,
+    mut_visit::MutVisitor,
+    ptr::P,
+    visit::{self, Visitor},
+};
 use rustc_ast_pretty::pprust;
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -17,7 +23,7 @@ use rustc_middle::{
     mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue, TerminatorKind},
     ty::TyCtxt,
 };
-use rustc_span::{symbol::Ident, FileName, RealFileName, Span, Symbol};
+use rustc_span::{def_id::LocalDefId, symbol::Ident, FileName, RealFileName, Span, Symbol};
 
 use crate::{
     api_list::{self, Origin, Permission},
@@ -42,6 +48,14 @@ impl Pass for Transformation {
     type Out = Vec<(FileName, String)>;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
+        let stolen = tcx.resolver_for_lowering(()).borrow();
+        let (_, krate) = stolen.deref();
+        let mut ast_visitor = AstVisitor {
+            static_span_to_lit: FxHashMap::default(),
+        };
+        visit::walk_crate(&mut ast_visitor, krate);
+        drop(stolen);
+
         let analysis_result = file_analysis::FileAnalysis.run(tcx);
 
         let hir = tcx.hir();
@@ -71,6 +85,8 @@ impl Pass for Transformation {
             lhs_id_to_rhs_spans: FxHashMap::default(),
             pat_span_to_id: FxHashMap::default(),
             path_id_to_spans: FxHashMap::default(),
+            path_span_to_def_id: FxHashMap::default(),
+            static_def_id_to_span: FxHashMap::default(),
         };
         hir.visit_all_item_likes_in_crate(&mut hir_visitor);
         for (span, hir_id) in &hir_visitor.pat_span_to_id {
@@ -218,6 +234,9 @@ impl Pass for Transformation {
                 call_file_args: &call_file_args,
                 null_checks: &null_checks,
                 null_casts: &null_casts,
+                path_span_to_def_id: &hir_visitor.path_span_to_def_id,
+                static_def_id_to_span: &hir_visitor.static_def_id_to_span,
+                static_span_to_lit: &ast_visitor.static_span_to_lit,
                 unsupported: &unsupported,
             };
             visitor.visit_crate(&mut krate);
@@ -265,6 +284,10 @@ struct HirVisitor<'tcx> {
     pat_span_to_id: FxHashMap<Span, HirId>,
     /// for each x, maps x's hir_id to bound occurrences' spans
     path_id_to_spans: FxHashMap<HirId, Vec<Span>>,
+    /// for each static x, maps x's bound occurrence's span to x's def_id
+    path_span_to_def_id: FxHashMap<Span, LocalDefId>,
+    /// for each static x, maps x's def_id to definition's span
+    static_def_id_to_span: FxHashMap<LocalDefId, Span>,
 }
 
 impl<'tcx> HirVisitor<'tcx> {
@@ -304,6 +327,14 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         self.tcx.hir()
     }
 
+    fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
+        if matches!(item.kind, rustc_hir::ItemKind::Static(_, _, _)) {
+            self.static_def_id_to_span
+                .insert(item.owner_id.def_id, item.span);
+        }
+        intravisit::walk_item(self, item);
+    }
+
     fn visit_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
         self.handle_local(local);
         intravisit::walk_local(self, local);
@@ -320,10 +351,36 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     }
 
     fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, _: HirId) {
-        if let Res::Local(id) = path.res {
-            self.path_id_to_spans.entry(id).or_default().push(path.span);
+        match path.res {
+            Res::Local(id) => {
+                self.path_id_to_spans.entry(id).or_default().push(path.span);
+            }
+            Res::Def(_, def_id) => {
+                if let Some(def_id) = def_id.as_local() {
+                    self.path_span_to_def_id.insert(path.span, def_id);
+                }
+            }
+            _ => {}
         }
         intravisit::walk_path(self, path);
+    }
+}
+
+struct AstVisitor {
+    static_span_to_lit: FxHashMap<Span, Symbol>,
+}
+
+impl<'ast> Visitor<'ast> for AstVisitor {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if let ItemKind::Static(box StaticItem {
+            expr: Some(expr), ..
+        }) = &item.kind
+        {
+            if let LikelyLit::Lit(lit) = LikelyLit::from_expr(expr) {
+                self.static_span_to_lit.insert(item.span, lit);
+            }
+        }
+        visit::walk_item(self, item);
     }
 }
 
@@ -337,12 +394,37 @@ struct TransformVisitor<'a> {
     call_file_args: &'a FxHashMap<Span, Vec<usize>>,
     null_checks: &'a FxHashSet<Span>,
     null_casts: &'a FxHashSet<Span>,
+    path_span_to_def_id: &'a FxHashMap<Span, LocalDefId>,
+    static_def_id_to_span: &'a FxHashMap<LocalDefId, Span>,
+    static_span_to_lit: &'a FxHashMap<Span, Symbol>,
     unsupported: &'a FxHashSet<Span>,
 }
 
 impl TransformVisitor<'_> {
+    #[inline]
     fn is_unsupported(&self, expr: &Expr) -> bool {
         self.unsupported.contains(&expr.span) || self.unsupported.contains(&remove_cast(expr).span)
+    }
+
+    #[inline]
+    fn transform_fprintf<E: Deref<Target = Expr>>(
+        &self,
+        stream: &str,
+        fmt: &Expr,
+        args: &[E],
+        wide: bool,
+    ) -> Expr {
+        match LikelyLit::from_expr(fmt) {
+            LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, wide),
+            LikelyLit::If(_, _, _) => todo!(),
+            LikelyLit::Path(span) => {
+                let def_id = self.path_span_to_def_id[&span];
+                let static_span = self.static_def_id_to_span[&def_id];
+                let fmt = self.static_span_to_lit[&static_span];
+                transform_fprintf_lit(stream, fmt, args, wide)
+            }
+            LikelyLit::Other(e) => todo!("{:?}", e),
+        }
     }
 }
 
@@ -505,21 +587,21 @@ impl MutVisitor for TransformVisitor<'_> {
                                 self.updated = true;
                                 let stream = pprust::expr_to_string(&args[0]);
                                 let new_expr =
-                                    transform_fprintf(&stream, &args[1], &args[2..], false);
+                                    self.transform_fprintf(&stream, &args[1], &args[2..], false);
                                 *expr.deref_mut() = new_expr;
                             }
                             "printf" => {
                                 self.updated = true;
                                 let stream = "Some(std::io::stdout())";
                                 let new_expr =
-                                    transform_fprintf(stream, &args[0], &args[1..], false);
+                                    self.transform_fprintf(stream, &args[0], &args[1..], false);
                                 *expr.deref_mut() = new_expr;
                             }
                             "wprintf" => {
                                 self.updated = true;
                                 let stream = "Some(std::io::stdout())";
                                 let new_expr =
-                                    transform_fprintf(stream, &args[0], &args[1..], true);
+                                    self.transform_fprintf(stream, &args[0], &args[1..], true);
                                 *expr.deref_mut() = new_expr;
                             }
                             "vfprintf" => todo!(),
@@ -781,8 +863,9 @@ fn transform_fopen(path: &Expr, mode: &Expr, permissions: &BitSet<Permission>) -
                 _ => panic!("{:?}", mode),
             }
         }
-        LikelyLit::If(_c, _t, _f) => todo!(),
-        LikelyLit::Other(_e) => todo!(),
+        LikelyLit::If(_, _, _) => todo!(),
+        LikelyLit::Path(_) => todo!(),
+        LikelyLit::Other(_) => todo!(),
     }
 }
 
@@ -813,8 +896,9 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
                 field
             )
         }
-        LikelyLit::If(_c, _t, _f) => todo!(),
-        LikelyLit::Other(_e) => todo!(),
+        LikelyLit::If(_, _, _) => todo!(),
+        LikelyLit::Path(_) => todo!(),
+        LikelyLit::Other(_) => todo!(),
     }
 }
 
@@ -906,6 +990,7 @@ fn transform_fscanf<E: Deref<Target = Expr>>(stream: &Expr, fmt: &Expr, args: &[
             )
         }
         LikelyLit::If(_, _, _) => todo!(),
+        LikelyLit::Path(_) => todo!(),
         LikelyLit::Other(_) => todo!(),
     }
 }
@@ -1007,45 +1092,42 @@ fn transform_feof(stream: &Expr) -> Expr {
     )
 }
 
-fn transform_fprintf<E: Deref<Target = Expr>>(
+fn transform_fprintf_lit<E: Deref<Target = Expr>>(
     stream: &str,
-    fmt: &Expr,
+    fmt: Symbol,
     args: &[E],
     wide: bool,
 ) -> Expr {
-    let fmt = LikelyLit::from_expr(fmt);
-    match fmt {
-        LikelyLit::Lit(fmt) => {
-            // from rustc_ast/src/util/literal.rs
-            let s = fmt.as_str();
-            let mut buf = Vec::with_capacity(s.len());
-            unescape::unescape_literal(fmt.as_str(), unescape::Mode::ByteStr, &mut |_, c| {
-                buf.push(unescape::byte_from_char(c.unwrap()))
-            });
+    // from rustc_ast/src/util/literal.rs
+    let s = fmt.as_str();
+    let mut buf = Vec::with_capacity(s.len());
+    unescape::unescape_literal(fmt.as_str(), unescape::Mode::ByteStr, &mut |_, c| {
+        buf.push(unescape::byte_from_char(c.unwrap()))
+    });
 
-            if wide {
-                let mut new_buf: Vec<u8> = vec![];
-                for c in buf.chunks_exact(4) {
-                    let c = u32::from_le_bytes(c.try_into().unwrap());
-                    new_buf.push(c.try_into().unwrap());
-                }
-                buf = new_buf;
-            }
-            let (fmt, casts) = printf::to_rust_format(&buf);
-            assert!(args.len() == casts.len());
-            let mut new_args = String::new();
-            for (arg, cast) in args.iter().zip(casts) {
-                let arg = pprust::expr_to_string(arg);
-                match cast {
-                    "&str" => write!(
-                        new_args,
-                        "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap(), ",
-                        arg
-                    )
-                    .unwrap(),
-                    "String" => write!(
-                        new_args,
-                        "{{
+    if wide {
+        let mut new_buf: Vec<u8> = vec![];
+        for c in buf.chunks_exact(4) {
+            let c = u32::from_le_bytes(c.try_into().unwrap());
+            new_buf.push(c.try_into().unwrap());
+        }
+        buf = new_buf;
+    }
+    let (fmt, casts) = printf::to_rust_format(&buf);
+    assert!(args.len() == casts.len());
+    let mut new_args = String::new();
+    for (arg, cast) in args.iter().zip(casts) {
+        let arg = pprust::expr_to_string(arg);
+        match cast {
+            "&str" => write!(
+                new_args,
+                "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap(), ",
+                arg
+            )
+            .unwrap(),
+            "String" => write!(
+                new_args,
+                "{{
     let mut p: *const u8 = {} as _;
     let mut s: String = String::new();
     loop {{
@@ -1058,25 +1140,21 @@ fn transform_fprintf<E: Deref<Target = Expr>>(
         p = p.offset(4);
     }}
 }}",
-                        arg
-                    )
-                    .unwrap(),
-                    _ => write!(new_args, "({}) as {}, ", arg, cast).unwrap(),
-                }
-            }
-            expr!(
-                "{{
+                arg
+            )
+            .unwrap(),
+            _ => write!(new_args, "({}) as {}, ", arg, cast).unwrap(),
+        }
+    }
+    expr!(
+        "{{
     use std::io::Write;
     write!(({}).as_mut().unwrap(), \"{}\", {})
 }}",
-                stream,
-                fmt,
-                new_args
-            )
-        }
-        LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Other(e) => todo!("{:?}", e),
-    }
+        stream,
+        fmt,
+        new_args
+    )
 }
 
 #[inline]
@@ -1189,6 +1267,7 @@ fn transform_fseek(stream: &Expr, off: &Expr, whence: &Expr) -> Expr {
             )
         }
         LikelyLit::If(_, _, _) => todo!(),
+        LikelyLit::Path(_) => todo!(),
         LikelyLit::Other(_) => todo!(),
     }
 }
@@ -1233,6 +1312,7 @@ fn transform_fileno(stream: &Expr) -> Expr {
 pub enum LikelyLit<'a> {
     Lit(Symbol),
     If(&'a Expr, Box<LikelyLit<'a>>, Box<LikelyLit<'a>>),
+    Path(Span),
     Other(&'a Expr),
 }
 
@@ -1264,6 +1344,12 @@ impl<'a> LikelyLit<'a> {
             }
             ExprKind::Paren(e) => Self::from_expr(e),
             ExprKind::Unary(UnOp::Deref, e) => Self::from_expr(e),
+            ExprKind::Path(_, path) => LikelyLit::Path(path.span),
+            ExprKind::Block(block, _) => {
+                let [.., stmt] = &block.stmts[..] else { return LikelyLit::Other(expr) };
+                let StmtKind::Expr(expr) = &stmt.kind else { return LikelyLit::Other(expr) };
+                Self::from_expr(expr)
+            }
             _ => LikelyLit::Other(expr),
         }
     }
