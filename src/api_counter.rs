@@ -1,7 +1,4 @@
-use std::rc::Rc;
-
 use etrace::some_or;
-use rustc_ast::LitKind;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
     def::{DefKind, Res},
@@ -79,14 +76,6 @@ impl<'tcx> ApiVisitor<'tcx> {
             &mut self.counts
         };
         *counts.entry(*name).or_default() += 1;
-        if *name == "printf" || *name == "fprintf" {
-            // let arg = if *name == "printf" { args[0] } else { args[1] };
-            // if let OpenMode::Lit(lit) = normalize_open_mode(arg, self.tcx) {
-            // println!("{:?}", String::from_utf8_lossy(&lit));
-            // let (f, casts) = printf::to_rust_format(&lit);
-            // println!("\"{}\" {:?}", f, casts);
-            // }
-        }
         true
     }
 
@@ -115,36 +104,5 @@ impl<'tcx> Visitor<'tcx> for ApiVisitor<'tcx> {
     fn visit_path(&mut self, path: &Path<'tcx>, _: HirId) {
         self.handle_path(path);
         intravisit::walk_path(self, path);
-    }
-}
-
-#[derive(Debug)]
-pub enum OpenMode {
-    Lit(Rc<[u8]>),
-    If(String, Box<OpenMode>, Box<OpenMode>),
-    Path(String, Res),
-    Other(String),
-}
-
-pub fn normalize_open_mode<'tcx>(expr: Expr<'tcx>, tcx: TyCtxt<'tcx>) -> OpenMode {
-    match expr.kind {
-        ExprKind::MethodCall(_, e, _, _) | ExprKind::Cast(e, _) | ExprKind::DropTemps(e) => {
-            normalize_open_mode(*e, tcx)
-        }
-        ExprKind::Lit(lit) => {
-            let LitKind::ByteStr(ref bytes, _) = lit.node else { panic!() };
-            OpenMode::Lit(bytes.clone())
-        }
-        ExprKind::If(c, t, Some(f)) => {
-            let c = tcx.sess.source_map().span_to_snippet(c.span).unwrap();
-            let t = normalize_open_mode(*t, tcx);
-            let f = normalize_open_mode(*f, tcx);
-            OpenMode::If(c, Box::new(t), Box::new(f))
-        }
-        ExprKind::Path(QPath::Resolved(_, path)) => {
-            let s = tcx.sess.source_map().span_to_snippet(path.span).unwrap();
-            OpenMode::Path(s, path.res)
-        }
-        _ => OpenMode::Other(tcx.sess.source_map().span_to_snippet(expr.span).unwrap()),
     }
 }

@@ -604,8 +604,6 @@ impl MutVisitor for TransformVisitor<'_> {
                                     self.transform_fprintf(stream, &args[0], &args[1..], true);
                                 *expr.deref_mut() = new_expr;
                             }
-                            "vfprintf" => todo!(),
-                            "vprintf" => todo!(),
                             "fputc" | "putc" => {
                                 if self.is_unsupported(&args[1]) {
                                     return;
