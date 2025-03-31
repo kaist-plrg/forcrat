@@ -140,7 +140,7 @@ lazy_static! {
     pub static ref API_MAP: FxHashMap<&'static str, ApiKind> = API_LIST.iter().copied().collect();
 }
 
-pub static API_LIST: [(&str, ApiKind); 91] = [
+pub static API_LIST: [(&str, ApiKind); 81] = [
     // stdio.h
     // Open (6)
     ("fopen", Open(File)),
@@ -168,8 +168,8 @@ pub static API_LIST: [(&str, ApiKind); 91] = [
     ("getchar", StdioOperation), // unlocked
     ("gets", StdioOperation),    // removed
     // Read string (2)
-    ("sscanf", NotIO),
-    ("vsscanf", NotIO),
+    // ("sscanf", NotIO),
+    // ("vsscanf", NotIO),
     // Write (8)
     ("fprintf", Operation(Some(Write))),
     ("vfprintf", Unsupported),
@@ -188,10 +188,10 @@ pub static API_LIST: [(&str, ApiKind); 91] = [
     ("dprintf", Unsupported),
     ("vdprintf", Unsupported),
     // Write string (4)
-    ("sprintf", NotIO),
-    ("vsprintf", NotIO),
-    ("snprintf", NotIO),
-    ("vsnprintf", NotIO),
+    // ("sprintf", NotIO),
+    // ("vsprintf", NotIO),
+    // ("snprintf", NotIO),
+    // ("vsnprintf", NotIO),
     // Positioning (7)
     ("fseek", Operation(Some(Seek))),
     ("fseeko", Operation(Some(Seek))),
@@ -241,8 +241,8 @@ pub static API_LIST: [(&str, ApiKind); 91] = [
     ("vwscanf", StdioOperation),
     ("getwchar", StdioOperation),
     // Read string (2)
-    ("swscanf", NotIO),
-    ("vswscanf", NotIO),
+    // ("swscanf", NotIO),
+    // ("vswscanf", NotIO),
     // Write (5)
     ("fwprintf", Operation(Some(Write))),
     ("vfwprintf", Unsupported),
@@ -254,8 +254,8 @@ pub static API_LIST: [(&str, ApiKind); 91] = [
     ("vwprintf", StdioOperation),
     ("putwchar", StdioOperation),
     // Write string (2)
-    ("swprintf", NotIO),
-    ("vswprintf", NotIO),
+    // ("swprintf", NotIO),
+    // ("vswprintf", NotIO),
     // Orientation (1)
     ("fwide", Unsupported),
 ];
