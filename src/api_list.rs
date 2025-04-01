@@ -134,6 +134,11 @@ impl ApiKind {
     pub fn is_write(self) -> bool {
         matches!(self, Operation(Some(Write)))
     }
+
+    #[inline]
+    pub fn is_unsupported(self) -> bool {
+        matches!(self, Unsupported)
+    }
 }
 
 lazy_static! {

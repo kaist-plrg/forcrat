@@ -10,10 +10,12 @@ use forcrat::{api_list::API_LIST, compile_util::Pass, *};
 #[derive(Subcommand, Debug)]
 enum Command {
     CountApis {
-        #[arg(short, long, default_value = "false")]
+        #[arg(long, default_value = "false")]
         distinguish_std_args: bool,
-        #[arg(short, long, default_value = "false")]
+        #[arg(long, default_value = "false")]
         show_api_names: bool,
+        #[arg(long, default_value = "false")]
+        show_unsupported: bool,
     },
     CountReturnValues,
     Steensgaard,
@@ -55,6 +57,7 @@ fn main() {
         Command::CountApis {
             distinguish_std_args,
             show_api_names,
+            show_unsupported,
         } => {
             if show_api_names {
                 print!("total ");
@@ -87,6 +90,20 @@ fn main() {
                 }
             }
             println!();
+            if show_unsupported {
+                for (name, api_kind) in API_LIST {
+                    if !api_kind.is_unsupported() {
+                        continue;
+                    }
+                    let v1 = counts.get(name).copied().unwrap_or(0);
+                    let v2 = std_arg_counts.get(name).copied().unwrap_or(0);
+                    let v = v1 + v2;
+                    if v > 0 {
+                        print!("{}: {}, ", name, v);
+                    }
+                }
+                println!();
+            }
         }
         Command::CountReturnValues => {
             let counts = retval_use_counter::RetValCounter.run_on_path(&file);
