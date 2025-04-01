@@ -8,17 +8,15 @@ use rustc_data_structures::graph::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
-    def::{DefKind, Res},
     def_id::{DefId, LocalDefId},
     definitions::DefPathData,
-    intravisit, ExprKind, ItemKind, Node, QPath,
+    ItemKind, Node,
 };
 use rustc_index::{
     bit_set::{BitSet, HybridBitSet, HybridIter},
     Idx, IndexVec,
 };
 use rustc_middle::{
-    hir::nested_filter,
     mir::{
         AggregateKind, CastKind, Constant, ConstantKind, Local, LocalDecl, Operand, Place,
         ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
@@ -32,7 +30,7 @@ use typed_arena::Arena;
 
 use crate::{
     api_list::{def_id_api_kind, is_def_id_api, is_symbol_api, ApiKind, Origin, Permission},
-    compile_util::{contains_file_ty, is_file_ty, is_std_io_expr, Pass},
+    compile_util::{contains_file_ty, is_file_ty, Pass},
     disjoint_set::DisjointSet,
     rustc_ast::visit::Visitor as _,
     steensgaard,
@@ -80,16 +78,16 @@ impl Pass for FileAnalysis {
         info!("\n{:?}", steensgaard);
         let hir = tcx.hir();
 
-        let mut visitor = StdioArgVisitor::new(tcx);
-        hir.visit_all_item_likes_in_crate(&mut visitor);
-        let stdio_args = visitor.stdio_args;
-        for span in &stdio_args {
-            info!("{:?}", span);
-        }
+        // let mut visitor = StdioArgVisitor::new(tcx);
+        // hir.visit_all_item_likes_in_crate(&mut visitor);
+        // let stdio_args = visitor.stdio_args;
+        // for span in &stdio_args {
+        //     info!("{:?}", span);
+        // }
 
+        // let mut stdio_arg_locs: FxHashSet<Loc> = FxHashSet::default();
         let mut fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>> =
             FxHashMap::default();
-        let mut stdio_arg_locs: FxHashSet<Loc> = FxHashSet::default();
         let mut locs: IndexVec<LocId, Loc> =
             IndexVec::from_raw(vec![Loc::Stdin, Loc::Stdout, Loc::Stderr]);
 
@@ -123,21 +121,22 @@ impl Pass for FileAnalysis {
                 }
                 _ => continue,
             };
-            for bbd in body.basic_blocks.iter() {
-                for stmt in &bbd.statements {
-                    if stdio_args.contains(&stmt.source_info.span) {
-                        let StatementKind::Assign(box (l, _)) = stmt.kind else { continue };
-                        assert!(l.projection.is_empty());
-                        stdio_arg_locs.insert(Loc::Var(local_def_id, l.local));
-                    }
-                }
-            }
+            // for bbd in body.basic_blocks.iter() {
+            //     for stmt in &bbd.statements {
+            //         if stdio_args.contains(&stmt.source_info.span) {
+            //             let StatementKind::Assign(box (l, _)) = stmt.kind else { continue };
+            //             assert!(l.projection.is_empty());
+            //             stdio_arg_locs.insert(Loc::Var(local_def_id, l.local));
+            //         }
+            //     }
+            // }
             for (i, local_decl) in body.local_decls.iter_enumerated() {
                 if contains_file_ty(local_decl.ty, tcx) {
                     let loc = Loc::Var(local_def_id, i);
-                    if !stdio_arg_locs.contains(&loc) {
-                        locs.push(loc);
-                    }
+                    locs.push(loc);
+                    // if !stdio_arg_locs.contains(&loc) {
+                    //     locs.push(loc);
+                    // }
                 }
             }
         }
@@ -160,7 +159,7 @@ impl Pass for FileAnalysis {
             popen_read,
             steensgaard: &steensgaard,
             fn_ty_functions,
-            stdio_arg_locs,
+            // stdio_arg_locs,
             loc_ind_map: &loc_ind_map,
             permission_graph: Graph::new(locs.len(), Permission::NUM),
             origin_graph,
@@ -227,7 +226,7 @@ impl Pass for FileAnalysis {
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     popen_read: FxHashMap<Span, bool>,
-    stdio_arg_locs: FxHashSet<Loc>,
+    // stdio_arg_locs: FxHashSet<Loc>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
     steensgaard: &'a steensgaard::AnalysisResult,
@@ -345,11 +344,12 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let loc = if place.projection.is_empty()
             || place.projection.len() == 1 && place.is_indirect_first_projection()
         {
-            let loc = Loc::Var(ctx.function, place.local);
-            if self.stdio_arg_locs.contains(&loc) {
-                return None;
-            }
-            loc
+            Loc::Var(ctx.function, place.local)
+            // let loc = Loc::Var(ctx.function, place.local);
+            // if self.stdio_arg_locs.contains(&loc) {
+            //     return None;
+            // }
+            // loc
         } else {
             let (last, init) = place.projection.split_last().unwrap();
             let ty = Place::ty_from(place.local, init, ctx.local_decls, self.tcx).ty;
@@ -817,48 +817,48 @@ impl<'a> UnsupportedTracker<'a> {
     }
 }
 
-struct StdioArgVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    stdio_args: FxHashSet<Span>,
-}
+// struct StdioArgVisitor<'tcx> {
+//     tcx: TyCtxt<'tcx>,
+//     stdio_args: FxHashSet<Span>,
+// }
 
-impl<'tcx> StdioArgVisitor<'tcx> {
-    #[inline]
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self {
-            tcx,
-            stdio_args: FxHashSet::default(),
-        }
-    }
+// impl<'tcx> StdioArgVisitor<'tcx> {
+//     #[inline]
+//     fn new(tcx: TyCtxt<'tcx>) -> Self {
+//         Self {
+//             tcx,
+//             stdio_args: FxHashSet::default(),
+//         }
+//     }
 
-    #[inline]
-    fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        let ExprKind::Call(callee, args) = expr.kind else { return };
-        let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return };
-        let Res::Def(DefKind::Fn, def_id) = path.res else { return };
-        if !is_def_id_api(def_id, self.tcx) {
-            return;
-        }
-        for arg in args {
-            if is_std_io_expr(arg, self.tcx) {
-                self.stdio_args.insert(arg.span);
-            }
-        }
-    }
-}
+//     #[inline]
+//     fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+//         let ExprKind::Call(callee, args) = expr.kind else { return };
+//         let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return };
+//         let Res::Def(DefKind::Fn, def_id) = path.res else { return };
+//         if !is_def_id_api(def_id, self.tcx) {
+//             return;
+//         }
+//         for arg in args {
+//             if is_std_io_expr(arg, self.tcx) {
+//                 self.stdio_args.insert(arg.span);
+//             }
+//         }
+//     }
+// }
 
-impl<'tcx> intravisit::Visitor<'tcx> for StdioArgVisitor<'tcx> {
-    type NestedFilter = nested_filter::OnlyBodies;
+// impl<'tcx> intravisit::Visitor<'tcx> for StdioArgVisitor<'tcx> {
+//     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
-    }
+//     fn nested_visit_map(&mut self) -> Self::Map {
+//         self.tcx.hir()
+//     }
 
-    fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        self.handle_expr(expr);
-        intravisit::walk_expr(self, expr);
-    }
-}
+//     fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+//         self.handle_expr(expr);
+//         intravisit::walk_expr(self, expr);
+//     }
+// }
 
 #[derive(Default)]
 struct AstVisitor<'ast> {
