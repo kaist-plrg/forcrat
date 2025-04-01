@@ -584,6 +584,26 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
 }
 
 #[test]
+fn test_fileno_call() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    fileno(stream);
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream);
+    fclose(stream);
+}"#,
+        &["AsRawFd", "as_raw_fd"],
+        &["FILE", "fileno"],
+    );
+}
+
+#[test]
 fn test_null_arg() {
     run_test(
         "

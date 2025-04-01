@@ -808,9 +808,23 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 continue;
                             }
                             let loc = Loc::Var(*def_id, mir::Local::from_usize(i + 1));
-                            let _ = some_or!(self.loc_to_po.get(&loc), continue);
+                            let po = some_or!(self.loc_to_po.get(&loc), continue);
                             let a = pprust::expr_to_string(arg);
-                            let new_expr = expr!("({}).as_mut()", a);
+                            let new_expr = if po.permissions.contains(Permission::AsRawFd) {
+                                if self
+                                    .hir
+                                    .bound_span_to_loc
+                                    .get(&arg.span)
+                                    .and_then(|loc| self.hir_loc_to_po.get(loc))
+                                    .map_or_else(|| false, |po| po.origins.contains(Origin::File))
+                                {
+                                    expr!("({}).as_ref().map(|b| std::os::fd::AsFd::as_fd(b.get_ref()))", a)
+                                } else {
+                                    expr!("({}).as_mut()", a)
+                                }
+                            } else {
+                                expr!("({}).as_mut()", a)
+                            };
                             **arg = new_expr;
                             self.updated = true;
                             if a == "None" {
