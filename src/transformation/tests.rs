@@ -714,6 +714,31 @@ unsafe fn f(mut stream: *mut FILE) {
     );
 }
 
+#[test]
+fn test_field() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct s {
+    pub f: *mut FILE,
+}
+pub unsafe extern "C" fn f() {
+    let mut s: s = s { f: 0 as *mut FILE };
+    s
+        .f = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(s.f);
+    fgetc(s.f);
+    fclose(s.f);
+}"#,
+        &["File", "open", "Read", "read_exact", "drop"],
+        &["FILE", "fopen", "fgetc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

@@ -5,6 +5,7 @@ use std::{
 };
 
 use etrace::some_or;
+use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_ast::{
     ast::*,
     mut_visit,
@@ -21,7 +22,7 @@ use rustc_lexer::unescape;
 use rustc_middle::{
     hir::nested_filter,
     mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue, TerminatorKind},
-    ty::TyCtxt,
+    ty::{self, TyCtxt},
 };
 use rustc_span::{def_id::LocalDefId, symbol::Ident, FileName, RealFileName, Span, Symbol};
 
@@ -112,9 +113,9 @@ impl Pass for Transformation {
 
         let mut api_sig_spans = FxHashSet::default();
         let mut fn_permissions = FxHashMap::default();
-        let mut local_origins = FxHashMap::default();
-        let mut local_permissions = FxHashMap::default();
-        let mut hir_id_permissions = FxHashMap::default();
+        let mut binding_origins = FxHashMap::default();
+        let mut binding_permissions = FxHashMap::default();
+        let mut lv_permissions = FxHashMap::default();
         let mut call_file_args = FxHashMap::default();
         let mut null_checks = FxHashSet::default();
         let mut null_casts = FxHashSet::default();
@@ -122,96 +123,112 @@ impl Pass for Transformation {
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
-            if let rustc_hir::ItemKind::Fn(sig, _, _) = item.kind {
-                if item.ident.name.as_str() == "main" {
-                    continue;
-                }
-                if api_list::is_symbol_api(item.ident.name) {
-                    api_sig_spans.insert(sig.span);
-                    continue;
-                }
-
-                let body = tcx.optimized_mir(local_def_id);
-                let mut permissions = vec![];
-                for (i, local) in body.local_decls.iter_enumerated() {
-                    let loc = Loc::Var(local_def_id, i);
-                    let i = i.as_usize();
-                    if i == 0 {
-                        // return value
-                    } else if i <= sig.decl.inputs.len() {
-                        // parameters
-                        let p = analysis_result
-                            .loc_ind_map
-                            .get(&loc)
-                            .map(|loc_id| &analysis_result.permissions[*loc_id]);
-                        permissions.push(p);
-                    } else {
+            match item.kind {
+                rustc_hir::ItemKind::Struct(rustc_hir::VariantData::Struct(fds, _), _) => {
+                    for (i, f) in fds.iter().enumerate() {
+                        let i = FieldIdx::from_usize(i);
+                        let loc = Loc::Field(local_def_id, i);
                         let loc_id = some_or!(analysis_result.loc_ind_map.get(&loc), continue);
 
-                        let span = local.source_info.span;
-
                         let o = &analysis_result.origins[*loc_id];
-                        local_origins.insert(span, o);
-
+                        binding_origins.insert(f.span, o);
                         let p = &analysis_result.permissions[*loc_id];
-                        local_permissions.insert(span, p);
-                        if let Some(hid_id) = hir_visitor.pat_span_to_id.get(&span) {
-                            hir_id_permissions.insert(*hid_id, p);
+                        binding_permissions.insert(f.span, p);
+
+                        let lv = Lvalue::Field(local_def_id, i);
+                        lv_permissions.insert(lv, p);
+                    }
+                }
+                rustc_hir::ItemKind::Fn(sig, _, _) => {
+                    if item.ident.name.as_str() == "main" {
+                        continue;
+                    }
+                    if api_list::is_symbol_api(item.ident.name) {
+                        api_sig_spans.insert(sig.span);
+                        continue;
+                    }
+
+                    let body = tcx.optimized_mir(local_def_id);
+                    let mut permissions = vec![];
+                    for (i, local) in body.local_decls.iter_enumerated() {
+                        let loc = Loc::Var(local_def_id, i);
+                        let i = i.as_usize();
+                        if i == 0 {
+                            // return value
+                        } else if i <= sig.decl.inputs.len() {
+                            // parameters
+                            let p = analysis_result
+                                .loc_ind_map
+                                .get(&loc)
+                                .map(|loc_id| &analysis_result.permissions[*loc_id]);
+                            permissions.push(p);
+                        } else {
+                            let loc_id = some_or!(analysis_result.loc_ind_map.get(&loc), continue);
+                            let span = local.source_info.span;
+
+                            let o = &analysis_result.origins[*loc_id];
+                            binding_origins.insert(span, o);
+                            let p = &analysis_result.permissions[*loc_id];
+                            binding_permissions.insert(span, p);
+
+                            if let Some(hid_id) = hir_visitor.pat_span_to_id.get(&span) {
+                                let lv = Lvalue::Path(*hid_id);
+                                lv_permissions.insert(lv, p);
+                            }
                         }
                     }
-                }
-                if permissions.iter().any(|p| p.is_some()) {
-                    fn_permissions.insert(sig.span, permissions);
-                }
+                    if permissions.iter().any(|p| p.is_some()) {
+                        fn_permissions.insert(sig.span, permissions);
+                    }
 
-                for bbd in body.basic_blocks.iter() {
-                    let terminator = bbd.terminator();
-                    let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
-                        continue;
+                    for bbd in body.basic_blocks.iter() {
+                        let terminator = bbd.terminator();
+                        let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
+                            continue;
+                        };
+                        let span = terminator.source_info.span;
+                        let file_args: Vec<_> = args
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, arg)| {
+                                let ty = arg.ty(&body.local_decls, tcx);
+                                if compile_util::contains_file_ty(ty, tcx) {
+                                    Some(i)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        if !file_args.is_empty() {
+                            call_file_args.insert(span, file_args);
+                        }
+
+                        let [arg] = &args[..] else { continue };
+                        let ty = arg.ty(&body.local_decls, tcx);
+                        if !compile_util::contains_file_ty(ty, tcx) {
+                            continue;
+                        }
+                        let constant = some_or!(func.constant(), continue);
+                        let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+                        let ty::TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                        let sym = compile_util::def_id_to_value_symbol(def_id, tcx);
+                        let sym = some_or!(sym, continue);
+                        if sym.as_str() == "is_null" {
+                            null_checks.insert(span);
+                        }
+                    }
+
+                    let mut visitor = MirVisitor {
+                        tcx,
+                        nulls: FxHashSet::default(),
                     };
-                    let span = terminator.source_info.span;
-                    let file_args: Vec<_> = args
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, arg)| {
-                            let ty = arg.ty(&body.local_decls, tcx);
-                            if compile_util::contains_file_ty(ty, tcx) {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if !file_args.is_empty() {
-                        call_file_args.insert(span, file_args);
-                    }
-
-                    let [arg] = &args[..] else { continue };
-                    let ty = arg.ty(&body.local_decls, tcx);
-                    if !compile_util::contains_file_ty(ty, tcx) {
-                        continue;
-                    }
-                    let constant = some_or!(func.constant(), continue);
-                    let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
-                    let rustc_middle::ty::TyKind::FnDef(def_id, _) = ty.kind() else {
-                        unreachable!()
-                    };
-                    let sym = compile_util::def_id_to_value_symbol(def_id, tcx);
-                    let sym = some_or!(sym, continue);
-                    if sym.as_str() == "is_null" {
-                        null_checks.insert(span);
+                    visitor.visit_body(body);
+                    for location in visitor.nulls {
+                        let stmt = body.stmt_at(location).left().unwrap();
+                        null_casts.insert(stmt.source_info.span);
                     }
                 }
-
-                let mut visitor = MirVisitor {
-                    tcx,
-                    nulls: FxHashSet::default(),
-                };
-                visitor.visit_body(body);
-                for location in visitor.nulls {
-                    let stmt = body.stmt_at(location).left().unwrap();
-                    null_casts.insert(stmt.source_info.span);
-                }
+                _ => {}
             }
         }
 
@@ -236,9 +253,9 @@ impl Pass for Transformation {
                 updated: false,
                 api_sig_spans: &api_sig_spans,
                 fn_permissions: &fn_permissions,
-                local_origins: &local_origins,
-                local_permissions: &local_permissions,
-                hir_id_permissions: &hir_id_permissions,
+                binding_origins: &binding_origins,
+                binding_permissions: &binding_permissions,
+                lv_permissions: &lv_permissions,
                 rhs_span_to_lhs_id: &hir_visitor.rhs_span_to_lhs_id,
                 call_file_args: &call_file_args,
                 null_checks: &null_checks,
@@ -248,9 +265,21 @@ impl Pass for Transformation {
                 static_span_to_lit: &ast_visitor.static_span_to_lit,
                 unsupported: &unsupported,
                 is_stdin_unsupported,
+                updated_field_spans: FxHashSet::default(),
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
+                for item in &mut krate.items {
+                    let ItemKind::Struct(vd, _) = &item.kind else { continue };
+                    let VariantData::Struct(fs, _) = vd else { continue };
+                    if fs
+                        .iter()
+                        .any(|f| visitor.updated_field_spans.contains(&f.span))
+                    {
+                        item.attrs.clear();
+                    }
+                }
+
                 let s = pprust::crate_to_string_for_macros(&krate);
                 updated.push((file.name.clone(), s));
             }
@@ -284,10 +313,16 @@ impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Lvalue {
+    Path(HirId),
+    Field(LocalDefId, FieldIdx),
+}
+
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    /// for each x = rhs, maps rhs's span to x's hir_id
-    rhs_span_to_lhs_id: FxHashMap<Span, HirId>,
+    /// for each lv = rhs, maps rhs's span to lv
+    rhs_span_to_lhs_id: FxHashMap<Span, Lvalue>,
     /// for each x = rhs, maps x's hir_id to rhs's spans
     lhs_id_to_rhs_spans: FxHashMap<HirId, Vec<Span>>,
     /// for each x, maps binding's span to x's hir_id
@@ -304,7 +339,8 @@ impl<'tcx> HirVisitor<'tcx> {
     fn handle_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
         let rustc_hir::PatKind::Binding(_, hir_id, _, _) = local.pat.kind else { return };
         let init = some_or!(local.init, return);
-        self.rhs_span_to_lhs_id.insert(init.span, hir_id);
+        self.rhs_span_to_lhs_id
+            .insert(init.span, Lvalue::Path(hir_id));
         self.lhs_id_to_rhs_spans
             .entry(hir_id)
             .or_default()
@@ -313,15 +349,33 @@ impl<'tcx> HirVisitor<'tcx> {
 
     fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
         let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expr.kind else { return };
-        let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = lhs.kind else {
-            return;
-        };
-        let Res::Local(hir_id) = path.res else { return };
-        self.rhs_span_to_lhs_id.insert(rhs.span, hir_id);
-        self.lhs_id_to_rhs_spans
-            .entry(hir_id)
-            .or_default()
-            .push(rhs.span);
+        match lhs.kind {
+            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                let Res::Local(hir_id) = path.res else { return };
+                self.rhs_span_to_lhs_id
+                    .insert(rhs.span, Lvalue::Path(hir_id));
+                self.lhs_id_to_rhs_spans
+                    .entry(hir_id)
+                    .or_default()
+                    .push(rhs.span);
+            }
+            rustc_hir::ExprKind::Field(e, field) => {
+                let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
+                let ty = typeck.expr_ty(e);
+                let ty::TyKind::Adt(adt_def, _) = ty.kind() else { return };
+                let def_id = some_or!(adt_def.did().as_local(), return);
+                let variant = adt_def.variant(VariantIdx::from_u32(0));
+                let i = variant
+                    .fields
+                    .iter_enumerated()
+                    .find(|(_, f)| f.name == field.name)
+                    .unwrap()
+                    .0;
+                let lv = Lvalue::Field(def_id, i);
+                self.rhs_span_to_lhs_id.insert(rhs.span, lv);
+            }
+            _ => {}
+        }
     }
 
     fn handle_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
@@ -377,6 +431,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 }
 
 struct AstVisitor {
+    /// static variable definition's span to its literal
     static_span_to_lit: FxHashMap<Span, Symbol>,
 }
 
@@ -394,22 +449,44 @@ impl<'ast> Visitor<'ast> for AstVisitor {
     }
 }
 
+fn remove_cast(expr: &Expr) -> &Expr {
+    let ExprKind::Cast(expr, _) = &expr.kind else { return expr };
+    remove_cast(expr)
+}
+
 struct TransformVisitor<'a> {
+    /// is this file updated
     updated: bool,
+    /// user-defined API functions' signatures' spans
     api_sig_spans: &'a FxHashSet<Span>,
+    /// function signature's span to permissions of each parameter
     fn_permissions: &'a FxHashMap<Span, Vec<Option<&'a BitSet<Permission>>>>,
-    local_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
-    local_permissions: &'a FxHashMap<Span, &'a BitSet<Permission>>,
-    hir_id_permissions: &'a FxHashMap<HirId, &'a BitSet<Permission>>,
-    rhs_span_to_lhs_id: &'a FxHashMap<Span, HirId>,
+    /// variable/field' span to its origins
+    binding_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
+    /// variable/field's span to its permissions
+    binding_permissions: &'a FxHashMap<Span, &'a BitSet<Permission>>,
+    /// lvalue to its permissions
+    lv_permissions: &'a FxHashMap<Lvalue, &'a BitSet<Permission>>,
+    /// for each lv = rhs, maps rhs's span to lv
+    rhs_span_to_lhs_id: &'a FxHashMap<Span, Lvalue>,
+    /// call expr span to file argument positions
     call_file_args: &'a FxHashMap<Span, Vec<usize>>,
+    /// file pointer null check expr spans
     null_checks: &'a FxHashSet<Span>,
+    /// null to file pointer cast expr spans
     null_casts: &'a FxHashSet<Span>,
+    /// for each static x, maps x's bound occurrence's span to x's def_id
     path_span_to_def_id: &'a FxHashMap<Span, LocalDefId>,
+    /// for each static x, maps x's def_id to definition's span
     static_def_id_to_span: &'a FxHashMap<LocalDefId, Span>,
+    /// static variable definition's span to its literal
     static_span_to_lit: &'a FxHashMap<Span, Symbol>,
+    /// unsupported expr spans
     unsupported: &'a FxHashSet<Span>,
+    /// is stdin unsupported
     is_stdin_unsupported: bool,
+
+    updated_field_spans: FxHashSet<Span>,
 }
 
 impl TransformVisitor<'_> {
@@ -438,11 +515,33 @@ impl TransformVisitor<'_> {
             LikelyLit::Other(e) => todo!("{:?}", e),
         }
     }
-}
 
-fn remove_cast(expr: &Expr) -> &Expr {
-    let ExprKind::Cast(expr, _) = &expr.kind else { return expr };
-    remove_cast(expr)
+    fn binding_ty(&self, span: Span) -> Option<Ty> {
+        let origins = self.binding_origins.get(&span)?;
+        if origins.is_empty() {
+            return None;
+        }
+        let origins: Vec<_> = origins.iter().collect();
+        let [origin] = &origins[..] else { panic!("{:?}", span) };
+        let ty = match origin {
+            Origin::File => {
+                let permissions = self.binding_permissions[&span];
+                if permissions.contains(Permission::Write) {
+                    ty!("Option<std::io::BufWriter<std::fs::File>>")
+                } else {
+                    ty!("Option<std::io::BufReader<std::fs::File>>")
+                }
+            }
+            Origin::Stdin => ty!("Option<std::io::Stdin>"),
+            Origin::Stdout => ty!("Option<std::io::Stdout>"),
+            Origin::Stderr => ty!("Option<std::io::Stderr>"),
+            Origin::PipeRead => ty!("Option<std::process::ChildStdout>"),
+            Origin::PipeWrite => ty!("Option<std::process::ChildStdin>"),
+            Origin::PipeDyn => todo!(),
+            Origin::Buffer => todo!(),
+        };
+        Some(ty)
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_> {
@@ -483,6 +582,19 @@ impl MutVisitor for TransformVisitor<'_> {
         }
     }
 
+    fn visit_variant_data(&mut self, vdata: &mut VariantData) {
+        mut_visit::noop_visit_variant_data(vdata, self);
+
+        let VariantData::Struct(fields, _) = vdata else { return };
+        for f in fields {
+            if let Some(ty) = self.binding_ty(f.span) {
+                self.updated = true;
+                self.updated_field_spans.insert(f.span);
+                *f.ty = ty;
+            }
+        }
+    }
+
     fn visit_local(&mut self, local: &mut P<Local>) {
         mut_visit::noop_visit_local(local, self);
 
@@ -490,30 +602,9 @@ impl MutVisitor for TransformVisitor<'_> {
             return;
         }
 
-        if let Some(origins) = self.local_origins.get(&local.pat.span) {
-            if !origins.is_empty() {
-                self.updated = true;
-                let origins: Vec<_> = origins.iter().collect();
-                let [origin] = &origins[..] else { panic!() };
-                let ty = match origin {
-                    Origin::File => {
-                        let permissions = self.local_permissions[&local.pat.span];
-                        if permissions.contains(Permission::Write) {
-                            ty!("Option<std::io::BufWriter<std::fs::File>>")
-                        } else {
-                            ty!("Option<std::io::BufReader<std::fs::File>>")
-                        }
-                    }
-                    Origin::Stdin => ty!("Option<std::io::Stdin>"),
-                    Origin::Stdout => ty!("Option<std::io::Stdout>"),
-                    Origin::Stderr => ty!("Option<std::io::Stderr>"),
-                    Origin::PipeRead => ty!("Option<std::process::ChildStdout>"),
-                    Origin::PipeWrite => ty!("Option<std::process::ChildStdin>"),
-                    Origin::PipeDyn => todo!(),
-                    Origin::Buffer => todo!(),
-                };
-                *local.ty.as_mut().unwrap() = P(ty);
-            }
+        if let Some(ty) = self.binding_ty(local.pat.span) {
+            self.updated = true;
+            **local.ty.as_mut().unwrap() = ty;
         }
     }
 
@@ -528,11 +619,12 @@ impl MutVisitor for TransformVisitor<'_> {
                 if let ExprKind::Path(None, path) = &callee.kind {
                     if let [seg] = &path.segments[..] {
                         let symbol = seg.ident.name;
-                        match symbol.as_str() {
+                        let name = api_list::normalize_api_name(symbol.as_str());
+                        match name {
                             "fopen" => {
                                 self.updated = true;
-                                let lhs_id = self.rhs_span_to_lhs_id[&expr_span];
-                                let permissions = self.hir_id_permissions[&lhs_id];
+                                let lhs = self.rhs_span_to_lhs_id[&expr_span];
+                                let permissions = self.lv_permissions[&lhs];
                                 let new_expr = transform_fopen(&args[0], &args[1], permissions);
                                 *expr.deref_mut() = new_expr;
                             }
@@ -714,7 +806,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                         }
                                         let a = pprust::expr_to_string(arg);
                                         let new_expr = expr!("({}).as_mut()", a);
-                                        *arg = P(new_expr);
+                                        **arg = new_expr;
                                         self.updated = true;
                                         if a == "None" {
                                             none = true;
@@ -723,7 +815,7 @@ impl MutVisitor for TransformVisitor<'_> {
                                     if none {
                                         let c = pprust::expr_to_string(callee);
                                         let new_expr = expr!("{}::<&mut std::fs::File>", c);
-                                        *callee = P(new_expr);
+                                        **callee = new_expr;
                                     }
                                 }
                             }
@@ -736,15 +828,15 @@ impl MutVisitor for TransformVisitor<'_> {
                     match seg.ident.name.as_str() {
                         "stdin" => {
                             self.updated = true;
-                            *expr = P(expr!("Some(std::io::stdin())"));
+                            **expr = expr!("Some(std::io::stdin())");
                         }
                         "stdout" => {
                             self.updated = true;
-                            *expr = P(expr!("Some(std::io::stdout())"));
+                            **expr = expr!("Some(std::io::stdout())");
                         }
                         "stderr" => {
                             self.updated = true;
-                            *expr = P(expr!("Some(std::io::stderr())"));
+                            **expr = expr!("Some(std::io::stderr())");
                         }
                         _ => {}
                     }
@@ -759,7 +851,7 @@ impl MutVisitor for TransformVisitor<'_> {
             ExprKind::Cast(_, _) => {
                 if self.null_casts.contains(&expr_span) {
                     self.updated = true;
-                    *expr = P(expr!("None"));
+                    **expr = expr!("None");
                 }
             }
             _ => {}
