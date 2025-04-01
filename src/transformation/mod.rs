@@ -16,7 +16,7 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{def::Res, intravisit, HirId};
+use rustc_hir::{self as hir, def::Res, intravisit, HirId};
 use rustc_index::bit_set::BitSet;
 use rustc_lexer::unescape;
 use rustc_middle::{
@@ -43,12 +43,19 @@ pub fn write_to_files(fss: &[(FileName, String)]) -> std::io::Result<()> {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct Po<'a> {
+    permissions: &'a BitSet<Permission>,
+    origins: &'a BitSet<Origin>,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct Transformation;
 
 impl Pass for Transformation {
     type Out = Vec<(FileName, String)>;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
+        // collect information from AST
         let stolen = tcx.resolver_for_lowering(()).borrow();
         let (_, krate) = stolen.deref();
         let mut ast_visitor = AstVisitor {
@@ -57,20 +64,26 @@ impl Pass for Transformation {
         visit::walk_crate(&mut ast_visitor, krate);
         drop(stolen);
 
-        let analysis_result = file_analysis::FileAnalysis.run(tcx);
-
         let hir = tcx.hir();
-        let source_map = tcx.sess.source_map();
+        let analysis_res = file_analysis::FileAnalysis.run(tcx);
 
-        let is_stdin_unsupported = analysis_result
+        // collect information from HIR
+        let mut hir_visitor = HirVisitor {
+            tcx,
+            ctx: HirCtx::default(),
+        };
+        hir.visit_all_item_likes_in_crate(&mut hir_visitor);
+        let hir_ctx = hir_visitor.ctx;
+
+        let is_stdin_unsupported = analysis_res
             .unsupported
-            .contains(analysis_result.loc_ind_map[&Loc::Stdin]);
-        // all binding occurrences of unsupported
-        let mut unsupported: FxHashSet<_> = analysis_result
+            .contains(analysis_res.loc_ind_map[&Loc::Stdin]);
+        // all unsupported spans
+        let mut unsupported: FxHashSet<_> = analysis_res
             .unsupported
             .iter()
             .filter_map(|loc_id| {
-                let loc = analysis_result.locs[loc_id];
+                let loc = analysis_res.locs[loc_id];
                 match loc {
                     Loc::Var(def_id, local) => {
                         let body = tcx.optimized_mir(def_id);
@@ -83,39 +96,60 @@ impl Pass for Transformation {
                 }
             })
             .collect();
-        let mut hir_visitor = HirVisitor {
-            tcx,
-            rhs_span_to_lhs_id: FxHashMap::default(),
-            lhs_id_to_rhs_spans: FxHashMap::default(),
-            pat_span_to_id: FxHashMap::default(),
-            path_id_to_spans: FxHashMap::default(),
-            path_span_to_def_id: FxHashMap::default(),
-            static_def_id_to_span: FxHashMap::default(),
-        };
-        hir.visit_all_item_likes_in_crate(&mut hir_visitor);
-        for (span, hir_id) in &hir_visitor.pat_span_to_id {
+        for (span, loc) in &hir_ctx.binding_span_to_loc {
             if !unsupported.contains(span) {
                 continue;
             }
-            // add all bound occurrences to unsupported
-            if let Some(spans) = hir_visitor.path_id_to_spans.get(hir_id) {
-                for span in spans {
-                    unsupported.insert(*span);
-                }
-            }
-            // add all rhs to unsupported
-            if let Some(spans) = hir_visitor.lhs_id_to_rhs_spans.get(hir_id) {
-                for span in spans {
+            let bounds = some_or!(hir_ctx.loc_to_bound_spans.get(loc), continue);
+            for span in bounds {
+                // add bound occurrence to unsupported
+                unsupported.insert(*span);
+
+                // add rhs to unsupported
+                if let Some(span) = hir_ctx.lhs_to_rhs.get(span) {
                     unsupported.insert(*span);
                 }
             }
         }
 
+        let mut loc_to_po = FxHashMap::default();
+        let mut hir_loc_to_po = FxHashMap::default();
+
+        for ((loc, permissions), origins) in analysis_res
+            .locs
+            .iter()
+            .zip(&analysis_res.permissions)
+            .zip(&analysis_res.origins)
+        {
+            let hir_loc = match loc {
+                Loc::Var(def_id, local) => {
+                    let hir::Node::Item(item) = hir.get_by_def_id(*def_id) else { unreachable!() };
+                    match item.kind {
+                        hir::ItemKind::Fn(_, _, _) => {
+                            let body = tcx.optimized_mir(*def_id);
+                            let local_decl = &body.local_decls[*local];
+                            let span = local_decl.source_info.span;
+                            *some_or!(hir_ctx.binding_span_to_loc.get(&span), continue)
+                        }
+                        hir::ItemKind::Static(_, _, _) => {
+                            todo!()
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Loc::Field(def_id, field) => HirLoc::Field(*def_id, *field),
+                _ => continue,
+            };
+            let po = Po {
+                permissions,
+                origins,
+            };
+            loc_to_po.insert(*loc, po);
+            let old = hir_loc_to_po.insert(hir_loc, po);
+            assert!(old.is_none());
+        }
+
         let mut api_sig_spans = FxHashSet::default();
-        let mut fn_permissions = FxHashMap::default();
-        let mut binding_origins = FxHashMap::default();
-        let mut binding_permissions = FxHashMap::default();
-        let mut lv_permissions = FxHashMap::default();
         let mut call_file_args = FxHashMap::default();
         let mut null_checks = FxHashSet::default();
         let mut null_casts = FxHashSet::default();
@@ -123,118 +157,70 @@ impl Pass for Transformation {
         for item_id in hir.items() {
             let item = hir.item(item_id);
             let local_def_id = item.owner_id.def_id;
-            match item.kind {
-                rustc_hir::ItemKind::Struct(rustc_hir::VariantData::Struct(fds, _), _) => {
-                    for (i, f) in fds.iter().enumerate() {
-                        let i = FieldIdx::from_usize(i);
-                        let loc = Loc::Field(local_def_id, i);
-                        let loc_id = some_or!(analysis_result.loc_ind_map.get(&loc), continue);
-
-                        let o = &analysis_result.origins[*loc_id];
-                        binding_origins.insert(f.span, o);
-                        let p = &analysis_result.permissions[*loc_id];
-                        binding_permissions.insert(f.span, p);
-
-                        let lv = Lvalue::Field(local_def_id, i);
-                        lv_permissions.insert(lv, p);
-                    }
+            if let hir::ItemKind::Fn(sig, _, _) = item.kind {
+                if item.ident.name.as_str() == "main" {
+                    continue;
                 }
-                rustc_hir::ItemKind::Fn(sig, _, _) => {
-                    if item.ident.name.as_str() == "main" {
+                if api_list::is_symbol_api(item.ident.name) {
+                    api_sig_spans.insert(sig.span);
+                    continue;
+                }
+
+                let body = tcx.optimized_mir(local_def_id);
+
+                for bbd in body.basic_blocks.iter() {
+                    let terminator = bbd.terminator();
+                    let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
                         continue;
-                    }
-                    if api_list::is_symbol_api(item.ident.name) {
-                        api_sig_spans.insert(sig.span);
-                        continue;
-                    }
-
-                    let body = tcx.optimized_mir(local_def_id);
-                    let mut permissions = vec![];
-                    for (i, local) in body.local_decls.iter_enumerated() {
-                        let loc = Loc::Var(local_def_id, i);
-                        let i = i.as_usize();
-                        if i == 0 {
-                            // return value
-                        } else if i <= sig.decl.inputs.len() {
-                            // parameters
-                            let p = analysis_result
-                                .loc_ind_map
-                                .get(&loc)
-                                .map(|loc_id| &analysis_result.permissions[*loc_id]);
-                            permissions.push(p);
-                        } else {
-                            let loc_id = some_or!(analysis_result.loc_ind_map.get(&loc), continue);
-                            let span = local.source_info.span;
-
-                            let o = &analysis_result.origins[*loc_id];
-                            binding_origins.insert(span, o);
-                            let p = &analysis_result.permissions[*loc_id];
-                            binding_permissions.insert(span, p);
-
-                            if let Some(hid_id) = hir_visitor.pat_span_to_id.get(&span) {
-                                let lv = Lvalue::Path(*hid_id);
-                                lv_permissions.insert(lv, p);
-                            }
-                        }
-                    }
-                    if permissions.iter().any(|p| p.is_some()) {
-                        fn_permissions.insert(sig.span, permissions);
-                    }
-
-                    for bbd in body.basic_blocks.iter() {
-                        let terminator = bbd.terminator();
-                        let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
-                            continue;
-                        };
-                        let span = terminator.source_info.span;
-                        let file_args: Vec<_> = args
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, arg)| {
-                                let ty = arg.ty(&body.local_decls, tcx);
-                                if compile_util::contains_file_ty(ty, tcx) {
-                                    Some(i)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        if !file_args.is_empty() {
-                            call_file_args.insert(span, file_args);
-                        }
-
-                        let [arg] = &args[..] else { continue };
-                        let ty = arg.ty(&body.local_decls, tcx);
-                        if !compile_util::contains_file_ty(ty, tcx) {
-                            continue;
-                        }
-                        let constant = some_or!(func.constant(), continue);
-                        let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
-                        let ty::TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
-                        let sym = compile_util::def_id_to_value_symbol(def_id, tcx);
-                        let sym = some_or!(sym, continue);
-                        if sym.as_str() == "is_null" {
-                            null_checks.insert(span);
-                        }
-                    }
-
-                    let mut visitor = MirVisitor {
-                        tcx,
-                        nulls: FxHashSet::default(),
                     };
-                    visitor.visit_body(body);
-                    for location in visitor.nulls {
-                        let stmt = body.stmt_at(location).left().unwrap();
-                        null_casts.insert(stmt.source_info.span);
+                    let span = terminator.source_info.span;
+                    let file_args: Vec<_> = args
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, arg)| {
+                            let ty = arg.ty(&body.local_decls, tcx);
+                            if compile_util::contains_file_ty(ty, tcx) {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !file_args.is_empty() {
+                        call_file_args.insert(span, file_args);
+                    }
+
+                    let [arg] = &args[..] else { continue };
+                    let ty = arg.ty(&body.local_decls, tcx);
+                    if !compile_util::contains_file_ty(ty, tcx) {
+                        continue;
+                    }
+                    let constant = some_or!(func.constant(), continue);
+                    let ConstantKind::Val(_, ty) = constant.literal else { unreachable!() };
+                    let ty::TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
+                    let sym = compile_util::def_id_to_value_symbol(def_id, tcx);
+                    let sym = some_or!(sym, continue);
+                    if sym.as_str() == "is_null" {
+                        null_checks.insert(span);
                     }
                 }
-                _ => {}
+
+                let mut visitor = MirVisitor {
+                    tcx,
+                    nulls: FxHashSet::default(),
+                };
+                visitor.visit_body(body);
+                for location in visitor.nulls {
+                    let stmt = body.stmt_at(location).left().unwrap();
+                    null_casts.insert(stmt.source_info.span);
+                }
             }
         }
 
         let parse_sess = new_parse_sess();
         let mut updated = vec![];
 
+        let source_map = tcx.sess.source_map();
         for file in source_map.files().iter() {
             if !matches!(
                 file.name,
@@ -251,18 +237,14 @@ impl Pass for Transformation {
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
                 updated: false,
+                static_span_to_lit: &ast_visitor.static_span_to_lit,
+                hir_ctx: &hir_ctx,
+                hir_loc_to_po: &hir_loc_to_po,
+                loc_to_po: &loc_to_po,
                 api_sig_spans: &api_sig_spans,
-                fn_permissions: &fn_permissions,
-                binding_origins: &binding_origins,
-                binding_permissions: &binding_permissions,
-                lv_permissions: &lv_permissions,
-                rhs_span_to_lhs_id: &hir_visitor.rhs_span_to_lhs_id,
                 call_file_args: &call_file_args,
                 null_checks: &null_checks,
                 null_casts: &null_casts,
-                path_span_to_def_id: &hir_visitor.path_span_to_def_id,
-                static_def_id_to_span: &hir_visitor.static_def_id_to_span,
-                static_span_to_lit: &ast_visitor.static_span_to_lit,
                 unsupported: &unsupported,
                 is_stdin_unsupported,
                 updated_field_spans: FxHashSet::default(),
@@ -314,52 +296,131 @@ impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Lvalue {
-    Path(HirId),
+enum HirLoc {
+    Global(LocalDefId),
+    Local(HirId),
     Field(LocalDefId, FieldIdx),
+}
+
+impl HirLoc {
+    fn from_res(res: Res) -> Option<Self> {
+        match res {
+            Res::Local(hir_id) => Some(Self::Local(hir_id)),
+            Res::Def(_, def_id) => {
+                let def_id = def_id.as_local()?;
+                Some(Self::Global(def_id))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct HirCtx {
+    /// location to binding occurrence span
+    /// * global (var): item span
+    /// * global (fn): sig span
+    /// * local: pat span
+    /// * field: field span
+    loc_to_binding_span: FxHashMap<HirLoc, Span>,
+    /// binding occurrence span to location
+    binding_span_to_loc: FxHashMap<Span, HirLoc>,
+
+    /// location to bound occurrence spans
+    loc_to_bound_spans: FxHashMap<HirLoc, Vec<Span>>,
+    /// bound occurrence span to location
+    bound_span_to_loc: FxHashMap<Span, HirLoc>,
+
+    /// for each assignment, lhs span to rhs span
+    lhs_to_rhs: FxHashMap<Span, Span>,
+    /// for each assignment, rhs span to lhs span
+    rhs_to_lhs: FxHashMap<Span, Span>,
 }
 
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    /// for each lv = rhs, maps rhs's span to lv
-    rhs_span_to_lhs_id: FxHashMap<Span, Lvalue>,
-    /// for each x = rhs, maps x's hir_id to rhs's spans
-    lhs_id_to_rhs_spans: FxHashMap<HirId, Vec<Span>>,
-    /// for each x, maps binding's span to x's hir_id
-    pat_span_to_id: FxHashMap<Span, HirId>,
-    /// for each x, maps x's hir_id to bound occurrences' spans
-    path_id_to_spans: FxHashMap<HirId, Vec<Span>>,
-    /// for each static x, maps x's bound occurrence's span to x's def_id
-    path_span_to_def_id: FxHashMap<Span, LocalDefId>,
-    /// for each static x, maps x's def_id to definition's span
-    static_def_id_to_span: FxHashMap<LocalDefId, Span>,
+    ctx: HirCtx,
 }
 
-impl<'tcx> HirVisitor<'tcx> {
-    fn handle_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
-        let rustc_hir::PatKind::Binding(_, hir_id, _, _) = local.pat.kind else { return };
-        let init = some_or!(local.init, return);
-        self.rhs_span_to_lhs_id
-            .insert(init.span, Lvalue::Path(hir_id));
-        self.lhs_id_to_rhs_spans
-            .entry(hir_id)
-            .or_default()
-            .push(init.span);
+impl HirVisitor<'_> {
+    fn add_binding(&mut self, loc: HirLoc, span: Span) {
+        self.ctx.loc_to_binding_span.insert(loc, span);
+        self.ctx.binding_span_to_loc.insert(span, loc);
     }
 
-    fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expr.kind else { return };
-        match lhs.kind {
-            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
-                let Res::Local(hir_id) = path.res else { return };
-                self.rhs_span_to_lhs_id
-                    .insert(rhs.span, Lvalue::Path(hir_id));
-                self.lhs_id_to_rhs_spans
-                    .entry(hir_id)
-                    .or_default()
-                    .push(rhs.span);
+    fn add_bound(&mut self, loc: HirLoc, span: Span) {
+        self.ctx
+            .loc_to_bound_spans
+            .entry(loc)
+            .or_default()
+            .push(span);
+        self.ctx.bound_span_to_loc.insert(span, loc);
+    }
+
+    fn add_assignment(&mut self, lhs: Span, rhs: Span) {
+        self.ctx.lhs_to_rhs.insert(lhs, rhs);
+        self.ctx.rhs_to_lhs.insert(rhs, lhs);
+    }
+}
+
+impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
+        intravisit::walk_item(self, item);
+
+        match item.kind {
+            hir::ItemKind::Static(_, _, _) => {
+                let loc = HirLoc::Global(item.owner_id.def_id);
+                self.add_binding(loc, item.span);
             }
-            rustc_hir::ExprKind::Field(e, field) => {
+            hir::ItemKind::Fn(sig, _, _) => {
+                let loc = HirLoc::Global(item.owner_id.def_id);
+                self.add_binding(loc, sig.span);
+            }
+            hir::ItemKind::Struct(vd, _) => {
+                let hir::VariantData::Struct(fs, _) = vd else { return };
+                let def_id = item.owner_id.def_id;
+                for (i, f) in fs.iter().enumerate() {
+                    let loc = HirLoc::Field(def_id, FieldIdx::from_usize(i));
+                    self.add_binding(loc, f.span);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_local(&mut self, local: &'tcx hir::Local<'tcx>) {
+        intravisit::walk_local(self, local);
+
+        if let Some(init) = local.init {
+            self.add_assignment(local.pat.span, init.span);
+        }
+
+        if let hir::PatKind::Binding(_, hir_id, _, _) = local.pat.kind {
+            let loc = HirLoc::Local(hir_id);
+            let span = local.pat.span;
+            self.add_bound(loc, span);
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &'tcx hir::Pat<'tcx>) {
+        intravisit::walk_pat(self, pat);
+
+        let hir::PatKind::Binding(_, hir_id, _, _) = pat.kind else { return };
+        let loc = HirLoc::Local(hir_id);
+        self.add_binding(loc, pat.span);
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+        intravisit::walk_expr(self, expr);
+
+        match expr.kind {
+            hir::ExprKind::Field(e, field) => {
                 let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
                 let ty = typeck.expr_ty(e);
                 let ty::TyKind::Adt(adt_def, _) = ty.kind() else { return };
@@ -371,62 +432,22 @@ impl<'tcx> HirVisitor<'tcx> {
                     .find(|(_, f)| f.name == field.name)
                     .unwrap()
                     .0;
-                let lv = Lvalue::Field(def_id, i);
-                self.rhs_span_to_lhs_id.insert(rhs.span, lv);
+                let loc = HirLoc::Field(def_id, i);
+                self.add_bound(loc, expr.span);
+            }
+            hir::ExprKind::Assign(lhs, rhs, _) => {
+                self.add_assignment(lhs.span, rhs.span);
             }
             _ => {}
         }
     }
 
-    fn handle_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
-        let rustc_hir::PatKind::Binding(_, hir_id, _, _) = pat.kind else { return };
-        self.pat_span_to_id.insert(pat.span, hir_id);
-    }
-}
-
-impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
-    type NestedFilter = nested_filter::OnlyBodies;
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
-    }
-
-    fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
-        if matches!(item.kind, rustc_hir::ItemKind::Static(_, _, _)) {
-            self.static_def_id_to_span
-                .insert(item.owner_id.def_id, item.span);
-        }
-        intravisit::walk_item(self, item);
-    }
-
-    fn visit_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
-        self.handle_local(local);
-        intravisit::walk_local(self, local);
-    }
-
-    fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        self.handle_expr(expr);
-        intravisit::walk_expr(self, expr);
-    }
-
-    fn visit_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
-        self.handle_pat(pat);
-        intravisit::walk_pat(self, pat);
-    }
-
-    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, _: HirId) {
-        match path.res {
-            Res::Local(id) => {
-                self.path_id_to_spans.entry(id).or_default().push(path.span);
-            }
-            Res::Def(_, def_id) => {
-                if let Some(def_id) = def_id.as_local() {
-                    self.path_span_to_def_id.insert(path.span, def_id);
-                }
-            }
-            _ => {}
-        }
+    fn visit_path(&mut self, path: &hir::Path<'tcx>, _: HirId) {
         intravisit::walk_path(self, path);
+
+        if let Some(loc) = HirLoc::from_res(path.res) {
+            self.add_bound(loc, path.span);
+        }
     }
 }
 
@@ -455,37 +476,28 @@ fn remove_cast(expr: &Expr) -> &Expr {
 }
 
 struct TransformVisitor<'a> {
-    /// is this file updated
-    updated: bool,
+    hir_ctx: &'a HirCtx,
+    /// location to permissions and origins
+    loc_to_po: &'a FxHashMap<Loc, Po<'a>>,
+    /// HIR location to permissions and origins
+    hir_loc_to_po: &'a FxHashMap<HirLoc, Po<'a>>,
+    /// static variable definition's span to its literal
+    static_span_to_lit: &'a FxHashMap<Span, Symbol>,
     /// user-defined API functions' signatures' spans
     api_sig_spans: &'a FxHashSet<Span>,
-    /// function signature's span to permissions of each parameter
-    fn_permissions: &'a FxHashMap<Span, Vec<Option<&'a BitSet<Permission>>>>,
-    /// variable/field' span to its origins
-    binding_origins: &'a FxHashMap<Span, &'a BitSet<Origin>>,
-    /// variable/field's span to its permissions
-    binding_permissions: &'a FxHashMap<Span, &'a BitSet<Permission>>,
-    /// lvalue to its permissions
-    lv_permissions: &'a FxHashMap<Lvalue, &'a BitSet<Permission>>,
-    /// for each lv = rhs, maps rhs's span to lv
-    rhs_span_to_lhs_id: &'a FxHashMap<Span, Lvalue>,
     /// call expr span to file argument positions
     call_file_args: &'a FxHashMap<Span, Vec<usize>>,
     /// file pointer null check expr spans
     null_checks: &'a FxHashSet<Span>,
     /// null to file pointer cast expr spans
     null_casts: &'a FxHashSet<Span>,
-    /// for each static x, maps x's bound occurrence's span to x's def_id
-    path_span_to_def_id: &'a FxHashMap<Span, LocalDefId>,
-    /// for each static x, maps x's def_id to definition's span
-    static_def_id_to_span: &'a FxHashMap<LocalDefId, Span>,
-    /// static variable definition's span to its literal
-    static_span_to_lit: &'a FxHashMap<Span, Symbol>,
     /// unsupported expr spans
     unsupported: &'a FxHashSet<Span>,
     /// is stdin unsupported
     is_stdin_unsupported: bool,
 
+    /// is this file updated
+    updated: bool,
     updated_field_spans: FxHashSet<Span>,
 }
 
@@ -507,8 +519,8 @@ impl TransformVisitor<'_> {
             LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, wide),
             LikelyLit::If(_, _, _) => todo!(),
             LikelyLit::Path(span) => {
-                let def_id = self.path_span_to_def_id[&span];
-                let static_span = self.static_def_id_to_span[&def_id];
+                let loc = self.hir_ctx.bound_span_to_loc[&span];
+                let static_span = self.hir_ctx.loc_to_binding_span[&loc];
                 let fmt = self.static_span_to_lit[&static_span];
                 transform_fprintf_lit(stream, fmt, args, wide)
             }
@@ -517,7 +529,11 @@ impl TransformVisitor<'_> {
     }
 
     fn binding_ty(&self, span: Span) -> Option<Ty> {
-        let origins = self.binding_origins.get(&span)?;
+        let loc = self.hir_ctx.binding_span_to_loc.get(&span)?;
+        let Po {
+            origins,
+            permissions,
+        } = self.hir_loc_to_po.get(loc)?;
         if origins.is_empty() {
             return None;
         }
@@ -525,7 +541,6 @@ impl TransformVisitor<'_> {
         let [origin] = &origins[..] else { panic!("{:?}", span) };
         let ty = match origin {
             Origin::File => {
-                let permissions = self.binding_permissions[&span];
                 if permissions.contains(Permission::Write) {
                     ty!("Option<std::io::BufWriter<std::fs::File>>")
                 } else {
@@ -555,29 +570,34 @@ impl MutVisitor for TransformVisitor<'_> {
         mut_visit::noop_visit_item_kind(item, self);
 
         if let ItemKind::Fn(f) = item {
-            if let Some(permissions) = self.fn_permissions.get(&f.sig.span) {
-                let mut ps = BitSet::new_empty(Permission::NUM);
-                for (param, perm) in f.sig.decl.inputs.iter_mut().zip(permissions) {
-                    if self.unsupported.contains(&param.pat.span) {
-                        continue;
-                    }
-                    let perm = some_or!(perm, continue);
-                    if !perm.is_empty() {
-                        *param.ty = ty!("Option<TTT>");
-                        ps.union(*perm);
-                    }
+            let HirLoc::Global(def_id) = self.hir_ctx.binding_span_to_loc[&f.sig.span] else {
+                unreachable!()
+            };
+            let mut tparams = vec![];
+            for (i, param) in f.sig.decl.inputs.iter_mut().enumerate() {
+                if self.unsupported.contains(&param.pat.span) {
+                    continue;
                 }
-                if !ps.is_empty() {
-                    self.updated = true;
-                    let mut param = "TTT: ".to_string();
-                    for (i, p) in ps.iter().enumerate() {
+                let loc = Loc::Var(def_id, mir::Local::from_usize(i + 1));
+                let po = some_or!(self.loc_to_po.get(&loc), continue);
+                *param.ty = ty!("Option<TT{}>", i);
+                self.updated = true;
+                tparams.push((i, po));
+            }
+            for (i, po) in tparams {
+                let tparam = if po.permissions.is_empty() {
+                    ty_param!("TT{}", i)
+                } else {
+                    let mut traits = String::new();
+                    for (i, p) in po.permissions.iter().enumerate() {
                         if i > 0 {
-                            param.push_str(" + ");
+                            traits.push_str(" + ");
                         }
-                        param.push_str(p.full_name());
+                        traits.push_str(p.full_name());
                     }
-                    f.generics.params.push(parse_ty_param(param));
-                }
+                    ty_param!("TT{}: {}", i, traits)
+                };
+                f.generics.params.push(tparam);
             }
         }
     }
@@ -623,8 +643,9 @@ impl MutVisitor for TransformVisitor<'_> {
                         match name {
                             "fopen" => {
                                 self.updated = true;
-                                let lhs = self.rhs_span_to_lhs_id[&expr_span];
-                                let permissions = self.lv_permissions[&lhs];
+                                let lhs = self.hir_ctx.rhs_to_lhs[&expr_span];
+                                let loc = self.hir_ctx.bound_span_to_loc[&lhs];
+                                let permissions = self.hir_loc_to_po[&loc].permissions;
                                 let new_expr = transform_fopen(&args[0], &args[1], permissions);
                                 *expr.deref_mut() = new_expr;
                             }

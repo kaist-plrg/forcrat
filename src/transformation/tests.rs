@@ -596,7 +596,7 @@ unsafe fn f() {
     g(0 as *mut FILE);
 }",
         &["None", "is_none"],
-        &["0", "is_null"],
+        &["0 as", "is_null"],
     );
 }
 
