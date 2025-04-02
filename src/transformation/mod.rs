@@ -17,7 +17,7 @@ use rustc_index::{bit_set::BitSet, Idx};
 use rustc_lexer::unescape;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue, TerminatorKind},
+    mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue},
     ty::{self, AdtDef, TyCtxt},
 };
 use rustc_span::{def_id::LocalDefId, symbol::Ident, FileName, RealFileName, Span, Symbol};
@@ -174,7 +174,6 @@ impl Pass for Transformation {
         }
 
         let mut api_sig_spans = FxHashSet::default();
-        let mut null_checks = FxHashSet::default();
         let mut null_casts = FxHashSet::default();
 
         for item_id in hir.items() {
@@ -190,29 +189,6 @@ impl Pass for Transformation {
                 }
 
                 let body = tcx.optimized_mir(local_def_id);
-
-                for bbd in body.basic_blocks.iter() {
-                    let terminator = bbd.terminator();
-                    let TerminatorKind::Call { func, args, .. } = &terminator.kind else {
-                        continue;
-                    };
-                    let span = terminator.source_info.span;
-
-                    let [arg] = &args[..] else { continue };
-                    let ty = arg.ty(&body.local_decls, tcx);
-                    if !compile_util::contains_file_ty(ty, tcx) {
-                        continue;
-                    }
-                    let constant = some_or!(func.constant(), continue);
-                    let ConstantKind::Val(_, ty) = constant.literal else { panic!() };
-                    let ty::TyKind::FnDef(def_id, _) = ty.kind() else { panic!() };
-                    let sym = compile_util::def_id_to_value_symbol(def_id, tcx);
-                    let sym = some_or!(sym, continue);
-                    if sym.as_str() == "is_null" {
-                        null_checks.insert(span);
-                    }
-                }
-
                 let mut visitor = MirVisitor {
                     tcx,
                     nulls: FxHashSet::default(),
@@ -251,7 +227,6 @@ impl Pass for Transformation {
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
                 api_sig_spans: &api_sig_spans,
-                null_checks: &null_checks,
                 null_casts: &null_casts,
                 unsupported: &unsupported,
                 is_stdin_unsupported,
@@ -903,8 +878,6 @@ struct TransformVisitor<'tcx, 'a> {
     static_span_to_lit: &'a FxHashMap<Span, Symbol>,
     /// user-defined API functions' signatures' spans
     api_sig_spans: &'a FxHashSet<Span>,
-    /// file pointer null check expr spans
-    null_checks: &'a FxHashSet<Span>,
     /// null to file pointer cast expr spans
     null_casts: &'a FxHashSet<Span>,
     /// unsupported expr spans
@@ -1301,8 +1274,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ExprKind::MethodCall(box MethodCall { receiver, seg, .. }) => {
-                if !self.is_unsupported(receiver) && self.null_checks.contains(&expr_span) {
-                    self.replace_ident(&mut seg.ident, Ident::from_str("is_none"));
+                if self.is_unsupported(receiver) {
+                    return;
+                }
+                let ty = some_or!(self.bound_pot(receiver.span), return).ty;
+                match ty {
+                    StreamType::Option(_) => {
+                        self.replace_ident(&mut seg.ident, Ident::from_str("is_none"));
+                    }
+                    StreamType::Ptr(_) => {}
+                    _ => panic!(),
                 }
             }
             ExprKind::Cast(_, _) => {
