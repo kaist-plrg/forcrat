@@ -1,8 +1,4 @@
-use std::{
-    fmt::Write as _,
-    fs,
-    ops::{Deref, DerefMut},
-};
+use std::{fmt::Write as _, fs, ops::Deref};
 
 use etrace::some_or;
 use rustc_abi::{FieldIdx, VariantIdx};
@@ -111,8 +107,7 @@ impl Pass for Transformation {
         let arena = Arena::new();
         let type_arena = TypeArena::new(&arena);
         let mut param_to_hir_loc = FxHashMap::default();
-        let mut loc_to_po = FxHashMap::default();
-        let mut hir_loc_to_po = FxHashMap::default();
+        let mut hir_loc_to_pot = FxHashMap::default();
         for ((loc, permissions), origins) in analysis_res
             .locs
             .iter()
@@ -149,13 +144,32 @@ impl Pass for Transformation {
                 _ => continue,
             };
             let ty = type_arena.make_ty(permissions, origins, is_param);
-            let po = Pot {
+            let pot = Pot {
                 permissions,
                 origins,
                 ty,
             };
-            loc_to_po.insert(*loc, po);
-            let old = hir_loc_to_po.insert(hir_loc, po);
+            let old = hir_loc_to_pot.insert(hir_loc, pot);
+            assert!(old.is_none());
+        }
+        for hir_loc in hir_ctx.loc_to_bound_spans.keys() {
+            let HirLoc::Global(def_id) = hir_loc else { continue };
+            let name = some_or!(compile_util::def_id_to_value_symbol(*def_id, tcx), continue);
+            let (loc, ty) = match name.as_str() {
+                "stdin" => (Loc::Stdin, &STDIN_TY),
+                "stdout" => (Loc::Stdout, &STDOUT_TY),
+                "stderr" => (Loc::Stderr, &STDERR_TY),
+                _ => continue,
+            };
+            let loc_id = analysis_res.loc_ind_map[&loc];
+            let permissions = &analysis_res.permissions[loc_id];
+            let origins = &analysis_res.origins[loc_id];
+            let pot = Pot {
+                permissions,
+                origins,
+                ty,
+            };
+            let old = hir_loc_to_pot.insert(*hir_loc, pot);
             assert!(old.is_none());
         }
 
@@ -234,8 +248,8 @@ impl Pass for Transformation {
                 updated: false,
                 static_span_to_lit: &ast_visitor.static_span_to_lit,
                 hir: &hir_ctx,
-                hir_loc_to_po: &hir_loc_to_po,
-                loc_to_po: &loc_to_po,
+                param_to_loc: &param_to_hir_loc,
+                loc_to_pot: &hir_loc_to_pot,
                 api_sig_spans: &api_sig_spans,
                 null_checks: &null_checks,
                 null_casts: &null_casts,
@@ -298,32 +312,12 @@ struct Pot<'a> {
 
 struct TypeArena<'a> {
     arena: &'a Arena<StreamType<'a>>,
-    stdin: &'a StreamType<'a>,
-    stdout: &'a StreamType<'a>,
-    stderr: &'a StreamType<'a>,
-    file: &'a StreamType<'a>,
-    child_stdin: &'a StreamType<'a>,
-    child_stdout: &'a StreamType<'a>,
 }
 
 impl<'a> TypeArena<'a> {
     #[inline]
     fn new(arena: &'a Arena<StreamType<'a>>) -> Self {
-        let stdin = arena.alloc(StreamType::Stdin);
-        let stdout = arena.alloc(StreamType::Stdout);
-        let stderr = arena.alloc(StreamType::Stderr);
-        let file = arena.alloc(StreamType::File);
-        let child_stdin = arena.alloc(StreamType::ChildStdin);
-        let child_stdout = arena.alloc(StreamType::ChildStdout);
-        Self {
-            arena,
-            stdin,
-            stdout,
-            stderr,
-            file,
-            child_stdin,
-            child_stdout,
-        }
+        Self { arena }
     }
 
     #[inline]
@@ -373,27 +367,27 @@ impl<'a> TypeArena<'a> {
             let ty = self.alloc(StreamType::Impl(traits));
             self.option(ty)
         } else if origins.is_empty() {
-            self.option(self.file)
+            self.option(&FILE_TY)
         } else if origins.count() == 1 {
             let origin = origins.iter().next().unwrap();
             let ty = match origin {
-                Origin::Stdin => self.stdin,
-                Origin::Stdout => self.stdout,
-                Origin::Stderr => self.stderr,
+                Origin::Stdin => &STDIN_TY,
+                Origin::Stdout => &STDOUT_TY,
+                Origin::Stderr => &STDERR_TY,
                 Origin::File => {
                     if permissions.contains(Permission::Write) {
-                        self.buf_writer(self.file)
+                        self.buf_writer(&FILE_TY)
                     // } else if permissions.contains(Permission::Read)
                     //     || permissions.contains(Permission::BufRead)
                     // {
                     //     self.buf_reader(self.file)
                     } else {
                         // self.file
-                        self.buf_reader(self.file)
+                        self.buf_reader(&FILE_TY)
                     }
                 }
-                Origin::PipeRead => self.child_stdout,
-                Origin::PipeWrite => self.child_stdin,
+                Origin::PipeRead => &CHILD_STDOUT_TY,
+                Origin::PipeWrite => &CHILD_STDIN_TY,
                 Origin::PipeDyn => todo!(),
                 Origin::Buffer => todo!(),
             };
@@ -409,7 +403,7 @@ impl<'a> TypeArena<'a> {
 }
 
 #[allow(unused_tuple_struct_fields)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamType<'a> {
     File,
     Stdin,
@@ -423,6 +417,13 @@ enum StreamType<'a> {
     Ptr(&'a StreamType<'a>),
     Impl(BitSet8<StreamTrait>),
 }
+
+static STDIN_TY: StreamType<'static> = StreamType::Stdin;
+static STDOUT_TY: StreamType<'static> = StreamType::Stdout;
+static STDERR_TY: StreamType<'static> = StreamType::Stderr;
+static FILE_TY: StreamType<'static> = StreamType::File;
+static CHILD_STDIN_TY: StreamType<'static> = StreamType::ChildStdin;
+static CHILD_STDOUT_TY: StreamType<'static> = StreamType::ChildStdout;
 
 impl std::fmt::Display for StreamType<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -446,6 +447,233 @@ impl std::fmt::Display for StreamType<'_> {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+impl StreamType<'_> {
+    fn expr_to_write(self, expr: &str) -> String {
+        match self {
+            Self::File | Self::Stdout | Self::Stderr | Self::ChildStdin | Self::BufWriter(_) => {
+                expr.to_string()
+            }
+            Self::Impl(traits) => {
+                assert!(traits.contains(StreamTrait::Write));
+                expr.to_string()
+            }
+            Self::Option(t) => format!("({}).as_mut().unwrap()", t.expr_to_write(expr)),
+            Self::Ptr(t) => format!("&mut *{}", t.expr_to_write(expr)),
+            Self::Stdin | Self::ChildStdout | Self::BufReader(_) => panic!("{}", expr),
+        }
+    }
+
+    fn expr_to_read(self, expr: &str) -> String {
+        match self {
+            Self::File | Self::Stdin | Self::ChildStdout | Self::BufReader(_) => expr.to_string(),
+            Self::Impl(traits) => {
+                assert!(traits.contains(StreamTrait::Read));
+                expr.to_string()
+            }
+            Self::Option(t) => format!("({}).as_mut().unwrap()", t.expr_to_read(expr)),
+            Self::Ptr(t) => format!("&mut *{}", t.expr_to_read(expr)),
+            Self::Stdout | Self::Stderr | Self::ChildStdin | Self::BufWriter(_) => {
+                panic!("{}", expr)
+            }
+        }
+    }
+
+    fn expr_to_buf_read(self, expr: &str) -> (String, bool) {
+        match self {
+            Self::Stdin => (expr.to_string(), true),
+            Self::BufReader(_) => (expr.to_string(), false),
+            Self::Impl(traits) => {
+                assert!(traits.contains(StreamTrait::BufRead));
+                (expr.to_string(), false)
+            }
+            Self::Option(t) => {
+                let (e, lock) = t.expr_to_buf_read(expr);
+                (format!("({}).as_mut().unwrap()", e), lock)
+            }
+            Self::Ptr(t) => {
+                let (e, lock) = t.expr_to_buf_read(expr);
+                (format!("&mut *{}", e), lock)
+            }
+            Self::File
+            | Self::Stdout
+            | Self::Stderr
+            | Self::ChildStdin
+            | Self::ChildStdout
+            | Self::BufWriter(_) => panic!("{}", expr),
+        }
+    }
+
+    fn expr_to_seek(self, expr: &str) -> String {
+        match self {
+            Self::File | Self::BufWriter(_) | Self::BufReader(_) => expr.to_string(),
+            Self::Impl(traits) => {
+                assert!(traits.contains(StreamTrait::Seek));
+                expr.to_string()
+            }
+            Self::Option(t) => format!("({}).as_mut().unwrap()", t.expr_to_seek(expr)),
+            Self::Ptr(t) => format!("&mut *{}", t.expr_to_seek(expr)),
+            Self::Stdin | Self::Stdout | Self::Stderr | Self::ChildStdout | Self::ChildStdin => {
+                panic!("{}", expr)
+            }
+        }
+    }
+
+    fn expr_to_fd(self, expr: &str) -> String {
+        match self {
+            Self::File
+            | Self::Stdin
+            | Self::Stdout
+            | Self::Stderr
+            | Self::ChildStdout
+            | Self::ChildStdin => expr.to_string(),
+            Self::BufWriter(t) | Self::BufReader(t) => format!(
+                "std::os::fd::AsFd::as_fd(({}).get_ref())",
+                t.expr_to_fd(expr)
+            ),
+            Self::Impl(traits) => {
+                assert!(traits.contains(StreamTrait::AsRawFd));
+                expr.to_string()
+            }
+            Self::Option(t) => format!("({}).as_mut().unwrap()", t.expr_to_fd(expr)),
+            Self::Ptr(t) => format!("&mut *{}", t.expr_to_fd(expr)),
+        }
+    }
+
+    //     fn null_to_expr(self, null: &str) -> &str {
+    //         match self {
+    //             Self::Option(_) => "None",
+    //             Self::Ptr(_) => null,
+    //             _ => panic!(),
+    //         }
+    //     }
+
+    //     fn assign(self, rty: StreamType<'a>, rhs: &str) -> String {
+    //         if self == rty {
+    //             return rhs.to_string();
+    //         }
+    //         if let Self::Option(this) = self {
+    //             if *this == rty {
+    //                 return format!("Some({})", rhs);
+    //             }
+    //         }
+    //         if let Self::Ptr(this) = self {
+    //             if *this == rty {
+    //                 return format!("&mut ({})", rhs);
+    //             }
+    //         }
+    //         todo!("{:?} {:?}", self, rty)
+    //     }
+}
+
+trait StreamExpr {
+    fn expr(&self) -> String;
+    fn ty(&self) -> StreamType<'_>;
+
+    #[inline]
+    fn write_expr(&self) -> String {
+        self.ty().expr_to_write(&self.expr())
+    }
+
+    #[inline]
+    fn read_expr(&self) -> String {
+        self.ty().expr_to_read(&self.expr())
+    }
+
+    #[inline]
+    fn buf_read_def(&self, id: &str) -> String {
+        let (stream, lock) = self.ty().expr_to_buf_read(&self.expr());
+        if lock {
+            format!("let mut {0} = {1}; let mut {0} = {0}.lock();", id, stream)
+        } else {
+            format!("let mut {} = {};", id, stream)
+        }
+    }
+
+    #[inline]
+    fn seek_expr(&self) -> String {
+        self.ty().expr_to_seek(&self.expr())
+    }
+
+    #[inline]
+    fn fd_expr(&self) -> String {
+        self.ty().expr_to_fd(&self.expr())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TypedExpr<'a> {
+    expr: &'a Expr,
+    ty: &'a StreamType<'a>,
+}
+
+impl<'a> TypedExpr<'a> {
+    #[inline]
+    fn new(expr: &'a Expr, ty: &'a StreamType<'a>) -> Self {
+        Self { expr, ty }
+    }
+}
+
+impl StreamExpr for TypedExpr<'_> {
+    #[inline]
+    fn expr(&self) -> String {
+        pprust::expr_to_string(self.expr)
+    }
+
+    #[inline]
+    fn ty(&self) -> StreamType<'_> {
+        *self.ty
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StdStream {
+    Stdin,
+    Stdout,
+    #[allow(unused)]
+    Stderr,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StdExpr(StdStream);
+
+impl StdExpr {
+    #[inline]
+    fn stdin() -> Self {
+        Self(StdStream::Stdin)
+    }
+
+    #[inline]
+    fn stdout() -> Self {
+        Self(StdStream::Stdout)
+    }
+
+    #[allow(unused)]
+    #[inline]
+    fn stderr() -> Self {
+        Self(StdStream::Stderr)
+    }
+}
+
+impl StreamExpr for StdExpr {
+    #[inline]
+    fn expr(&self) -> String {
+        match self.0 {
+            StdStream::Stdin => "std::io::stdin()".to_string(),
+            StdStream::Stdout => "std::io::stdout()".to_string(),
+            StdStream::Stderr => "std::io::stderr()".to_string(),
+        }
+    }
+
+    #[inline]
+    fn ty(&self) -> StreamType<'_> {
+        match self.0 {
+            StdStream::Stdin => STDIN_TY,
+            StdStream::Stdout => STDOUT_TY,
+            StdStream::Stderr => STDERR_TY,
         }
     }
 }
@@ -495,6 +723,13 @@ impl Idx for StreamTrait {
 struct Param {
     func: LocalDefId,
     index: usize,
+}
+
+impl Param {
+    #[inline]
+    fn new(func: LocalDefId, index: usize) -> Self {
+        Self { func, index }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -700,10 +935,10 @@ impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
 struct TransformVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     hir: &'a HirCtx,
-    /// location to permissions and origins
-    loc_to_po: &'a FxHashMap<Loc, Pot<'a>>,
+    /// function parameter to HIR location
+    param_to_loc: &'a FxHashMap<Param, HirLoc>,
     /// HIR location to permissions and origins
-    hir_loc_to_po: &'a FxHashMap<HirLoc, Pot<'a>>,
+    loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// static variable definition's span to its literal
     static_span_to_lit: &'a FxHashMap<Span, Symbol>,
     /// user-defined API functions' signatures' spans
@@ -729,9 +964,9 @@ impl TransformVisitor<'_, '_> {
     }
 
     #[inline]
-    fn transform_fprintf<E: Deref<Target = Expr>>(
+    fn transform_fprintf<S: StreamExpr, E: Deref<Target = Expr>>(
         &self,
-        stream: &str,
+        stream: &S,
         fmt: &Expr,
         args: &[E],
         wide: bool,
@@ -749,10 +984,41 @@ impl TransformVisitor<'_, '_> {
         }
     }
 
+    #[inline]
+    fn bound_pot(&self, span: Span) -> Option<&Pot<'_>> {
+        let loc = self.hir.bound_span_to_loc.get(&span)?;
+        self.loc_to_pot.get(loc)
+    }
+
+    #[inline]
     fn binding_ty(&self, span: Span) -> Option<Ty> {
         let loc = self.hir.binding_span_to_loc.get(&span)?;
-        let pot = self.hir_loc_to_po.get(loc)?;
+        let pot = self.loc_to_pot.get(loc)?;
         Some(ty!("{}", pot.ty))
+    }
+
+    #[inline]
+    fn replace_expr(&mut self, old: &mut Expr, new: Expr) {
+        self.updated = true;
+        let span = old.span;
+        *old = new;
+        old.span = span;
+    }
+
+    #[inline]
+    fn replace_ty(&mut self, old: &mut Ty, new: Ty) {
+        self.updated = true;
+        let span = old.span;
+        *old = new;
+        old.span = span;
+    }
+
+    #[inline]
+    fn replace_ident(&mut self, old: &mut Ident, new: Ident) {
+        self.updated = true;
+        let span = old.span;
+        *old = new;
+        old.span = span;
     }
 }
 
@@ -775,8 +1041,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if self.unsupported.contains(&param.pat.span) {
                     continue;
                 }
-                let loc = Loc::Var(def_id, mir::Local::from_usize(i + 1));
-                let po = some_or!(self.loc_to_po.get(&loc), continue);
+                let p = Param::new(def_id, i);
+                let loc = some_or!(self.param_to_loc.get(&p), continue);
+                let po = some_or!(self.loc_to_pot.get(loc), continue);
                 *param.ty = ty!("Option<TT{}>", i);
                 self.updated = true;
                 tparams.push((i, po));
@@ -785,14 +1052,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let tparam = if po.permissions.is_empty() {
                     ty_param!("TT{}", i)
                 } else {
-                    let mut traits = String::new();
-                    for (i, p) in po.permissions.iter().enumerate() {
-                        if i > 0 {
-                            traits.push_str(" + ");
-                        }
-                        traits.push_str(p.full_name());
-                    }
-                    ty_param!("TT{}: {}", i, traits)
+                    let StreamType::Option(ty) = po.ty else { panic!() };
+                    ty_param!("TT{}: {}", i, ty)
                 };
                 f.generics.params.push(tparam);
             }
@@ -805,9 +1066,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         let VariantData::Struct(fields, _) = vdata else { return };
         for f in fields {
             if let Some(ty) = self.binding_ty(f.span) {
-                self.updated = true;
                 self.updated_field_spans.insert(f.span);
-                *f.ty = ty;
+                self.replace_ty(&mut f.ty, ty);
             }
         }
     }
@@ -820,8 +1080,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         }
 
         if let Some(ty) = self.binding_ty(local.pat.span) {
-            self.updated = true;
-            **local.ty.as_mut().unwrap() = ty;
+            self.replace_ty(local.ty.as_mut().unwrap(), ty);
         }
     }
 
@@ -841,66 +1100,65 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let name = api_list::normalize_api_name(name.as_str());
                 match name {
                     "fopen" => {
-                        self.updated = true;
                         let lhs = self.hir.rhs_to_lhs[&expr_span];
                         let loc = self.hir.bound_span_to_loc[&lhs];
-                        let permissions = self.hir_loc_to_po[&loc].permissions;
+                        let permissions = self.loc_to_pot[&loc].permissions;
                         let new_expr = transform_fopen(&args[0], &args[1], permissions);
-                        *expr.deref_mut() = new_expr;
+                        self.replace_expr(expr, new_expr);
                     }
                     "popen" => {
-                        self.updated = true;
                         let new_expr = transform_popen(&args[0], &args[1]);
-                        *expr.deref_mut() = new_expr;
+                        self.replace_expr(expr, new_expr);
                     }
                     "fclose" | "pclose" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        *callee.deref_mut() = expr!("drop");
+                        self.replace_expr(callee, expr!("drop"));
                     }
                     "fscanf" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_fscanf(&args[0], &args[1], &args[2..]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
+                        let new_expr = transform_fscanf(&stream, &args[1], &args[2..]);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fgetc" | "getc" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let stream = pprust::expr_to_string(&args[0]);
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
                         let new_expr = transform_fgetc(&stream);
-                        *expr.deref_mut() = new_expr;
+                        self.replace_expr(expr, new_expr);
                     }
                     "getchar" => {
                         if self.is_stdin_unsupported {
                             return;
                         }
-                        self.updated = true;
-                        let stream = "Some(std::io::stdin())";
-                        let new_expr = transform_fgetc(stream);
-                        *expr.deref_mut() = new_expr;
+                        let stream = StdExpr::stdin();
+                        let new_expr = transform_fgetc(&stream);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fgets" => {
                         if self.is_unsupported(&args[2]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_fgets(&args[2], &args[0], &args[1]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[2].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[2], ty);
+                        let new_expr = transform_fgets(&stream, &args[0], &args[1]);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fread" => {
                         if self.is_unsupported(&args[3]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_fread(&args[3], &args[0], &args[1], &args[2]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[3].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[3], ty);
+                        let new_expr = transform_fread(&stream, &args[0], &args[1], &args[2]);
+                        self.replace_expr(expr, new_expr);
                     }
                     "getdelim" => todo!(),
                     "getline" => todo!(),
@@ -908,98 +1166,101 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_feof(&args[0]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
+                        let new_expr = transform_feof(&stream);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fprintf" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let stream = pprust::expr_to_string(&args[0]);
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
                         let new_expr = self.transform_fprintf(&stream, &args[1], &args[2..], false);
-                        *expr.deref_mut() = new_expr;
+                        self.replace_expr(expr, new_expr);
                     }
                     "printf" => {
-                        self.updated = true;
-                        let stream = "Some(std::io::stdout())";
-                        let new_expr = self.transform_fprintf(stream, &args[0], &args[1..], false);
-                        *expr.deref_mut() = new_expr;
+                        let stream = StdExpr::stdout();
+                        let new_expr = self.transform_fprintf(&stream, &args[0], &args[1..], false);
+                        self.replace_expr(expr, new_expr);
                     }
                     "wprintf" => {
-                        self.updated = true;
-                        let stream = "Some(std::io::stdout())";
-                        let new_expr = self.transform_fprintf(stream, &args[0], &args[1..], true);
-                        *expr.deref_mut() = new_expr;
+                        let stream = StdExpr::stdout();
+                        let new_expr = self.transform_fprintf(&stream, &args[0], &args[1..], true);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fputc" | "putc" => {
                         if self.is_unsupported(&args[1]) {
                             return;
                         }
-                        self.updated = true;
-                        let stream = pprust::expr_to_string(&args[1]);
+                        let ty = self.bound_pot(args[1].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[1], ty);
                         let new_expr = transform_fputc(&stream, &args[0]);
-                        *expr.deref_mut() = new_expr;
+                        self.replace_expr(expr, new_expr);
                     }
                     "putchar" => {
-                        self.updated = true;
-                        let stream = "Some(std::io::stdout())";
-                        let new_expr = transform_fputc(stream, &args[0]);
-                        *expr.deref_mut() = new_expr;
+                        let stream = StdExpr::stdout();
+                        let new_expr = transform_fputc(&stream, &args[0]);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fputs" => {
                         if self.is_unsupported(&args[1]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_fputs(&args[1], &args[0]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[1].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[1], ty);
+                        let new_expr = transform_fputs(&stream, &args[0]);
+                        self.replace_expr(expr, new_expr);
                     }
                     "puts" => {
-                        self.updated = true;
                         let new_expr = transform_puts(&args[0]);
-                        *expr.deref_mut() = new_expr;
+                        self.replace_expr(expr, new_expr);
                     }
                     "fwrite" => {
                         if self.is_unsupported(&args[3]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_fwrite(&args[3], &args[0], &args[1], &args[2]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[3].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[3], ty);
+                        let new_expr = transform_fwrite(&stream, &args[0], &args[1], &args[2]);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fflush" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_fflush(&args[0]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
+                        let new_expr = transform_fflush(&stream);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fseek" | "fseeko" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_fseek(&args[0], &args[1], &args[2]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
+                        let new_expr = transform_fseek(&stream, &args[1], &args[2]);
+                        self.replace_expr(expr, new_expr);
                     }
                     "ftell" | "ftello" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_ftell(&args[0]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
+                        let new_expr = transform_ftell(&stream);
+                        self.replace_expr(expr, new_expr);
                     }
                     "rewind" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_rewind(&args[0]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
+                        let new_expr = transform_rewind(&stream);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fgetpos" => todo!(),
                     "fsetpos" => todo!(),
@@ -1007,9 +1268,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.updated = true;
-                        let new_expr = transform_fileno(&args[0]);
-                        *expr.deref_mut() = new_expr;
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
+                        let new_expr = transform_fileno(&stream);
+                        self.replace_expr(expr, new_expr);
                     }
                     _ => {
                         let hir::Node::Item(item) = self.tcx.hir().get_by_def_id(*def_id) else {
@@ -1021,15 +1283,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(arg) {
                                 continue;
                             }
-                            let loc = Loc::Var(*def_id, mir::Local::from_usize(i + 1));
-                            let po = some_or!(self.loc_to_po.get(&loc), continue);
+                            let param = Param::new(*def_id, i);
+                            let loc = some_or!(self.param_to_loc.get(&param), continue);
+                            let po = some_or!(self.loc_to_pot.get(loc), continue);
                             let a = pprust::expr_to_string(arg);
                             let new_expr = if po.permissions.contains(Permission::AsRawFd) {
                                 if self
                                     .hir
                                     .bound_span_to_loc
                                     .get(&arg.span)
-                                    .and_then(|loc| self.hir_loc_to_po.get(loc))
+                                    .and_then(|loc| self.loc_to_pot.get(loc))
                                     .map_or_else(|| false, |po| po.origins.contains(Origin::File))
                                 {
                                     expr!("({}).as_ref().map(|b| std::os::fd::AsFd::as_fd(b.get_ref()))", a)
@@ -1039,8 +1302,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             } else {
                                 expr!("({}).as_mut()", a)
                             };
-                            **arg = new_expr;
-                            self.updated = true;
+                            self.replace_expr(arg, new_expr);
                             if a == "None" {
                                 none = true;
                             }
@@ -1048,7 +1310,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if none {
                             let c = pprust::expr_to_string(callee);
                             let new_expr = expr!("{}::<&mut std::fs::File>", c);
-                            **callee = new_expr;
+                            self.replace_expr(callee, new_expr);
                         }
                     }
                 }
@@ -1057,16 +1319,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if let [seg] = &path.segments[..] {
                     match seg.ident.name.as_str() {
                         "stdin" => {
-                            self.updated = true;
-                            **expr = expr!("Some(std::io::stdin())");
+                            let new_expr = expr!("std::io::stdin()");
+                            self.replace_expr(expr, new_expr);
                         }
                         "stdout" => {
-                            self.updated = true;
-                            **expr = expr!("Some(std::io::stdout())");
+                            let new_expr = expr!("std::io::stdout()");
+                            self.replace_expr(expr, new_expr);
                         }
                         "stderr" => {
-                            self.updated = true;
-                            **expr = expr!("Some(std::io::stderr())");
+                            let new_expr = expr!("std::io::stderr()");
+                            self.replace_expr(expr, new_expr);
                         }
                         _ => {}
                     }
@@ -1074,53 +1336,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ExprKind::MethodCall(box MethodCall { receiver, seg, .. }) => {
                 if !self.is_unsupported(receiver) && self.null_checks.contains(&expr_span) {
-                    self.updated = true;
-                    seg.ident = Ident::from_str("is_none");
+                    self.replace_ident(&mut seg.ident, Ident::from_str("is_none"));
                 }
             }
             ExprKind::Cast(_, _) => {
                 if self.null_casts.contains(&expr_span) {
-                    self.updated = true;
-                    **expr = expr!("None");
+                    self.replace_expr(expr, expr!("None"));
                 }
             }
             _ => {}
         }
-    }
-}
-
-#[inline]
-fn unwrap_some_call(expr: &Expr) -> Option<&Expr> {
-    let ExprKind::Call(callee, args) = &expr.kind else { return None };
-    let ExprKind::Path(None, path) = &callee.kind else { return None };
-    if path.segments.last().unwrap().ident.name.as_str() != "Some" {
-        return None;
-    }
-    let [arg] = &args[..] else { return None };
-    let ExprKind::Call(callee, _) = &arg.kind else { return None };
-    let ExprKind::Path(None, _) = &callee.kind else { return None };
-    Some(callee)
-}
-
-#[inline]
-fn make_stream_def(stream: &Expr) -> String {
-    if let Some(stream) = unwrap_some_call(stream) {
-        let stream = pprust::expr_to_string(stream);
-        format!("let mut stream = {}();", stream)
-    } else {
-        let stream = pprust::expr_to_string(stream);
-        format!("let stream = ({}).as_mut().unwrap();", stream)
-    }
-}
-
-#[inline]
-fn make_buf_stream_def(stream: &Expr) -> String {
-    if let Some(stream) = unwrap_some_call(stream) {
-        let stream = pprust::expr_to_string(stream);
-        format!("let stream = {}(); let mut stream = stream.lock();", stream)
-    } else {
-        let stream = pprust::expr_to_string(stream);
-        format!("let stream = ({}).as_mut().unwrap();", stream)
     }
 }
 
@@ -1243,8 +1468,12 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
     }
 }
 
-fn transform_fscanf<E: Deref<Target = Expr>>(stream: &Expr, fmt: &Expr, args: &[E]) -> Expr {
-    let stream_def = make_buf_stream_def(stream);
+fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
+    stream: &S,
+    fmt: &Expr,
+    args: &[E],
+) -> Expr {
+    let stream_def = stream.buf_read_def("stream");
     let fmt = LikelyLit::from_expr(fmt);
     match fmt {
         LikelyLit::Lit(fmt) => {
@@ -1337,20 +1566,21 @@ fn transform_fscanf<E: Deref<Target = Expr>>(stream: &Expr, fmt: &Expr, args: &[
 }
 
 #[inline]
-fn transform_fgetc(stream: &str) -> Expr {
+fn transform_fgetc<S: StreamExpr>(stream: &S) -> Expr {
+    let stream = stream.read_expr();
     expr!(
         "{{
     use std::io::Read;
     let mut buf = [0];
-    ({}).as_mut().unwrap().read_exact(&mut buf).map_or(libc::EOF, |_| buf[0] as _)
+    ({}).read_exact(&mut buf).map_or(libc::EOF, |_| buf[0] as _)
 }}",
         stream
     )
 }
 
 #[inline]
-fn transform_fgets(stream: &Expr, s: &Expr, n: &Expr) -> Expr {
-    let stream_def = make_buf_stream_def(stream);
+fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr) -> Expr {
+    let stream_def = stream.buf_read_def("stream");
     let s = pprust::expr_to_string(s);
     let n = pprust::expr_to_string(n);
     expr!(
@@ -1393,15 +1623,15 @@ fn transform_fgets(stream: &Expr, s: &Expr, n: &Expr) -> Expr {
 }
 
 #[inline]
-fn transform_fread(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
-    let stream_def = make_stream_def(stream);
+fn transform_fread<S: StreamExpr>(stream: &S, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
+    let stream = stream.read_expr();
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
     expr!(
         "{{
     use std::io::Read;
-    {}
+    let mut stream = {};
     let size = {};
     let ptr: &mut [u8] = std::slice::from_raw_parts_mut(({}) as _, (size * ({})) as usize);
     let mut i = 0;
@@ -1413,7 +1643,7 @@ fn transform_fread(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Exp
     }}
     i
 }}",
-        stream_def,
+        stream,
         size,
         ptr,
         nitems,
@@ -1421,20 +1651,20 @@ fn transform_fread(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Exp
 }
 
 #[inline]
-fn transform_feof(stream: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+fn transform_feof<S: StreamExpr>(stream: &S) -> Expr {
+    let stream = stream.read_expr();
     expr!(
         "{{
     use std::io::Read;
     let mut buf = [0];
-    ({}).as_mut().unwrap().read_exact(&mut buf).map_or(1, |_| 0)
+    ({}).read_exact(&mut buf).map_or(1, |_| 0)
 }}",
         stream
     )
 }
 
-fn transform_fprintf_lit<E: Deref<Target = Expr>>(
-    stream: &str,
+fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
+    stream: &S,
     fmt: Symbol,
     args: &[E],
     wide: bool,
@@ -1487,10 +1717,11 @@ fn transform_fprintf_lit<E: Deref<Target = Expr>>(
             _ => write!(new_args, "({}) as {}, ", arg, cast).unwrap(),
         }
     }
+    let stream = stream.write_expr();
     expr!(
         "{{
     use std::io::Write;
-    write!(({}).as_mut().unwrap(), \"{}\", {})
+    write!({}, \"{}\", {})
 }}",
         stream,
         fmt,
@@ -1499,13 +1730,14 @@ fn transform_fprintf_lit<E: Deref<Target = Expr>>(
 }
 
 #[inline]
-fn transform_fputc(stream: &str, c: &Expr) -> Expr {
+fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr) -> Expr {
+    let stream = stream.write_expr();
     let c = pprust::expr_to_string(c);
     expr!(
         "{{
     use std::io::Write;
     let c = {};
-    ({}).as_mut().unwrap().write_all(&[c as u8]).map_or(libc::EOF, |_| c)
+    ({}).write_all(&[c as u8]).map_or(libc::EOF, |_| c)
 }}",
         c,
         stream
@@ -1513,14 +1745,13 @@ fn transform_fputc(stream: &str, c: &Expr) -> Expr {
 }
 
 #[inline]
-fn transform_fputs(stream: &Expr, s: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr) -> Expr {
+    let stream = stream.write_expr();
     let s = pprust::expr_to_string(s);
     expr!(
         "{{
     use std::io::Write;
-    ({}).as_mut().unwrap()
-        .write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
+    ({}).write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
         .map_or(libc::EOF, |_| 0)
 }}",
         stream,
@@ -1529,15 +1760,15 @@ fn transform_fputs(stream: &Expr, s: &Expr) -> Expr {
 }
 
 #[inline]
-fn transform_fwrite(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
-    let stream_def = make_stream_def(stream);
+fn transform_fwrite<S: StreamExpr>(stream: &S, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
+    let stream = stream.write_expr();
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
     expr!(
         "{{
     use std::io::Write;
-    {}
+    let mut stream = {};
     let size = {};
     let ptr: &[u8] = std::slice::from_raw_parts({} as _, (size * ({})) as usize);
     let mut i = 0;
@@ -1549,7 +1780,7 @@ fn transform_fwrite(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Ex
     }}
     i
 }}",
-        stream_def,
+        stream,
         size,
         ptr,
         nitems
@@ -1557,12 +1788,12 @@ fn transform_fwrite(stream: &Expr, ptr: &Expr, size: &Expr, nitems: &Expr) -> Ex
 }
 
 #[inline]
-fn transform_fflush(stream: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+fn transform_fflush<S: StreamExpr>(stream: &S) -> Expr {
+    let stream = stream.write_expr();
     expr!(
         "{{
     use std::io::Write;
-    ({}).as_mut().unwrap().flush().map_or(libc::EOF, |_| 0)
+    ({}).flush().map_or(libc::EOF, |_| 0)
 }}",
         stream
     )
@@ -1585,8 +1816,8 @@ fn transform_puts(s: &Expr) -> Expr {
 }
 
 #[inline]
-fn transform_fseek(stream: &Expr, off: &Expr, whence: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr {
+    let stream = stream.seek_expr();
     let off = pprust::expr_to_string(off);
     let whence = LikelyLit::from_expr(whence);
     match whence {
@@ -1600,7 +1831,7 @@ fn transform_fseek(stream: &Expr, off: &Expr, whence: &Expr) -> Expr {
             expr!(
                 "{{
     use std::io::Seek;
-    ({}).as_mut().unwrap().seek(std::io::SeekFrom::{}(({}) as _)).map_or(-1, |_| 0)
+    ({}).seek(std::io::SeekFrom::{}(({}) as _)).map_or(-1, |_| 0)
 }}",
                 stream,
                 v,
@@ -1614,36 +1845,36 @@ fn transform_fseek(stream: &Expr, off: &Expr, whence: &Expr) -> Expr {
 }
 
 #[inline]
-fn transform_ftell(stream: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+fn transform_ftell<S: StreamExpr>(stream: &S) -> Expr {
+    let stream = stream.seek_expr();
     expr!(
         "{{
     use std::io::Seek;
-    ({}).as_mut().unwrap().stream_position().map_or(-1, |p| p as i64)
+    ({}).stream_position().map_or(-1, |p| p as i64)
 }}",
         stream
     )
 }
 
 #[inline]
-fn transform_rewind(stream: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+fn transform_rewind<S: StreamExpr>(stream: &S) -> Expr {
+    let stream = stream.seek_expr();
     expr!(
         "{{
     use std::io::Seek;
-    ({}).as_mut().unwrap().rewind();
+    ({}).rewind();
 }}",
         stream
     )
 }
 
 #[inline]
-fn transform_fileno(stream: &Expr) -> Expr {
-    let stream = pprust::expr_to_string(stream);
+fn transform_fileno<S: StreamExpr>(stream: &S) -> Expr {
+    let stream = stream.fd_expr();
     expr!(
         "{{
     use std::os::fd::AsRawFd;
-    ({}).as_ref().unwrap().as_raw_fd()
+    ({}).as_raw_fd()
 }}",
         stream
     )
