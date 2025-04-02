@@ -8,6 +8,7 @@ fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let v = super::Transformation.run_on_str(&code);
     let [(_, s)] = &v[..] else { panic!() };
     let stripped = s.strip_prefix(FORMATTED_PREAMBLE.as_str()).unwrap();
+    assert!(ty_checker::TyChecker.run_on_str(&s), "{}", stripped);
     for s in includes {
         assert!(stripped.contains(s), "{}\nmust contain {}", stripped, s);
     }
@@ -19,7 +20,6 @@ fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
             s
         );
     }
-    assert!(ty_checker::TyChecker.run_on_str(&s), "{}", stripped);
 }
 
 #[test]
@@ -740,10 +740,10 @@ fn test_field() {
         r#"
 #[derive(Copy, Clone)]
 #[repr(C)]
-pub struct s {
+struct s {
     pub f: *mut FILE,
 }
-pub unsafe extern "C" fn f() {
+unsafe fn f() {
     let mut s: s = s { f: 0 as *mut FILE };
     s
         .f = fopen(
@@ -758,6 +758,35 @@ pub unsafe extern "C" fn f() {
         &["FILE", "fopen", "fgetc", "fclose"],
     );
 }
+
+// #[test]
+// fn test_field_borrowed() {
+//     run_test(
+//         r#"
+// #[derive(Copy, Clone)]
+// #[repr(C)]
+// struct s {
+//     pub f: *mut FILE,
+// }
+// unsafe fn g(mut s: *mut s) {
+//     fgetc((*s).f);
+//     fgetc((*s).f);
+// }
+// unsafe fn f() {
+//     let mut stream: *mut FILE = fopen(
+//         b"a\0" as *const u8 as *const libc::c_char,
+//         b"r\0" as *const u8 as *const libc::c_char,
+//     );
+//     let mut s: s = s { f: 0 as *mut FILE };
+//     s.f = stream;
+//     g(&mut s);
+//     g(&mut s);
+//     fclose(stream);
+// }"#,
+//         &["File", "open", "Read", "read_exact", "drop"],
+//         &["FILE", "fopen", "fgetc", "fclose"],
+//     );
+// }
 
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]

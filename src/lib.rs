@@ -56,6 +56,7 @@ pub mod api_counter;
 pub mod api_list;
 #[macro_use]
 pub mod ast_maker;
+pub mod bit_set;
 pub mod compile_util;
 pub mod disjoint_set;
 pub mod extern_finder;

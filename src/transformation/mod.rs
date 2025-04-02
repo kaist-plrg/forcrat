@@ -17,18 +17,20 @@ use rustc_ast_pretty::pprust;
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, def::Res, intravisit, HirId};
-use rustc_index::bit_set::BitSet;
+use rustc_index::{bit_set::BitSet, Idx};
 use rustc_lexer::unescape;
 use rustc_middle::{
     hir::nested_filter,
     mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue, TerminatorKind},
-    ty::{self, TyCtxt},
+    ty::{self, AdtDef, TyCtxt},
 };
 use rustc_span::{def_id::LocalDefId, symbol::Ident, FileName, RealFileName, Span, Symbol};
+use typed_arena::Arena;
 
 use crate::{
     api_list::{self, Origin, Permission},
     ast_maker::*,
+    bit_set::BitSet8,
     compile_util::{self, Pass},
     file_analysis::{self, Loc},
     rustc_middle::mir::visit::Visitor as _,
@@ -40,12 +42,6 @@ pub fn write_to_files(fss: &[(FileName, String)]) -> std::io::Result<()> {
         fs::write(p, s)?;
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Po<'a> {
-    permissions: &'a BitSet<Permission>,
-    origins: &'a BitSet<Origin>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,24 +108,36 @@ impl Pass for Transformation {
             }
         }
 
+        let arena = Arena::new();
+        let type_arena = TypeArena::new(&arena);
+        let mut param_to_hir_loc = FxHashMap::default();
         let mut loc_to_po = FxHashMap::default();
         let mut hir_loc_to_po = FxHashMap::default();
-
         for ((loc, permissions), origins) in analysis_res
             .locs
             .iter()
             .zip(&analysis_res.permissions)
             .zip(&analysis_res.origins)
         {
-            let hir_loc = match loc {
+            let (hir_loc, is_param) = match loc {
                 Loc::Var(def_id, local) => {
                     let hir::Node::Item(item) = hir.get_by_def_id(*def_id) else { panic!() };
                     match item.kind {
-                        hir::ItemKind::Fn(_, _, _) => {
+                        hir::ItemKind::Fn(sig, _, _) => {
                             let body = tcx.optimized_mir(*def_id);
                             let local_decl = &body.local_decls[*local];
                             let span = local_decl.source_info.span;
-                            *some_or!(hir_ctx.binding_span_to_loc.get(&span), continue)
+                            let loc = *some_or!(hir_ctx.binding_span_to_loc.get(&span), continue);
+                            let arity = sig.decl.inputs.len();
+                            let is_param = (1..=arity).contains(&local.as_usize());
+                            if is_param {
+                                let param = Param {
+                                    func: *def_id,
+                                    index: local.as_usize() - 1,
+                                };
+                                param_to_hir_loc.insert(param, loc);
+                            }
+                            (loc, is_param)
                         }
                         hir::ItemKind::Static(_, _, _) => {
                             todo!()
@@ -137,12 +145,14 @@ impl Pass for Transformation {
                         _ => panic!(),
                     }
                 }
-                Loc::Field(def_id, field) => HirLoc::Field(*def_id, *field),
+                Loc::Field(def_id, field) => (HirLoc::Field(*def_id, *field), false),
                 _ => continue,
             };
-            let po = Po {
+            let ty = type_arena.make_ty(permissions, origins, is_param);
+            let po = Pot {
                 permissions,
                 origins,
+                ty,
             };
             loc_to_po.insert(*loc, po);
             let old = hir_loc_to_po.insert(hir_loc, po);
@@ -255,28 +265,236 @@ impl Pass for Transformation {
     }
 }
 
-struct MirVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    nulls: FxHashSet<Location>,
+struct AstVisitor {
+    /// static variable definition's span to its literal
+    static_span_to_lit: FxHashMap<Span, Symbol>,
 }
 
-impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
-    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
-        if let Rvalue::Cast(
-            CastKind::PointerFromExposedAddress,
-            Operand::Constant(box Constant {
-                literal: ConstantKind::Val(ConstValue::Scalar(Scalar::Int(i)), _),
-                ..
-            }),
-            ty,
-        ) = rvalue
+impl<'ast> Visitor<'ast> for AstVisitor {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if let ItemKind::Static(box StaticItem {
+            expr: Some(expr), ..
+        }) = &item.kind
         {
-            if i.try_to_u64() == Ok(0) && compile_util::contains_file_ty(*ty, self.tcx) {
-                self.nulls.insert(location);
+            if let LikelyLit::Lit(lit) = LikelyLit::from_expr(expr) {
+                self.static_span_to_lit.insert(item.span, lit);
             }
         }
-        self.super_rvalue(rvalue, location);
+        visit::walk_item(self, item);
     }
+}
+
+fn remove_cast(expr: &Expr) -> &Expr {
+    let ExprKind::Cast(expr, _) = &expr.kind else { return expr };
+    remove_cast(expr)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Pot<'a> {
+    permissions: &'a BitSet<Permission>,
+    origins: &'a BitSet<Origin>,
+    ty: &'a StreamType<'a>,
+}
+
+struct TypeArena<'a> {
+    arena: &'a Arena<StreamType<'a>>,
+    stdin: &'a StreamType<'a>,
+    stdout: &'a StreamType<'a>,
+    stderr: &'a StreamType<'a>,
+    file: &'a StreamType<'a>,
+    child_stdin: &'a StreamType<'a>,
+    child_stdout: &'a StreamType<'a>,
+}
+
+impl<'a> TypeArena<'a> {
+    #[inline]
+    fn new(arena: &'a Arena<StreamType<'a>>) -> Self {
+        let stdin = arena.alloc(StreamType::Stdin);
+        let stdout = arena.alloc(StreamType::Stdout);
+        let stderr = arena.alloc(StreamType::Stderr);
+        let file = arena.alloc(StreamType::File);
+        let child_stdin = arena.alloc(StreamType::ChildStdin);
+        let child_stdout = arena.alloc(StreamType::ChildStdout);
+        Self {
+            arena,
+            stdin,
+            stdout,
+            stderr,
+            file,
+            child_stdin,
+            child_stdout,
+        }
+    }
+
+    #[inline]
+    fn buf_writer(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(StreamType::BufWriter(ty))
+    }
+
+    #[inline]
+    fn buf_reader(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(StreamType::BufReader(ty))
+    }
+
+    #[inline]
+    fn option(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(StreamType::Option(ty))
+    }
+
+    #[inline]
+    fn ptr(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(StreamType::Ptr(ty))
+    }
+}
+
+impl<'a> TypeArena<'a> {
+    fn alloc(&self, ty: StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(ty)
+    }
+
+    fn make_ty(
+        &self,
+        permissions: &BitSet<Permission>,
+        origins: &BitSet<Origin>,
+        is_param: bool,
+    ) -> &'a StreamType<'a> {
+        if is_param {
+            let mut traits = BitSet8::new_empty();
+            for p in permissions.iter() {
+                match p {
+                    Permission::Read => traits.insert(StreamTrait::Read),
+                    Permission::BufRead => traits.insert(StreamTrait::BufRead),
+                    Permission::Write => traits.insert(StreamTrait::Write),
+                    Permission::Seek => traits.insert(StreamTrait::Seek),
+                    Permission::AsRawFd => traits.insert(StreamTrait::AsRawFd),
+                    Permission::Lock | Permission::Close => {}
+                }
+            }
+            let ty = self.alloc(StreamType::Impl(traits));
+            self.option(ty)
+        } else if origins.is_empty() {
+            self.option(self.file)
+        } else if origins.count() == 1 {
+            let origin = origins.iter().next().unwrap();
+            let ty = match origin {
+                Origin::Stdin => self.stdin,
+                Origin::Stdout => self.stdout,
+                Origin::Stderr => self.stderr,
+                Origin::File => {
+                    if permissions.contains(Permission::Write) {
+                        self.buf_writer(self.file)
+                    // } else if permissions.contains(Permission::Read)
+                    //     || permissions.contains(Permission::BufRead)
+                    // {
+                    //     self.buf_reader(self.file)
+                    } else {
+                        // self.file
+                        self.buf_reader(self.file)
+                    }
+                }
+                Origin::PipeRead => self.child_stdout,
+                Origin::PipeWrite => self.child_stdin,
+                Origin::PipeDyn => todo!(),
+                Origin::Buffer => todo!(),
+            };
+            if permissions.contains(Permission::Close) {
+                self.option(ty)
+            } else {
+                self.ptr(ty)
+            }
+        } else {
+            todo!("{:?}", origins)
+        }
+    }
+}
+
+#[allow(unused_tuple_struct_fields)]
+#[derive(Debug, Clone, Copy)]
+enum StreamType<'a> {
+    File,
+    Stdin,
+    Stdout,
+    Stderr,
+    ChildStdin,
+    ChildStdout,
+    Option(&'a StreamType<'a>),
+    BufWriter(&'a StreamType<'a>),
+    BufReader(&'a StreamType<'a>),
+    Ptr(&'a StreamType<'a>),
+    Impl(BitSet8<StreamTrait>),
+}
+
+impl std::fmt::Display for StreamType<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File => write!(f, "std::fs::File"),
+            Self::Stdin => write!(f, "std::io::Stdin"),
+            Self::Stdout => write!(f, "std::io::Stdout"),
+            Self::Stderr => write!(f, "std::io::Stderr"),
+            Self::ChildStdin => write!(f, "std::process::ChildStdin"),
+            Self::ChildStdout => write!(f, "std::process::ChildStdout"),
+            Self::Option(t) => write!(f, "Option<{}>", t),
+            Self::BufWriter(t) => write!(f, "std::io::BufWriter<{}>", t),
+            Self::BufReader(t) => write!(f, "std::io::BufReader<{}>", t),
+            Self::Ptr(t) => write!(f, "*mut {}", t),
+            Self::Impl(traits) => {
+                for (i, t) in traits.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, " + ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum StreamTrait {
+    Read = 0,
+    BufRead = 1,
+    Write = 2,
+    Seek = 3,
+    AsRawFd = 4,
+}
+
+impl std::fmt::Display for StreamTrait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read => write!(f, "std::io::Read"),
+            Self::BufRead => write!(f, "std::io::BufRead"),
+            Self::Write => write!(f, "std::io::Write"),
+            Self::Seek => write!(f, "std::io::Seek"),
+            Self::AsRawFd => write!(f, "std::os::fd::AsRawFd"),
+        }
+    }
+}
+
+impl StreamTrait {
+    const NUM: usize = 5;
+}
+
+impl Idx for StreamTrait {
+    #[inline]
+    fn new(idx: usize) -> Self {
+        if idx >= Self::NUM {
+            panic!()
+        }
+        unsafe { std::mem::transmute(idx as u8) }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self as _
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Param {
+    func: LocalDefId,
+    index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -405,22 +623,22 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
         match expr.kind {
             hir::ExprKind::Field(e, field) => {
-                let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
-                let ty = typeck.expr_ty(e);
-                let ty::TyKind::Adt(adt_def, _) = ty.kind() else { return };
-                let def_id = some_or!(adt_def.did().as_local(), return);
-                let variant = adt_def.variant(VariantIdx::from_u32(0));
-                let i = variant
-                    .fields
-                    .iter_enumerated()
-                    .find(|(_, f)| f.name == field.name)
-                    .unwrap()
-                    .0;
+                let (adt_def, def_id) = some_or!(adt_of_expr(e, self.tcx), return);
+                let i = some_or!(find_field(field.name, adt_def), return);
                 let loc = HirLoc::Field(def_id, i);
                 self.add_bound(loc, expr.span);
             }
             hir::ExprKind::Assign(lhs, rhs, _) => {
                 self.add_assignment(lhs.span, rhs.span);
+            }
+            hir::ExprKind::Struct(_, fields, _) => {
+                let (adt_def, def_id) = some_or!(adt_of_expr(expr, self.tcx), return);
+                for field in fields {
+                    let i = some_or!(find_field(field.ident.name, adt_def), continue);
+                    let loc = HirLoc::Field(def_id, i);
+                    self.add_bound(loc, field.ident.span);
+                    self.add_assignment(field.ident.span, field.expr.span);
+                }
             }
             _ => {}
         }
@@ -435,37 +653,57 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     }
 }
 
-struct AstVisitor {
-    /// static variable definition's span to its literal
-    static_span_to_lit: FxHashMap<Span, Symbol>,
+#[inline]
+fn adt_of_expr<'tcx>(
+    expr: &hir::Expr<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> Option<(AdtDef<'tcx>, LocalDefId)> {
+    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+    let ty = typeck.expr_ty(expr);
+    let ty::TyKind::Adt(adt_def, _) = ty.kind() else { return None };
+    Some((*adt_def, adt_def.did().as_local()?))
 }
 
-impl<'ast> Visitor<'ast> for AstVisitor {
-    fn visit_item(&mut self, item: &'ast Item) {
-        if let ItemKind::Static(box StaticItem {
-            expr: Some(expr), ..
-        }) = &item.kind
+#[inline]
+fn find_field(field: Symbol, adt_def: AdtDef<'_>) -> Option<FieldIdx> {
+    adt_def
+        .variant(VariantIdx::from_u32(0))
+        .fields
+        .iter_enumerated()
+        .find_map(|(i, f)| if f.name == field { Some(i) } else { None })
+}
+
+struct MirVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    nulls: FxHashSet<Location>,
+}
+
+impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
+    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
+        if let Rvalue::Cast(
+            CastKind::PointerFromExposedAddress,
+            Operand::Constant(box Constant {
+                literal: ConstantKind::Val(ConstValue::Scalar(Scalar::Int(i)), _),
+                ..
+            }),
+            ty,
+        ) = rvalue
         {
-            if let LikelyLit::Lit(lit) = LikelyLit::from_expr(expr) {
-                self.static_span_to_lit.insert(item.span, lit);
+            if i.try_to_u64() == Ok(0) && compile_util::contains_file_ty(*ty, self.tcx) {
+                self.nulls.insert(location);
             }
         }
-        visit::walk_item(self, item);
+        self.super_rvalue(rvalue, location);
     }
-}
-
-fn remove_cast(expr: &Expr) -> &Expr {
-    let ExprKind::Cast(expr, _) = &expr.kind else { return expr };
-    remove_cast(expr)
 }
 
 struct TransformVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
     hir: &'a HirCtx,
     /// location to permissions and origins
-    loc_to_po: &'a FxHashMap<Loc, Po<'a>>,
+    loc_to_po: &'a FxHashMap<Loc, Pot<'a>>,
     /// HIR location to permissions and origins
-    hir_loc_to_po: &'a FxHashMap<HirLoc, Po<'a>>,
+    hir_loc_to_po: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// static variable definition's span to its literal
     static_span_to_lit: &'a FxHashMap<Span, Symbol>,
     /// user-defined API functions' signatures' spans
@@ -513,32 +751,8 @@ impl TransformVisitor<'_, '_> {
 
     fn binding_ty(&self, span: Span) -> Option<Ty> {
         let loc = self.hir.binding_span_to_loc.get(&span)?;
-        let Po {
-            origins,
-            permissions,
-        } = self.hir_loc_to_po.get(loc)?;
-        if origins.is_empty() {
-            return None;
-        }
-        let origins: Vec<_> = origins.iter().collect();
-        let [origin] = &origins[..] else { panic!("{:?}", span) };
-        let ty = match origin {
-            Origin::File => {
-                if permissions.contains(Permission::Write) {
-                    ty!("Option<std::io::BufWriter<std::fs::File>>")
-                } else {
-                    ty!("Option<std::io::BufReader<std::fs::File>>")
-                }
-            }
-            Origin::Stdin => ty!("Option<std::io::Stdin>"),
-            Origin::Stdout => ty!("Option<std::io::Stdout>"),
-            Origin::Stderr => ty!("Option<std::io::Stderr>"),
-            Origin::PipeRead => ty!("Option<std::process::ChildStdout>"),
-            Origin::PipeWrite => ty!("Option<std::process::ChildStdin>"),
-            Origin::PipeDyn => todo!(),
-            Origin::Buffer => todo!(),
-        };
-        Some(ty)
+        let pot = self.hir_loc_to_po.get(loc)?;
+        Some(ty!("{}", pot.ty))
     }
 }
 
