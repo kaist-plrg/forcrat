@@ -306,6 +306,7 @@ fn remove_cast(expr: &Expr) -> &Expr {
 #[derive(Debug, Clone, Copy)]
 struct Pot<'a> {
     permissions: &'a BitSet<Permission>,
+    #[allow(unused)]
     origins: &'a BitSet<Origin>,
     ty: &'a StreamType<'a>,
 }
@@ -355,14 +356,7 @@ impl<'a> TypeArena<'a> {
         if is_param {
             let mut traits = BitSet8::new_empty();
             for p in permissions.iter() {
-                match p {
-                    Permission::Read => traits.insert(StreamTrait::Read),
-                    Permission::BufRead => traits.insert(StreamTrait::BufRead),
-                    Permission::Write => traits.insert(StreamTrait::Write),
-                    Permission::Seek => traits.insert(StreamTrait::Seek),
-                    Permission::AsRawFd => traits.insert(StreamTrait::AsRawFd),
-                    Permission::Lock | Permission::Close => {}
-                }
+                traits.insert(some_or!(StreamTrait::from_permission(p), continue));
             }
             let ty = self.alloc(StreamType::Impl(traits));
             self.option(ty)
@@ -452,94 +446,69 @@ impl std::fmt::Display for StreamType<'_> {
 }
 
 impl StreamType<'_> {
-    fn expr_to_write(self, expr: &str) -> String {
+    fn borrow_expr_for(self, expr: &str, tr: StreamTrait) -> String {
         match self {
-            Self::File | Self::Stdout | Self::Stderr | Self::ChildStdin | Self::BufWriter(_) => {
+            Self::File | Self::Stdout | Self::Stderr | Self::ChildStdin | Self::ChildStdout => {
                 expr.to_string()
             }
+            Self::Stdin => {
+                if tr == StreamTrait::BufRead {
+                    format!("({}).lock()", expr)
+                } else {
+                    expr.to_string()
+                }
+            }
+            Self::BufWriter(t) | Self::BufReader(t) => {
+                if tr == StreamTrait::AsRawFd {
+                    let expr = format!("std::os::fd::AsFd::as_fd(({}).get_ref())", expr);
+                    t.borrow_expr_for(&expr, tr)
+                } else {
+                    expr.to_string()
+                }
+            }
             Self::Impl(traits) => {
-                assert!(traits.contains(StreamTrait::Write));
+                assert!(traits.contains(tr));
                 expr.to_string()
-            }
-            Self::Option(t) => format!("({}).as_mut().unwrap()", t.expr_to_write(expr)),
-            Self::Ptr(t) => format!("&mut *{}", t.expr_to_write(expr)),
-            Self::Stdin | Self::ChildStdout | Self::BufReader(_) => panic!("{}", expr),
-        }
-    }
-
-    fn expr_to_read(self, expr: &str) -> String {
-        match self {
-            Self::File | Self::Stdin | Self::ChildStdout | Self::BufReader(_) => expr.to_string(),
-            Self::Impl(traits) => {
-                assert!(traits.contains(StreamTrait::Read));
-                expr.to_string()
-            }
-            Self::Option(t) => format!("({}).as_mut().unwrap()", t.expr_to_read(expr)),
-            Self::Ptr(t) => format!("&mut *{}", t.expr_to_read(expr)),
-            Self::Stdout | Self::Stderr | Self::ChildStdin | Self::BufWriter(_) => {
-                panic!("{}", expr)
-            }
-        }
-    }
-
-    fn expr_to_buf_read(self, expr: &str) -> (String, bool) {
-        match self {
-            Self::Stdin => (expr.to_string(), true),
-            Self::BufReader(_) => (expr.to_string(), false),
-            Self::Impl(traits) => {
-                assert!(traits.contains(StreamTrait::BufRead));
-                (expr.to_string(), false)
             }
             Self::Option(t) => {
-                let (e, lock) = t.expr_to_buf_read(expr);
-                (format!("({}).as_mut().unwrap()", e), lock)
+                let expr = format!("({}).as_mut().unwrap()", expr);
+                t.borrow_expr_for(&expr, tr)
             }
             Self::Ptr(t) => {
-                let (e, lock) = t.expr_to_buf_read(expr);
-                (format!("&mut *{}", e), lock)
-            }
-            Self::File
-            | Self::Stdout
-            | Self::Stderr
-            | Self::ChildStdin
-            | Self::ChildStdout
-            | Self::BufWriter(_) => panic!("{}", expr),
-        }
-    }
-
-    fn expr_to_seek(self, expr: &str) -> String {
-        match self {
-            Self::File | Self::BufWriter(_) | Self::BufReader(_) => expr.to_string(),
-            Self::Impl(traits) => {
-                assert!(traits.contains(StreamTrait::Seek));
-                expr.to_string()
-            }
-            Self::Option(t) => format!("({}).as_mut().unwrap()", t.expr_to_seek(expr)),
-            Self::Ptr(t) => format!("&mut *{}", t.expr_to_seek(expr)),
-            Self::Stdin | Self::Stdout | Self::Stderr | Self::ChildStdout | Self::ChildStdin => {
-                panic!("{}", expr)
+                let expr = format!("&mut *({})", expr);
+                t.borrow_expr_for(&expr, tr)
             }
         }
     }
 
-    fn expr_to_fd(self, expr: &str) -> String {
+    fn opt_borrow_expr_for(self, expr: &str, tr: StreamTrait) -> String {
         match self {
-            Self::File
-            | Self::Stdin
-            | Self::Stdout
-            | Self::Stderr
-            | Self::ChildStdout
-            | Self::ChildStdin => expr.to_string(),
-            Self::BufWriter(t) | Self::BufReader(t) => format!(
-                "std::os::fd::AsFd::as_fd(({}).get_ref())",
-                t.expr_to_fd(expr)
-            ),
-            Self::Impl(traits) => {
-                assert!(traits.contains(StreamTrait::AsRawFd));
-                expr.to_string()
+            Self::File | Self::Stdout | Self::Stderr | Self::ChildStdin | Self::ChildStdout => {
+                format!("Some({})", expr)
             }
-            Self::Option(t) => format!("({}).as_mut().unwrap()", t.expr_to_fd(expr)),
-            Self::Ptr(t) => format!("&mut *{}", t.expr_to_fd(expr)),
+            Self::Stdin => {
+                if tr == StreamTrait::BufRead {
+                    format!("Some(({}).lock())", expr)
+                } else {
+                    format!("Some({})", expr)
+                }
+            }
+            Self::BufWriter(t) | Self::BufReader(t) => {
+                if tr == StreamTrait::AsRawFd {
+                    let expr = format!("std::os::fd::AsFd::as_fd(({}).get_ref())", expr);
+                    t.opt_borrow_expr_for(&expr, tr)
+                } else {
+                    format!("Some({})", expr)
+                }
+            }
+            Self::Impl(traits) => {
+                assert!(traits.contains(tr));
+                format!("Some({})", expr)
+            }
+            Self::Option(t) | Self::Ptr(t) => {
+                let body = t.opt_borrow_expr_for("x", tr);
+                format!("({}).as_mut().and_then(|x| {})", expr, body)
+            }
         }
     }
 
@@ -574,33 +543,13 @@ trait StreamExpr {
     fn ty(&self) -> StreamType<'_>;
 
     #[inline]
-    fn write_expr(&self) -> String {
-        self.ty().expr_to_write(&self.expr())
+    fn borrow_for(&self, tr: StreamTrait) -> String {
+        self.ty().borrow_expr_for(&self.expr(), tr)
     }
 
     #[inline]
-    fn read_expr(&self) -> String {
-        self.ty().expr_to_read(&self.expr())
-    }
-
-    #[inline]
-    fn buf_read_def(&self, id: &str) -> String {
-        let (stream, lock) = self.ty().expr_to_buf_read(&self.expr());
-        if lock {
-            format!("let mut {0} = {1}; let mut {0} = {0}.lock();", id, stream)
-        } else {
-            format!("let mut {} = {};", id, stream)
-        }
-    }
-
-    #[inline]
-    fn seek_expr(&self) -> String {
-        self.ty().expr_to_seek(&self.expr())
-    }
-
-    #[inline]
-    fn fd_expr(&self) -> String {
-        self.ty().expr_to_fd(&self.expr())
+    fn opt_borrow_for(&self, tr: StreamTrait) -> String {
+        self.ty().opt_borrow_expr_for(&self.expr(), tr)
     }
 }
 
@@ -702,6 +651,17 @@ impl std::fmt::Display for StreamTrait {
 
 impl StreamTrait {
     const NUM: usize = 5;
+
+    fn from_permission(p: Permission) -> Option<Self> {
+        match p {
+            Permission::Read => Some(Self::Read),
+            Permission::BufRead => Some(Self::BufRead),
+            Permission::Write => Some(Self::Write),
+            Permission::Seek => Some(Self::Seek),
+            Permission::AsRawFd => Some(Self::AsRawFd),
+            Permission::Lock | Permission::Close => None,
+        }
+    }
 }
 
 impl Idx for StreamTrait {
@@ -957,7 +917,7 @@ struct TransformVisitor<'tcx, 'a> {
     updated_field_spans: FxHashSet<Span>,
 }
 
-impl TransformVisitor<'_, '_> {
+impl<'a> TransformVisitor<'_, 'a> {
     #[inline]
     fn is_unsupported(&self, expr: &Expr) -> bool {
         self.unsupported.contains(&expr.span) || self.unsupported.contains(&remove_cast(expr).span)
@@ -985,7 +945,13 @@ impl TransformVisitor<'_, '_> {
     }
 
     #[inline]
-    fn bound_pot(&self, span: Span) -> Option<&Pot<'_>> {
+    fn param_pot(&self, param: Param) -> Option<&'a Pot<'a>> {
+        let loc = self.param_to_loc.get(&param)?;
+        self.loc_to_pot.get(loc)
+    }
+
+    #[inline]
+    fn bound_pot(&self, span: Span) -> Option<&'a Pot<'a>> {
         let loc = self.hir.bound_span_to_loc.get(&span)?;
         self.loc_to_pot.get(loc)
     }
@@ -1042,11 +1008,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     continue;
                 }
                 let p = Param::new(def_id, i);
-                let loc = some_or!(self.param_to_loc.get(&p), continue);
-                let po = some_or!(self.loc_to_pot.get(loc), continue);
+                let pot = some_or!(self.param_pot(p), continue);
                 *param.ty = ty!("Option<TT{}>", i);
                 self.updated = true;
-                tparams.push((i, po));
+                tparams.push((i, pot));
             }
             for (i, po) in tparams {
                 let tparam = if po.permissions.is_empty() {
@@ -1278,38 +1243,39 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             return;
                         };
                         let hir::ItemKind::Fn(sig, _, _) = item.kind else { panic!() };
-                        let mut none = false;
+                        let mut targs = vec![];
                         for (i, arg) in args[..sig.decl.inputs.len()].iter_mut().enumerate() {
                             if self.is_unsupported(arg) {
                                 continue;
                             }
-                            let param = Param::new(*def_id, i);
-                            let loc = some_or!(self.param_to_loc.get(&param), continue);
-                            let po = some_or!(self.loc_to_pot.get(loc), continue);
-                            let a = pprust::expr_to_string(arg);
-                            let new_expr = if po.permissions.contains(Permission::AsRawFd) {
-                                if self
-                                    .hir
-                                    .bound_span_to_loc
-                                    .get(&arg.span)
-                                    .and_then(|loc| self.loc_to_pot.get(loc))
-                                    .map_or_else(|| false, |po| po.origins.contains(Origin::File))
-                                {
-                                    expr!("({}).as_ref().map(|b| std::os::fd::AsFd::as_fd(b.get_ref()))", a)
+                            let p = Param::new(*def_id, i);
+                            let param_pot = some_or!(self.param_pot(p), continue);
+                            let permissions = param_pot.permissions;
+                            assert!(!permissions.contains(Permission::Close));
+                            if self.null_casts.contains(&arg.span) {
+                                self.replace_expr(arg, expr!("None"));
+                                let targ = if permissions.contains(Permission::BufRead) {
+                                    "std::io::BufReader<std::fs::File>"
                                 } else {
-                                    expr!("({}).as_mut()", a)
-                                }
+                                    "std::fs::File"
+                                };
+                                targs.push(targ);
                             } else {
-                                expr!("({}).as_mut()", a)
-                            };
-                            self.replace_expr(arg, new_expr);
-                            if a == "None" {
-                                none = true;
+                                let arg_pot = self.bound_pot(arg.span).unwrap();
+                                let permission = permissions
+                                    .iter()
+                                    .find(|p| !matches!(p, Permission::Lock | Permission::Close))
+                                    .unwrap();
+                                let stream = TypedExpr::new(arg, arg_pot.ty);
+                                let tr = StreamTrait::from_permission(permission).unwrap();
+                                let new_arg = stream.opt_borrow_for(tr);
+                                self.replace_expr(arg, expr!("{}", new_arg));
+                                targs.push("_");
                             }
                         }
-                        if none {
+                        if targs.iter().any(|targ| *targ != "_") {
                             let c = pprust::expr_to_string(callee);
-                            let new_expr = expr!("{}::<&mut std::fs::File>", c);
+                            let new_expr = expr!("{}::<{}>", c, targs.join(", "));
                             self.replace_expr(callee, new_expr);
                         }
                     }
@@ -1473,7 +1439,7 @@ fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
     fmt: &Expr,
     args: &[E],
 ) -> Expr {
-    let stream_def = stream.buf_read_def("stream");
+    let stream = stream.borrow_for(StreamTrait::BufRead);
     let fmt = LikelyLit::from_expr(fmt);
     match fmt {
         LikelyLit::Lit(fmt) => {
@@ -1550,12 +1516,12 @@ fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
             expr!(
                 "{{
     use std::io::BufRead;
-    {}
+    let mut stream = {};
     let mut count = 0i32;
     {}
     count
 }}",
-                stream_def,
+                stream,
                 code
             )
         }
@@ -1567,7 +1533,7 @@ fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
 
 #[inline]
 fn transform_fgetc<S: StreamExpr>(stream: &S) -> Expr {
-    let stream = stream.read_expr();
+    let stream = stream.borrow_for(StreamTrait::Read);
     expr!(
         "{{
     use std::io::Read;
@@ -1580,13 +1546,13 @@ fn transform_fgetc<S: StreamExpr>(stream: &S) -> Expr {
 
 #[inline]
 fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr) -> Expr {
-    let stream_def = stream.buf_read_def("stream");
+    let stream = stream.borrow_for(StreamTrait::BufRead);
     let s = pprust::expr_to_string(s);
     let n = pprust::expr_to_string(n);
     expr!(
         "{{
     use std::io::BufRead;
-    {}
+    let mut stream = {};
     let s = {};
     let n = ({}) as usize;
     let buf: &mut [u8] = std::slice::from_raw_parts_mut(s as _, n);
@@ -1616,7 +1582,7 @@ fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr) -> Expr {
         s
     }}
 }}",
-        stream_def,
+        stream,
         s,
         n
     )
@@ -1624,7 +1590,7 @@ fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr) -> Expr {
 
 #[inline]
 fn transform_fread<S: StreamExpr>(stream: &S, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
-    let stream = stream.read_expr();
+    let stream = stream.borrow_for(StreamTrait::Read);
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
@@ -1652,7 +1618,7 @@ fn transform_fread<S: StreamExpr>(stream: &S, ptr: &Expr, size: &Expr, nitems: &
 
 #[inline]
 fn transform_feof<S: StreamExpr>(stream: &S) -> Expr {
-    let stream = stream.read_expr();
+    let stream = stream.borrow_for(StreamTrait::Read);
     expr!(
         "{{
     use std::io::Read;
@@ -1717,7 +1683,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
             _ => write!(new_args, "({}) as {}, ", arg, cast).unwrap(),
         }
     }
-    let stream = stream.write_expr();
+    let stream = stream.borrow_for(StreamTrait::Write);
     expr!(
         "{{
     use std::io::Write;
@@ -1731,7 +1697,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
 
 #[inline]
 fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr) -> Expr {
-    let stream = stream.write_expr();
+    let stream = stream.borrow_for(StreamTrait::Write);
     let c = pprust::expr_to_string(c);
     expr!(
         "{{
@@ -1746,7 +1712,7 @@ fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr) -> Expr {
 
 #[inline]
 fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr) -> Expr {
-    let stream = stream.write_expr();
+    let stream = stream.borrow_for(StreamTrait::Write);
     let s = pprust::expr_to_string(s);
     expr!(
         "{{
@@ -1761,7 +1727,7 @@ fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr) -> Expr {
 
 #[inline]
 fn transform_fwrite<S: StreamExpr>(stream: &S, ptr: &Expr, size: &Expr, nitems: &Expr) -> Expr {
-    let stream = stream.write_expr();
+    let stream = stream.borrow_for(StreamTrait::Write);
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
@@ -1789,7 +1755,7 @@ fn transform_fwrite<S: StreamExpr>(stream: &S, ptr: &Expr, size: &Expr, nitems: 
 
 #[inline]
 fn transform_fflush<S: StreamExpr>(stream: &S) -> Expr {
-    let stream = stream.write_expr();
+    let stream = stream.borrow_for(StreamTrait::Write);
     expr!(
         "{{
     use std::io::Write;
@@ -1817,7 +1783,7 @@ fn transform_puts(s: &Expr) -> Expr {
 
 #[inline]
 fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr {
-    let stream = stream.seek_expr();
+    let stream = stream.borrow_for(StreamTrait::Seek);
     let off = pprust::expr_to_string(off);
     let whence = LikelyLit::from_expr(whence);
     match whence {
@@ -1846,7 +1812,7 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
 
 #[inline]
 fn transform_ftell<S: StreamExpr>(stream: &S) -> Expr {
-    let stream = stream.seek_expr();
+    let stream = stream.borrow_for(StreamTrait::Seek);
     expr!(
         "{{
     use std::io::Seek;
@@ -1858,7 +1824,7 @@ fn transform_ftell<S: StreamExpr>(stream: &S) -> Expr {
 
 #[inline]
 fn transform_rewind<S: StreamExpr>(stream: &S) -> Expr {
-    let stream = stream.seek_expr();
+    let stream = stream.borrow_for(StreamTrait::Seek);
     expr!(
         "{{
     use std::io::Seek;
@@ -1870,7 +1836,7 @@ fn transform_rewind<S: StreamExpr>(stream: &S) -> Expr {
 
 #[inline]
 fn transform_fileno<S: StreamExpr>(stream: &S) -> Expr {
-    let stream = stream.fd_expr();
+    let stream = stream.borrow_for(StreamTrait::AsRawFd);
     expr!(
         "{{
     use std::os::fd::AsRawFd;
