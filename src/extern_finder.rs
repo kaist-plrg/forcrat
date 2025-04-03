@@ -11,7 +11,6 @@ use rustc_hir::{
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::Symbol;
-use tracing::info;
 
 use crate::compile_util::Pass;
 
@@ -161,7 +160,7 @@ impl<'tcx> ExternVisitor<'tcx> {
                     if self.is_std_io(arg) {
                         continue;
                     }
-                    info!(
+                    tracing::info!(
                         "{}",
                         self.tcx
                             .sess
@@ -254,7 +253,7 @@ impl<'tcx> ExternVisitor<'tcx> {
         let mut visitor = TyVisitor::new(self.tcx);
         visitor.visit_ty(ty);
         if visitor.has_file {
-            info!(
+            tracing::info!(
                 "{}",
                 self.tcx.sess.source_map().span_to_snippet(ty.span).unwrap()
             );

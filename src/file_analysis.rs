@@ -25,7 +25,6 @@ use rustc_middle::{
     ty::{List, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_span::Span;
-use tracing::info;
 use typed_arena::Arena;
 
 use crate::{
@@ -75,14 +74,14 @@ impl Pass for FileAnalysis {
         drop(krate_ref);
 
         let steensgaard = steensgaard::Steensgaard.run(tcx);
-        info!("\n{:?}", steensgaard);
+        tracing::info!("\n{:?}", steensgaard);
         let hir = tcx.hir();
 
         // let mut visitor = StdioArgVisitor::new(tcx);
         // hir.visit_all_item_likes_in_crate(&mut visitor);
         // let stdio_args = visitor.stdio_args;
         // for span in &stdio_args {
-        //     info!("{:?}", span);
+        //     tracing::info!("{:?}", span);
         // }
 
         // let mut stdio_arg_locs: FxHashSet<Loc> = FxHashSet::default();
@@ -142,10 +141,10 @@ impl Pass for FileAnalysis {
         }
 
         for (i, fs) in &fn_ty_functions {
-            info!("{:?}: {:?}", i, fs);
+            tracing::info!("{:?}: {:?}", i, fs);
         }
         for (i, loc) in locs.iter_enumerated() {
-            info!("{:?}: {:?}", i, loc);
+            tracing::info!("{:?}: {:?}", i, loc);
         }
         let loc_ind_map: FxHashMap<_, _> = locs.iter_enumerated().map(|(i, l)| (*l, i)).collect();
 
@@ -179,17 +178,17 @@ impl Pass for FileAnalysis {
                 ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
                 _ => continue,
             };
-            info!("{:?}", local_def_id);
+            tracing::info!("{:?}", local_def_id);
             let ctx = Ctx {
                 function: local_def_id,
                 local_decls: &body.local_decls,
             };
             for bbd in body.basic_blocks.iter() {
                 for stmt in &bbd.statements {
-                    info!("{:?}", stmt);
+                    tracing::info!("{:?}", stmt);
                     analyzer.transfer_stmt(stmt, ctx);
                 }
-                info!("{:?}", bbd.terminator().kind);
+                tracing::info!("{:?}", bbd.terminator().kind);
                 analyzer.transfer_term(bbd.terminator(), ctx);
             }
         }
@@ -200,17 +199,17 @@ impl Pass for FileAnalysis {
         for (((i, loc), permissions), origins) in
             locs.iter_enumerated().zip(&permissions).zip(&origins)
         {
-            info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
+            tracing::info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
         }
 
         let unsupported = analyzer.unsupported.compute_all(locs.len());
         if unsupported.is_empty() {
-            info!("No unsupported locations");
+            tracing::info!("No unsupported locations");
         } else {
-            info!("Unsupported locations:");
+            tracing::info!("Unsupported locations:");
         }
         for loc_id in unsupported.iter() {
-            info!("{:?}", locs[loc_id]);
+            tracing::info!("{:?}", locs[loc_id]);
         }
 
         AnalysisResult {
@@ -487,19 +486,19 @@ impl<'tcx> Analyzer<'_, 'tcx> {
 
     #[inline]
     fn add_permission(&mut self, loc: LocId, permission: Permission) {
-        info!("{:?} {:?}", loc, permission);
+        tracing::info!("{:?} {:?}", loc, permission);
         self.permission_graph.add_solution(loc, permission);
     }
 
     #[inline]
     fn add_origin(&mut self, loc: LocId, origin: Origin) {
-        info!("{:?} {:?}", loc, origin);
+        tracing::info!("{:?} {:?}", loc, origin);
         self.origin_graph.add_solution(loc, origin);
     }
 
     #[inline]
     fn assign(&mut self, lhs: LocId, rhs: LocId, v: Variance) {
-        info!("{:?} := {:?} {:?}", lhs, rhs, v);
+        tracing::info!("{:?} := {:?} {:?}", lhs, rhs, v);
         match v {
             Variance::Covariant => {
                 self.permission_graph.add_edge(lhs, rhs);
