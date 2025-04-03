@@ -28,6 +28,15 @@ impl<T: Idx> BitSet8<T> {
     }
 
     #[inline]
+    pub fn new<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut set = Self::new_empty();
+        for elem in iter {
+            set.insert(elem);
+        }
+        set
+    }
+
+    #[inline]
     pub fn clear(&mut self) {
         self.word = 0;
     }

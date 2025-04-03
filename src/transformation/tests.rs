@@ -819,6 +819,40 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_nested_calls() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    fputc('a' as i32, stream);
+    fputc('a' as i32, stream);
+}
+unsafe fn f(mut stream: *mut FILE) {
+    g(stream);
+    g(stream);
+}"#,
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
+fn test_std_arg() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    fputc('a' as i32, stream);
+    fputc('a' as i32, stream);
+}
+unsafe fn f() {
+    g(stdout);
+    g(stdout);
+}"#,
+        &["Write", "write_all", "std::io::stdout"],
+        &["FILE", "fputc"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

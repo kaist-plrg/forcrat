@@ -388,6 +388,7 @@ enum StreamType<'a> {
     BufWriter(&'a StreamType<'a>),
     BufReader(&'a StreamType<'a>),
     Ptr(&'a StreamType<'a>),
+    Ref(&'a StreamType<'a>),
     Impl(BitSet8<StreamTrait>),
 }
 
@@ -411,6 +412,7 @@ impl std::fmt::Display for StreamType<'_> {
             Self::BufWriter(t) => write!(f, "std::io::BufWriter<{}>", t),
             Self::BufReader(t) => write!(f, "std::io::BufReader<{}>", t),
             Self::Ptr(t) => write!(f, "*mut {}", t),
+            Self::Ref(t) => write!(f, "&mut {}", t),
             Self::Impl(traits) => {
                 for (i, t) in traits.iter().enumerate() {
                     if i != 0 {
@@ -424,154 +426,141 @@ impl std::fmt::Display for StreamType<'_> {
     }
 }
 
-impl StreamType<'_> {
-    fn borrow_expr_for(self, expr: &str, tr: StreamTrait) -> String {
-        match self {
-            Self::File | Self::Stdout | Self::Stderr | Self::ChildStdin | Self::ChildStdout => {
-                if tr == StreamTrait::AsRawFd {
-                    format!("std::os::fd::AsFd::as_fd({})", expr)
-                } else {
-                    expr.to_string()
-                }
+fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: bool) -> String {
+    tracing::info!("{} := {} // {}", to, from, consume);
+    if to == from && (consume || from.is_copyable()) {
+        return expr.to_string();
+    }
+    use StreamType::*;
+    match (to, from) {
+        (Option(to), Option(from)) => {
+            if consume {
+                let body = convert_expr(*to, *from, "x", true);
+                format!("({}).map(|x| {})", expr, body)
+            } else {
+                let body = convert_expr(*to, Ref(from), "x", true);
+                format!("({}).as_mut().map(|x| {})", expr, body)
             }
-            Self::Stdin => {
-                if tr == StreamTrait::BufRead {
-                    format!("({}).lock()", expr)
-                } else {
-                    expr.to_string()
-                }
+        }
+        (Ptr(to), Option(from)) if to == from => {
+            format!(
+                "({}).as_mut().map_or(std::ptr::null_mut(), |r| r as *mut _)",
+                expr
+            )
+        }
+        (to, Option(from)) if to == *from => {
+            if consume {
+                format!("({}).unwrap()", expr)
+            } else {
+                format!("({}).as_mut().unwrap()", expr)
             }
-            Self::BufWriter(t) | Self::BufReader(t) => {
-                if tr == StreamTrait::AsRawFd {
-                    let expr = format!("({}).get_ref()", expr);
-                    t.borrow_expr_for(&expr, tr)
-                } else {
-                    expr.to_string()
-                }
+        }
+        (to, Option(from)) => {
+            if consume {
+                let unwrapped = format!("({}).unwrap()", expr);
+                convert_expr(to, *from, &unwrapped, true)
+            } else {
+                let unwrapped = format!("({}).as_mut().unwrap()", expr);
+                convert_expr(to, Ref(from), &unwrapped, true)
             }
-            Self::Impl(traits) => {
-                assert!(traits.contains(tr));
+        }
+        (Option(to), from) => {
+            let converted = convert_expr(*to, from, expr, consume);
+            format!("Some({})", converted)
+        }
+        (Impl(traits), File | Stdout | Stderr | ChildStdin | ChildStdout) => {
+            if consume {
+                expr.to_string()
+            } else if traits.contains(StreamTrait::AsRawFd) {
+                format!("std::os::fd::AsFd::as_fd(&({}))", expr)
+            } else {
+                format!("&mut ({})", expr)
+            }
+        }
+        (
+            Impl(traits),
+            Ref(File) | Ref(Stdout) | Ref(Stderr) | Ref(ChildStdin) | Ref(ChildStdout),
+        ) => {
+            if traits.contains(StreamTrait::AsRawFd) {
+                format!("std::os::fd::AsFd::as_fd({})", expr)
+            } else {
                 expr.to_string()
             }
-            Self::Option(t) => {
-                let expr = format!("({}).as_mut().unwrap()", expr);
-                t.borrow_expr_for(&expr, tr)
-            }
-            Self::Ptr(t) => {
-                let expr = format!("&mut *({})", expr);
-                t.borrow_expr_for(&expr, tr)
+        }
+        (Impl(traits), Stdin) => {
+            if traits.contains(StreamTrait::BufRead) {
+                format!("({}).lock()", expr)
+            } else if consume {
+                expr.to_string()
+            } else if traits.contains(StreamTrait::AsRawFd) {
+                format!("std::os::fd::AsFd::as_fd(&({}))", expr)
+            } else {
+                format!("&mut ({})", expr)
             }
         }
+        (Impl(traits), BufWriter(from) | BufReader(from)) => {
+            if traits.contains(StreamTrait::AsRawFd) {
+                if consume {
+                    let inner = format!("({}).into_inner().unwrap()", expr);
+                    convert_expr(to, *from, &inner, true)
+                } else {
+                    let inner = format!("({}).get_mut()", expr);
+                    convert_expr(to, Ref(from), &inner, true)
+                }
+            } else if consume {
+                expr.to_string()
+            } else {
+                format!("&mut ({})", expr)
+            }
+        }
+        (Impl(traits), Ref(BufWriter(from)) | Ref(BufReader(from))) => {
+            if traits.contains(StreamTrait::AsRawFd) {
+                let inner = format!("({}).get_mut()", expr);
+                convert_expr(to, Ref(from), &inner, true)
+            } else {
+                expr.to_string()
+            }
+        }
+        (Impl(_), Ptr(from)) => {
+            let r = format!("({}).as_mut()", expr);
+            let from = Ref(from);
+            convert_expr(to, Option(&from), &r, true)
+        }
+        (Impl(_), Ref(Impl(_))) => {
+            if consume {
+                expr.to_string()
+            } else {
+                format!("&mut *({})", expr)
+            }
+        }
+        (BufWriter(to), from) if *to == from => {
+            assert!(consume);
+            format!("std::io::BufWriter::new({})", expr)
+        }
+        (BufReader(to), from) if *to == from => {
+            assert!(consume);
+            format!("std::io::BufReader::new({})", expr)
+        }
+        _ => panic!("{} := {} // {}", to, from, consume),
     }
+}
 
-    fn opt_borrow_expr_for(self, expr: &str, tr: StreamTrait) -> String {
+impl StreamType<'_> {
+    fn is_copyable(self) -> bool {
         match self {
-            Self::File | Self::Stdout | Self::Stderr | Self::ChildStdin | Self::ChildStdout => {
-                if tr == StreamTrait::AsRawFd {
-                    format!("Some(std::os::fd::AsFd::as_fd({}))", expr)
-                } else {
-                    format!("Some({})", expr)
-                }
-            }
-            Self::Stdin => {
-                if tr == StreamTrait::BufRead {
-                    format!("Some(({}).lock())", expr)
-                } else {
-                    format!("Some({})", expr)
-                }
-            }
-            Self::BufWriter(t) | Self::BufReader(t) => {
-                if tr == StreamTrait::AsRawFd {
-                    let expr = format!("({}).get_ref()", expr);
-                    t.opt_borrow_expr_for(&expr, tr)
-                } else {
-                    format!("Some({})", expr)
-                }
-            }
-            Self::Impl(traits) => {
-                assert!(traits.contains(tr));
-                format!("Some({})", expr)
-            }
-            Self::Option(t) | Self::Ptr(t) => {
-                let body = t.opt_borrow_expr_for("x", tr);
-                if body == "Some(x)" {
-                    format!("({}).as_mut()", expr)
-                } else if body.starts_with("Some(") {
-                    let body = body
-                        .strip_prefix("Some(")
-                        .unwrap()
-                        .strip_suffix(')')
-                        .unwrap();
-                    format!("({}).as_mut().map(|x| {})", expr, body)
-                } else {
-                    format!("({}).as_mut().and_then(|x| {})", expr, body)
-                }
-            }
+            Self::File
+            | Self::Stdin
+            | Self::Stdout
+            | Self::Stderr
+            | Self::ChildStdin
+            | Self::ChildStdout
+            | Self::BufWriter(_)
+            | Self::BufReader(_)
+            | Self::Impl(_) => false,
+            Self::Ref(_) => false,
+            Self::Ptr(_) => true,
+            Self::Option(t) => t.is_copyable(),
         }
-    }
-
-    fn assign_to(self, rty: StreamType<'_>, rhs: &str) -> String {
-        if self == rty {
-            return rhs.to_string();
-        }
-        use StreamType::*;
-        match (self, rty) {
-            (BufWriter(t1), t2) => {
-                let expr = t1.assign_to(t2, rhs);
-                format!("std::io::BufWriter::new({})", expr)
-            }
-            (BufReader(t1), t2) => {
-                let expr = t1.assign_to(t2, rhs);
-                format!("std::io::BufReader::new({})", expr)
-            }
-            (Option(t1), Option(t2)) => {
-                let body = t1.assign_to(*t2, "x");
-                format!("({}).map(|x| {})", rhs, body)
-            }
-            (Ptr(t1), Option(_)) => {
-                let expr = Option(t1).assign_to(rty, rhs);
-                format!(
-                    "({}).as_mut().map_or(std::ptr::null_mut(), |r| r as *mut _)",
-                    expr
-                )
-            }
-            _ => todo!("{} := {}", self, rty),
-        }
-        //     (
-        //         File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout,
-        //         BufWriter(t) | BufReader(t),
-        //     ) => {
-        //         let expr = format!("({}).into_inner().unwrap()", rhs);
-        //         t.assign_to(self, &expr)
-        //     }
-        //     (
-        //         File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_)
-        //         | BufReader(_) | Impl(_),
-        //         Option(t),
-        //     ) => {
-        //         let expr = format!("({}).unwrap()", rhs);
-        //         t.assign_to(self, &expr)
-        //     }
-
-        //     (Option(t1), t2) => {
-        //         let expr = t1.assign_to(t2, rhs);
-        //         format!("Some({})", expr)
-        //     }
-
-        //     (Ptr(t1), t2) => {
-        //         let expr = t1.assign_to(t2, rhs);
-        //         format!("&mut ({})", expr)
-        //     }
-
-        //     (Impl(traits1), Impl(traits2)) => {
-        //         if traits2.superset(&traits1) {
-        //             rhs.to_string()
-        //         } else {
-        //             panic!()
-        //         }
-        //     }
-        //     (Impl(_), _) => rhs.to_string(),
-        // }
     }
 }
 
@@ -581,12 +570,15 @@ trait StreamExpr {
 
     #[inline]
     fn borrow_for(&self, tr: StreamTrait) -> String {
-        self.ty().borrow_expr_for(&self.expr(), tr)
+        let to = StreamType::Impl(BitSet8::new([tr]));
+        convert_expr(to, self.ty(), &self.expr(), false)
     }
 
     #[inline]
     fn opt_borrow_for(&self, tr: StreamTrait) -> String {
-        self.ty().opt_borrow_expr_for(&self.expr(), tr)
+        let ty = StreamType::Impl(BitSet8::new([tr]));
+        let to = StreamType::Option(&ty);
+        convert_expr(to, self.ty(), &self.expr(), false)
     }
 }
 
@@ -1367,7 +1359,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let lhs_pot = some_or!(self.bound_pot(lhs.span), return);
                 let rhs_pot = some_or!(self.bound_pot(rhs.span), return);
                 let rhs_str = pprust::expr_to_string(rhs);
-                let new_rhs = expr!("{}", lhs_pot.ty.assign_to(*rhs_pot.ty, &rhs_str));
+                let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, false);
+                let new_rhs = expr!("{}", new_rhs);
                 self.replace_expr(rhs, new_rhs);
             }
             ExprKind::Struct(se) => {
@@ -1375,7 +1368,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let lhs_pot = some_or!(self.bound_pot(f.ident.span), return);
                     let rhs_pot = some_or!(self.bound_pot(f.expr.span), return);
                     let rhs_str = pprust::expr_to_string(&f.expr);
-                    let new_rhs = expr!("{}", lhs_pot.ty.assign_to(*rhs_pot.ty, &rhs_str));
+                    let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, false);
+                    let new_rhs = expr!("{}", new_rhs);
                     self.replace_expr(&mut f.expr, new_rhs);
                 }
             }
@@ -1456,7 +1450,8 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
         LikelyLit::Path(_) => todo!(),
         LikelyLit::Other(_) => todo!(),
     };
-    expr!("{}", pot.ty.assign_to(ty, &expr))
+    let new_expr = convert_expr(*pot.ty, ty, &expr, true);
+    expr!("{}", new_expr)
 }
 
 fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
