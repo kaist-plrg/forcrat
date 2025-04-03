@@ -759,34 +759,65 @@ unsafe fn f() {
     );
 }
 
-// #[test]
-// fn test_field_borrowed() {
-//     run_test(
-//         r#"
-// #[derive(Copy, Clone)]
-// #[repr(C)]
-// struct s {
-//     pub f: *mut FILE,
-// }
-// unsafe fn g(mut s: *mut s) {
-//     fgetc((*s).f);
-//     fgetc((*s).f);
-// }
-// unsafe fn f() {
-//     let mut stream: *mut FILE = fopen(
-//         b"a\0" as *const u8 as *const libc::c_char,
-//         b"r\0" as *const u8 as *const libc::c_char,
-//     );
-//     let mut s: s = s { f: 0 as *mut FILE };
-//     s.f = stream;
-//     g(&mut s);
-//     g(&mut s);
-//     fclose(stream);
-// }"#,
-//         &["File", "open", "Read", "read_exact", "drop"],
-//         &["FILE", "fopen", "fgetc", "fclose"],
-//     );
-// }
+#[test]
+fn test_field_borrowed() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    pub f: *mut FILE,
+}
+unsafe fn g(mut s: *mut s) {
+    fgetc((*s).f);
+    fgetc((*s).f);
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut s: s = s { f: 0 as *mut FILE };
+    s.f = stream;
+    g(&mut s);
+    g(&mut s);
+    fclose(stream);
+}"#,
+        &["File", "open", "Read", "read_exact", "drop"],
+        &["FILE", "fopen", "fgetc", "fclose"],
+    );
+}
+
+#[test]
+fn test_field_borrowed_init() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    pub f: *mut FILE,
+}
+unsafe fn g(mut s: *mut s) {
+    fgetc((*s).f);
+    fgetc((*s).f);
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut s: s = {
+        let mut init = s { f: stream };
+        init
+    };
+    g(&mut s);
+    g(&mut s);
+    fclose(stream);
+}"#,
+        &["File", "open", "Read", "read_exact", "drop"],
+        &["FILE", "fopen", "fgetc", "fclose"],
+    );
+}
 
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]

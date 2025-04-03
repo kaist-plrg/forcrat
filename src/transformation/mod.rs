@@ -528,6 +528,13 @@ impl StreamType<'_> {
                 let body = t1.assign_to(*t2, "x");
                 format!("({}).map(|x| {})", rhs, body)
             }
+            (Ptr(t1), Option(_)) => {
+                let expr = Option(t1).assign_to(rty, rhs);
+                format!(
+                    "({}).as_mut().map_or(std::ptr::null_mut(), |r| r as *mut _)",
+                    expr
+                )
+            }
             _ => todo!("{} := {}", self, rty),
         }
         //     (
@@ -551,13 +558,6 @@ impl StreamType<'_> {
         //         format!("Some({})", expr)
         //     }
 
-        //     (Ptr(t1), Ptr(t2)) => {
-        //         if t1 == t2 {
-        //             rhs.to_string()
-        //         } else {
-        //             panic!()
-        //         }
-        //     }
         //     (Ptr(t1), t2) => {
         //         let expr = t1.assign_to(t2, rhs);
         //         format!("&mut ({})", expr)
@@ -1347,10 +1347,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     _ => panic!(),
                 }
             }
-            ExprKind::Assign(lhs, rhs, _) => {
-                let _lhs_pot = some_or!(self.bound_pot(lhs.span), return);
-                let _rhs_pot = some_or!(self.bound_pot(rhs.span), return);
-            }
             ExprKind::Cast(_, _) => {
                 let lhs = some_or!(self.hir.rhs_to_lhs.get(&expr_span), return);
                 if self.unsupported.contains(lhs) {
@@ -1361,8 +1357,26 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     StreamType::Option(_) => {
                         self.replace_expr(expr, expr!("None"));
                     }
-                    StreamType::Ptr(_) => {}
+                    StreamType::Ptr(_) => {
+                        self.replace_expr(expr, expr!("std::ptr::null_mut()"));
+                    }
                     _ => panic!(),
+                }
+            }
+            ExprKind::Assign(lhs, rhs, _) => {
+                let lhs_pot = some_or!(self.bound_pot(lhs.span), return);
+                let rhs_pot = some_or!(self.bound_pot(rhs.span), return);
+                let rhs_str = pprust::expr_to_string(rhs);
+                let new_rhs = expr!("{}", lhs_pot.ty.assign_to(*rhs_pot.ty, &rhs_str));
+                self.replace_expr(rhs, new_rhs);
+            }
+            ExprKind::Struct(se) => {
+                for f in se.fields.iter_mut() {
+                    let lhs_pot = some_or!(self.bound_pot(f.ident.span), return);
+                    let rhs_pot = some_or!(self.bound_pot(f.expr.span), return);
+                    let rhs_str = pprust::expr_to_string(&f.expr);
+                    let new_rhs = expr!("{}", lhs_pot.ty.assign_to(*rhs_pot.ty, &rhs_str));
+                    self.replace_expr(&mut f.expr, new_rhs);
                 }
             }
             _ => {}
