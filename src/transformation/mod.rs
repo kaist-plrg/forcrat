@@ -12,7 +12,7 @@ use rustc_ast::{
 use rustc_ast_pretty::pprust;
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{self as hir, def::Res, intravisit, HirId};
+use rustc_hir::{self as hir, def::Res, intravisit, HirId, QPath};
 use rustc_index::{bit_set::BitSet, Idx};
 use rustc_lexer::unescape;
 use rustc_middle::{
@@ -564,27 +564,71 @@ impl StreamType<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IndicatorCheck<'a> {
+    name: &'a str,
+    eof: bool,
+    error: bool,
+}
+
+impl IndicatorCheck<'_> {
+    #[inline]
+    fn has_check(&self) -> bool {
+        self.eof || self.error
+    }
+
+    #[inline]
+    fn error_handling(&self) -> String {
+        match (self.eof, self.error) {
+            (true, true) => {
+                format!(
+                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{
+    {0}_eof = 1;
+}} else {{
+    {0}_error = 1;
+}}",
+                    self.name
+                )
+            }
+            (true, false) => {
+                format!(
+                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{ {}_eof = 1; }}",
+                    self.name,
+                )
+            }
+            (false, true) => {
+                format!(
+                    "if e.kind() != std::io::ErrorKind::UnexpectedEof {{ {}_error = 1; }}",
+                    self.name
+                )
+            }
+            (false, false) => "".to_string(),
+        }
+    }
+
+    #[inline]
+    fn error_handling_no_eof(&self) -> String {
+        if self.error {
+            format!("{}_error = 1;", self.name)
+        } else {
+            "".to_string()
+        }
+    }
+
+    #[inline]
+    fn clear(&self) -> String {
+        match (self.eof, self.error) {
+            (true, true) => format!("{{ {0}_eof = 0; {0}_error = 0; }}", self.name),
+            (true, false) => format!("{{ {}_eof = 0; }}", self.name),
+            (false, true) => format!("{{ {}_error = 0; }}", self.name),
+            (false, false) => "()".to_string(),
+        }
+    }
+}
+
 trait StreamExpr {
     fn expr(&self) -> String;
     fn ty(&self) -> StreamType<'_>;
-    fn name(&self) -> &str;
-    fn error_handling(&self, handle_error: bool) -> String {
-        if handle_error {
-            format!(
-                "if e.kind() != std::io::ErrorKind::UnexpectedEof {{ {}_error = 1; }}",
-                self.name()
-            )
-        } else {
-            String::new()
-        }
-    }
-    fn error_handling_no_eof(&self, handle_error: bool) -> String {
-        if handle_error {
-            format!("{}_error = 1;", self.name())
-        } else {
-            String::new()
-        }
-    }
 
     #[inline]
     fn borrow_for(&self, tr: StreamTrait) -> String {
@@ -622,14 +666,6 @@ impl StreamExpr for TypedExpr<'_> {
     #[inline]
     fn ty(&self) -> StreamType<'_> {
         *self.ty
-    }
-
-    fn name(&self) -> &str {
-        match &self.expr.kind {
-            ExprKind::Path(_, path) => path.segments.last().unwrap().ident.name.as_str(),
-            ExprKind::Field(_, field) => field.name.as_str(),
-            _ => panic!(),
-        }
     }
 }
 
@@ -678,15 +714,6 @@ impl StreamExpr for StdExpr {
             StdStream::Stdin => STDIN_TY,
             StdStream::Stdout => STDOUT_TY,
             StdStream::Stderr => STDERR_TY,
-        }
-    }
-
-    #[inline]
-    fn name(&self) -> &str {
-        match self.0 {
-            StdStream::Stdin => "stdin",
-            StdStream::Stdout => "stdout",
-            StdStream::Stderr => "stderr",
         }
     }
 }
@@ -796,6 +823,16 @@ struct HirCtx {
     lhs_to_rhs: FxHashMap<Span, Span>,
     /// for each assignment, rhs span to lhs span
     rhs_to_lhs: FxHashMap<Span, Span>,
+
+    /// function def_id to feof argument names
+    feof_functions: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
+    /// function def_id to ferror argument names
+    ferror_functions: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
+    /// call span to stream argument name
+    callee_span_to_stream_name: FxHashMap<Span, Symbol>,
+
+    /// callee span to expr hir_id
+    callee_span_to_hir_id: FxHashMap<Span, HirId>,
 }
 
 struct HirVisitor<'tcx> {
@@ -899,6 +936,39 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     self.add_assignment(field.ident.span, field.expr.span);
                 }
             }
+            hir::ExprKind::Call(callee, args) => {
+                let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return };
+                self.ctx
+                    .callee_span_to_hir_id
+                    .insert(path.span, expr.hir_id);
+                let name = path.segments.last().unwrap().ident.name;
+                let name = api_list::normalize_api_name(name.as_str());
+                let i = match name {
+                    "fscanf" | "fgetc" | "getc" | "fprintf" | "fflush" | "feof" | "ferror"
+                    | "clearerr" => 0,
+                    "fputc" | "putc" | "fputs" => 1,
+                    "fgets" => 2,
+                    "fread" | "fwrite" => 3,
+                    _ => return,
+                };
+                let arg_name = match &args[i].kind {
+                    hir::ExprKind::Path(QPath::Resolved(_, path)) => {
+                        path.segments.last().unwrap().ident.name
+                    }
+                    hir::ExprKind::Field(_, field) => field.name,
+                    _ => return,
+                };
+                self.ctx
+                    .callee_span_to_stream_name
+                    .insert(path.span, arg_name);
+                let funcs = match name {
+                    "feof" => &mut self.ctx.feof_functions,
+                    "ferror" => &mut self.ctx.ferror_functions,
+                    _ => return,
+                };
+                let curr_func = expr.hir_id.owner.def_id;
+                funcs.entry(curr_func).or_default().insert(arg_name);
+            }
             _ => {}
         }
     }
@@ -992,16 +1062,16 @@ impl<'a> TransformVisitor<'_, 'a> {
         fmt: &Expr,
         args: &[E],
         wide: bool,
-        handle_error: bool,
+        ic: IndicatorCheck<'_>,
     ) -> Expr {
         match LikelyLit::from_expr(fmt) {
-            LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, wide, handle_error),
+            LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, wide, ic),
             LikelyLit::If(_, _, _) => todo!(),
             LikelyLit::Path(span) => {
                 let loc = self.hir.bound_span_to_loc[&span];
                 let static_span = self.hir.loc_to_binding_span[&loc];
                 let fmt = self.static_span_to_lit[&static_span];
-                transform_fprintf_lit(stream, fmt, args, wide, handle_error)
+                transform_fprintf_lit(stream, fmt, args, wide, ic)
             }
             LikelyLit::Other(e) => todo!("{:?}", e),
         }
@@ -1024,6 +1094,43 @@ impl<'a> TransformVisitor<'_, 'a> {
         let loc = self.hir.binding_span_to_loc.get(&span)?;
         let pot = self.loc_to_pot.get(loc)?;
         Some(ty!("{}", pot.ty))
+    }
+
+    #[inline]
+    fn indicator_check(&self, span: Span) -> IndicatorCheck<'_> {
+        let curr_func = self.hir.callee_span_to_hir_id[&span].owner.def_id;
+        let name = self.hir.callee_span_to_stream_name.get(&span).unwrap();
+        let eof = self
+            .hir
+            .feof_functions
+            .get(&curr_func)
+            .map_or(false, |s| s.contains(name));
+        let error = self
+            .hir
+            .ferror_functions
+            .get(&curr_func)
+            .map_or(false, |s| s.contains(name));
+        IndicatorCheck {
+            name: name.as_str(),
+            eof,
+            error,
+        }
+    }
+
+    #[inline]
+    fn indicator_check_std<'s>(&self, span: Span, name: &'s str) -> IndicatorCheck<'s> {
+        let curr_func = self.hir.callee_span_to_hir_id[&span].owner.def_id;
+        let eof = self
+            .hir
+            .feof_functions
+            .get(&curr_func)
+            .map_or(false, |s| s.iter().any(|n| n.as_str() == name));
+        let error = self
+            .hir
+            .ferror_functions
+            .get(&curr_func)
+            .map_or(false, |s| s.iter().any(|n| n.as_str() == name));
+        IndicatorCheck { name, eof, error }
     }
 
     #[inline]
@@ -1085,6 +1192,20 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 f.generics.params.push(tparam);
             }
+            if let Some(eofs) = self.hir.feof_functions.get(&def_id) {
+                let stmts = &mut f.body.as_mut().unwrap().stmts;
+                for eof in eofs {
+                    let stmt = stmt!("let mut {}_eof = 0;", eof);
+                    stmts.insert(0, stmt);
+                }
+            }
+            if let Some(errors) = self.hir.ferror_functions.get(&def_id) {
+                let stmts = &mut f.body.as_mut().unwrap().stmts;
+                for error in errors {
+                    let stmt = stmt!("let mut {}_error = 0;", error);
+                    stmts.insert(0, stmt);
+                }
+            }
         }
     }
 
@@ -1126,7 +1247,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 let name = compile_util::def_id_to_value_symbol(*def_id, self.tcx).unwrap();
                 let name = api_list::normalize_api_name(name.as_str());
-                let handle_error = false;
                 match name {
                     "fopen" => {
                         let lhs = self.hir.rhs_to_lhs[&expr_span];
@@ -1150,8 +1270,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr =
-                            transform_fscanf(&stream, &args[1], &args[2..], handle_error);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fscanf(&stream, &args[1], &args[2..], ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "fgetc" | "getc" => {
@@ -1160,7 +1280,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr = transform_fgetc(&stream, handle_error);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fgetc(&stream, ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "getchar" => {
@@ -1168,7 +1289,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             return;
                         }
                         let stream = StdExpr::stdin();
-                        let new_expr = transform_fgetc(&stream, handle_error);
+                        let ic = self.indicator_check_std(callee.span, "stdin");
+                        let new_expr = transform_fgetc(&stream, ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "fgets" => {
@@ -1177,7 +1299,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[2].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[2], ty);
-                        let new_expr = transform_fgets(&stream, &args[0], &args[1], handle_error);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fgets(&stream, &args[0], &args[1], ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "fread" => {
@@ -1186,8 +1309,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[3].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[3], ty);
-                        let new_expr =
-                            transform_fread(&stream, &args[0], &args[1], &args[2], handle_error);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fread(&stream, &args[0], &args[1], &args[2], ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "getdelim" => todo!(),
@@ -1196,9 +1319,24 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr = transform_feof(&stream);
+                        let name = self.hir.callee_span_to_stream_name[&callee.span];
+                        let new_expr = expr!("{}_eof", name);
+                        self.replace_expr(expr, new_expr);
+                    }
+                    "ferror" => {
+                        if self.is_unsupported(&args[0]) {
+                            return;
+                        }
+                        let name = self.hir.callee_span_to_stream_name[&callee.span];
+                        let new_expr = expr!("{}_error", name);
+                        self.replace_expr(expr, new_expr);
+                    }
+                    "clearerr" => {
+                        if self.is_unsupported(&args[0]) {
+                            return;
+                        }
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = expr!("{}", ic.clear());
                         self.replace_expr(expr, new_expr);
                     }
                     "fprintf" => {
@@ -1207,35 +1345,23 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr = self.transform_fprintf(
-                            &stream,
-                            &args[1],
-                            &args[2..],
-                            false,
-                            handle_error,
-                        );
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr =
+                            self.transform_fprintf(&stream, &args[1], &args[2..], false, ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "printf" => {
                         let stream = StdExpr::stdout();
-                        let new_expr = self.transform_fprintf(
-                            &stream,
-                            &args[0],
-                            &args[1..],
-                            false,
-                            handle_error,
-                        );
+                        let ic = self.indicator_check_std(callee.span, "stdout");
+                        let new_expr =
+                            self.transform_fprintf(&stream, &args[0], &args[1..], false, ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "wprintf" => {
                         let stream = StdExpr::stdout();
-                        let new_expr = self.transform_fprintf(
-                            &stream,
-                            &args[0],
-                            &args[1..],
-                            true,
-                            handle_error,
-                        );
+                        let ic = self.indicator_check_std(callee.span, "stdout");
+                        let new_expr =
+                            self.transform_fprintf(&stream, &args[0], &args[1..], true, ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "fputc" | "putc" => {
@@ -1244,12 +1370,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[1].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[1], ty);
-                        let new_expr = transform_fputc(&stream, &args[0], handle_error);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fputc(&stream, &args[0], ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "putchar" => {
                         let stream = StdExpr::stdout();
-                        let new_expr = transform_fputc(&stream, &args[0], handle_error);
+                        let ic = self.indicator_check_std(callee.span, "stdout");
+                        let new_expr = transform_fputc(&stream, &args[0], ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "fputs" => {
@@ -1258,11 +1386,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[1].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[1], ty);
-                        let new_expr = transform_fputs(&stream, &args[0], handle_error);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fputs(&stream, &args[0], ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "puts" => {
-                        let new_expr = transform_puts(&args[0], handle_error);
+                        let ic = self.indicator_check_std(callee.span, "stdout");
+                        let new_expr = transform_puts(&args[0], ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "fwrite" => {
@@ -1271,8 +1401,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[3].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[3], ty);
-                        let new_expr =
-                            transform_fwrite(&stream, &args[0], &args[1], &args[2], handle_error);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fwrite(&stream, &args[0], &args[1], &args[2], ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "fflush" => {
@@ -1281,7 +1411,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr = transform_fflush(&stream, handle_error);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fflush(&stream, ic);
                         self.replace_expr(expr, new_expr);
                     }
                     "fseek" | "fseeko" => {
@@ -1549,9 +1680,9 @@ fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
     stream: &S,
     fmt: &Expr,
     args: &[E],
-    handle_error: bool,
+    ic: IndicatorCheck<'_>,
 ) -> Expr {
-    assert!(!handle_error);
+    assert!(!ic.has_check());
     let stream = stream.borrow_for(StreamTrait::BufRead);
     let fmt = LikelyLit::from_expr(fmt);
     match fmt {
@@ -1645,9 +1776,9 @@ fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
 }
 
 #[inline]
-fn transform_fgetc<S: StreamExpr>(stream: &S, handle_error: bool) -> Expr {
+fn transform_fgetc<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Read);
-    if handle_error {
+    if ic.has_check() {
         expr!(
             "{{
     use std::io::Read;
@@ -1661,7 +1792,7 @@ fn transform_fgetc<S: StreamExpr>(stream: &S, handle_error: bool) -> Expr {
     }}
 }}",
             stream_str,
-            stream.error_handling(true),
+            ic.error_handling(),
         )
     } else {
         expr!(
@@ -1676,11 +1807,11 @@ fn transform_fgetc<S: StreamExpr>(stream: &S, handle_error: bool) -> Expr {
 }
 
 #[inline]
-fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr, handle_error: bool) -> Expr {
+fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::BufRead);
     let s = pprust::expr_to_string(s);
     let n = pprust::expr_to_string(n);
-    let handling = stream.error_handling(handle_error);
+    let handling = ic.error_handling();
     expr!(
         "{{
     use std::io::BufRead;
@@ -1728,13 +1859,13 @@ fn transform_fread<S: StreamExpr>(
     ptr: &Expr,
     size: &Expr,
     nitems: &Expr,
-    handle_error: bool,
+    ic: IndicatorCheck<'_>,
 ) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Read);
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
-    let handling = stream.error_handling(handle_error);
+    let handling = ic.error_handling();
     expr!(
         "{{
     use std::io::Read;
@@ -1759,27 +1890,14 @@ fn transform_fread<S: StreamExpr>(
     )
 }
 
-#[inline]
-fn transform_feof<S: StreamExpr>(stream: &S) -> Expr {
-    let stream = stream.borrow_for(StreamTrait::Read);
-    expr!(
-        "{{
-    use std::io::Read;
-    let mut buf = [0];
-    ({}).read_exact(&mut buf).map_or(1, |_| 0)
-}}",
-        stream
-    )
-}
-
 fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
     stream: &S,
     fmt: Symbol,
     args: &[E],
     wide: bool,
-    handle_error: bool,
+    ic: IndicatorCheck<'_>,
 ) -> Expr {
-    assert!(!handle_error);
+    assert!(!ic.has_check());
     // from rustc_ast/src/util/literal.rs
     let s = fmt.as_str();
     let mut buf = Vec::with_capacity(s.len());
@@ -1841,10 +1959,10 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
 }
 
 #[inline]
-fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, handle_error: bool) -> Expr {
+fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let c = pprust::expr_to_string(c);
-    if handle_error {
+    if ic.has_check() {
         expr!(
             "{{
     use std::io::Write;
@@ -1859,7 +1977,7 @@ fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, handle_error: bool) -> E
 }}",
             c,
             stream_str,
-            stream.error_handling_no_eof(true),
+            ic.error_handling_no_eof(),
         )
     } else {
         expr!(
@@ -1875,10 +1993,10 @@ fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, handle_error: bool) -> E
 }
 
 #[inline]
-fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr, handle_error: bool) -> Expr {
+fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let s = pprust::expr_to_string(s);
-    if handle_error {
+    if ic.has_check() {
         expr!(
             "{{
     use std::io::Write;
@@ -1892,7 +2010,7 @@ fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr, handle_error: bool) -> E
 }}",
             stream_str,
             s,
-            stream.error_handling_no_eof(true),
+            ic.error_handling_no_eof(),
         )
     } else {
         expr!(
@@ -1913,13 +2031,13 @@ fn transform_fwrite<S: StreamExpr>(
     ptr: &Expr,
     size: &Expr,
     nitems: &Expr,
-    handle_error: bool,
+    ic: IndicatorCheck<'_>,
 ) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
-    let handling = stream.error_handling_no_eof(handle_error);
+    let handling = ic.error_handling_no_eof();
     expr!(
         "{{
     use std::io::Write;
@@ -1945,9 +2063,9 @@ fn transform_fwrite<S: StreamExpr>(
 }
 
 #[inline]
-fn transform_fflush<S: StreamExpr>(stream: &S, handle_error: bool) -> Expr {
+fn transform_fflush<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
-    if handle_error {
+    if ic.has_check() {
         expr!(
             "{{
     use std::io::Write;
@@ -1960,7 +2078,7 @@ fn transform_fflush<S: StreamExpr>(stream: &S, handle_error: bool) -> Expr {
     }}
 }}",
             stream_str,
-            stream.error_handling_no_eof(true),
+            ic.error_handling_no_eof(),
         )
     } else {
         expr!(
@@ -1974,9 +2092,9 @@ fn transform_fflush<S: StreamExpr>(stream: &S, handle_error: bool) -> Expr {
 }
 
 #[inline]
-fn transform_puts(s: &Expr, handle_error: bool) -> Expr {
+fn transform_puts(s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let s = pprust::expr_to_string(s);
-    if handle_error {
+    if ic.has_check() {
         expr!(
             r#"{{
     use std::io::Write;
@@ -1992,7 +2110,7 @@ fn transform_puts(s: &Expr, handle_error: bool) -> Expr {
     }}
 }}"#,
             s,
-            StdExpr::stdout().error_handling_no_eof(true),
+            ic.error_handling_no_eof(),
         )
     } else {
         expr!(

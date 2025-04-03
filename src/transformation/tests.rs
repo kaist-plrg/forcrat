@@ -853,6 +853,34 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_indicators() {
+    run_test(
+        r#"
+unsafe fn f() -> libc::c_int {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream);
+    if ferror(stream) != 0 {
+        clearerr(stream);
+        fclose(stream);
+        return 0 as libc::c_int;
+    } else if feof(stream) != 0 {
+        clearerr(stream);
+        fclose(stream);
+        return 1 as libc::c_int;
+    } else {
+        fclose(stream);
+        return 2 as libc::c_int
+    };
+}"#,
+        &["Read", "read_exact", "std::io::ErrorKind"],
+        &["FILE", "fgetc", "ferror", "feof", "clearerr"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
