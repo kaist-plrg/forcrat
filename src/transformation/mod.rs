@@ -88,10 +88,12 @@ impl Pass for Transformation {
                 }
             })
             .collect();
+        let mut unsupported_locs = FxHashSet::default();
         for (span, loc) in &hir_ctx.binding_span_to_loc {
             if !unsupported.contains(span) {
                 continue;
             }
+            unsupported_locs.insert(*loc);
             let bounds = some_or!(hir_ctx.loc_to_bound_spans.get(loc), continue);
             for span in bounds {
                 // add bound occurrence to unsupported
@@ -143,6 +145,9 @@ impl Pass for Transformation {
                 Loc::Field(def_id, field) => (HirLoc::Field(*def_id, *field), false),
                 _ => continue,
             };
+            if unsupported_locs.contains(&hir_loc) {
+                continue;
+            }
             let ty = type_arena.make_ty(permissions, origins, is_param);
             let pot = Pot {
                 permissions,
@@ -346,13 +351,12 @@ impl<'a> TypeArena<'a> {
                 Origin::File => {
                     if permissions.contains(Permission::Write) {
                         self.buf_writer(&FILE_TY)
-                    // } else if permissions.contains(Permission::Read)
-                    //     || permissions.contains(Permission::BufRead)
-                    // {
-                    //     self.buf_reader(self.file)
-                    } else {
-                        // self.file
+                    } else if permissions.contains(Permission::Read)
+                        || permissions.contains(Permission::BufRead)
+                    {
                         self.buf_reader(&FILE_TY)
+                    } else {
+                        &FILE_TY
                     }
                 }
                 Origin::PipeRead => &CHILD_STDOUT_TY,
@@ -424,7 +428,11 @@ impl StreamType<'_> {
     fn borrow_expr_for(self, expr: &str, tr: StreamTrait) -> String {
         match self {
             Self::File | Self::Stdout | Self::Stderr | Self::ChildStdin | Self::ChildStdout => {
-                expr.to_string()
+                if tr == StreamTrait::AsRawFd {
+                    format!("std::os::fd::AsFd::as_fd({})", expr)
+                } else {
+                    expr.to_string()
+                }
             }
             Self::Stdin => {
                 if tr == StreamTrait::BufRead {
@@ -435,7 +443,7 @@ impl StreamType<'_> {
             }
             Self::BufWriter(t) | Self::BufReader(t) => {
                 if tr == StreamTrait::AsRawFd {
-                    let expr = format!("std::os::fd::AsFd::as_fd(({}).get_ref())", expr);
+                    let expr = format!("({}).get_ref()", expr);
                     t.borrow_expr_for(&expr, tr)
                 } else {
                     expr.to_string()
@@ -459,7 +467,11 @@ impl StreamType<'_> {
     fn opt_borrow_expr_for(self, expr: &str, tr: StreamTrait) -> String {
         match self {
             Self::File | Self::Stdout | Self::Stderr | Self::ChildStdin | Self::ChildStdout => {
-                format!("Some({})", expr)
+                if tr == StreamTrait::AsRawFd {
+                    format!("Some(std::os::fd::AsFd::as_fd({}))", expr)
+                } else {
+                    format!("Some({})", expr)
+                }
             }
             Self::Stdin => {
                 if tr == StreamTrait::BufRead {
@@ -470,7 +482,7 @@ impl StreamType<'_> {
             }
             Self::BufWriter(t) | Self::BufReader(t) => {
                 if tr == StreamTrait::AsRawFd {
-                    let expr = format!("std::os::fd::AsFd::as_fd(({}).get_ref())", expr);
+                    let expr = format!("({}).get_ref()", expr);
                     t.opt_borrow_expr_for(&expr, tr)
                 } else {
                     format!("Some({})", expr)
@@ -482,35 +494,85 @@ impl StreamType<'_> {
             }
             Self::Option(t) | Self::Ptr(t) => {
                 let body = t.opt_borrow_expr_for("x", tr);
-                format!("({}).as_mut().and_then(|x| {})", expr, body)
+                if body == "Some(x)" {
+                    format!("({}).as_mut()", expr)
+                } else if body.starts_with("Some(") {
+                    let body = body
+                        .strip_prefix("Some(")
+                        .unwrap()
+                        .strip_suffix(')')
+                        .unwrap();
+                    format!("({}).as_mut().map(|x| {})", expr, body)
+                } else {
+                    format!("({}).as_mut().and_then(|x| {})", expr, body)
+                }
             }
         }
     }
 
-    //     fn null_to_expr(self, null: &str) -> &str {
-    //         match self {
-    //             Self::Option(_) => "None",
-    //             Self::Ptr(_) => null,
-    //             _ => panic!(),
-    //         }
-    //     }
+    fn assign_to(self, rty: StreamType<'_>, rhs: &str) -> String {
+        if self == rty {
+            return rhs.to_string();
+        }
+        use StreamType::*;
+        match (self, rty) {
+            (BufWriter(t1), t2) => {
+                let expr = t1.assign_to(t2, rhs);
+                format!("std::io::BufWriter::new({})", expr)
+            }
+            (BufReader(t1), t2) => {
+                let expr = t1.assign_to(t2, rhs);
+                format!("std::io::BufReader::new({})", expr)
+            }
+            (Option(t1), Option(t2)) => {
+                let body = t1.assign_to(*t2, "x");
+                format!("({}).map(|x| {})", rhs, body)
+            }
+            _ => todo!("{} := {}", self, rty),
+        }
+        //     (
+        //         File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout,
+        //         BufWriter(t) | BufReader(t),
+        //     ) => {
+        //         let expr = format!("({}).into_inner().unwrap()", rhs);
+        //         t.assign_to(self, &expr)
+        //     }
+        //     (
+        //         File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_)
+        //         | BufReader(_) | Impl(_),
+        //         Option(t),
+        //     ) => {
+        //         let expr = format!("({}).unwrap()", rhs);
+        //         t.assign_to(self, &expr)
+        //     }
 
-    //     fn assign(self, rty: StreamType<'a>, rhs: &str) -> String {
-    //         if self == rty {
-    //             return rhs.to_string();
-    //         }
-    //         if let Self::Option(this) = self {
-    //             if *this == rty {
-    //                 return format!("Some({})", rhs);
-    //             }
-    //         }
-    //         if let Self::Ptr(this) = self {
-    //             if *this == rty {
-    //                 return format!("&mut ({})", rhs);
-    //             }
-    //         }
-    //         todo!("{:?} {:?}", self, rty)
-    //     }
+        //     (Option(t1), t2) => {
+        //         let expr = t1.assign_to(t2, rhs);
+        //         format!("Some({})", expr)
+        //     }
+
+        //     (Ptr(t1), Ptr(t2)) => {
+        //         if t1 == t2 {
+        //             rhs.to_string()
+        //         } else {
+        //             panic!()
+        //         }
+        //     }
+        //     (Ptr(t1), t2) => {
+        //         let expr = t1.assign_to(t2, rhs);
+        //         format!("&mut ({})", expr)
+        //     }
+
+        //     (Impl(traits1), Impl(traits2)) => {
+        //         if traits2.superset(&traits1) {
+        //             rhs.to_string()
+        //         } else {
+        //             panic!()
+        //         }
+        //     }
+        //     (Impl(_), _) => rhs.to_string(),
+        // }
+    }
 }
 
 trait StreamExpr {
@@ -1039,9 +1101,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 match name {
                     "fopen" => {
                         let lhs = self.hir.rhs_to_lhs[&expr_span];
-                        let loc = self.hir.bound_span_to_loc[&lhs];
-                        let permissions = self.loc_to_pot[&loc].permissions;
-                        let new_expr = transform_fopen(&args[0], &args[1], permissions);
+                        let pot = self.bound_pot(lhs).unwrap();
+                        let new_expr = transform_fopen(&args[0], &args[1], pot);
                         self.replace_expr(expr, new_expr);
                     }
                     "popen" => {
@@ -1286,9 +1347,22 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     _ => panic!(),
                 }
             }
+            ExprKind::Assign(lhs, rhs, _) => {
+                let _lhs_pot = some_or!(self.bound_pot(lhs.span), return);
+                let _rhs_pot = some_or!(self.bound_pot(rhs.span), return);
+            }
             ExprKind::Cast(_, _) => {
-                if self.null_casts.contains(&expr_span) {
-                    self.replace_expr(expr, expr!("None"));
+                let lhs = some_or!(self.hir.rhs_to_lhs.get(&expr_span), return);
+                if self.unsupported.contains(lhs) {
+                    return;
+                }
+                let pot = some_or!(self.bound_pot(*lhs), return);
+                match pot.ty {
+                    StreamType::Option(_) => {
+                        self.replace_expr(expr, expr!("None"));
+                    }
+                    StreamType::Ptr(_) => {}
+                    _ => panic!(),
                 }
             }
             _ => {}
@@ -1296,90 +1370,79 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 }
 
-fn transform_fopen(path: &Expr, mode: &Expr, permissions: &BitSet<Permission>) -> Expr {
+fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
     let path = pprust::expr_to_string(path);
     let path = format!(
         "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
         path
     );
     let mode = LikelyLit::from_expr(mode);
-    let wrapper = if permissions.contains(Permission::Write) {
-        "std::io::BufWriter"
-    } else {
-        "std::io::BufReader"
-    };
-    match mode {
+    let (expr, ty) = match mode {
         LikelyLit::Lit(mode) => {
             let (prefix, suffix) = mode.as_str().split_at(1);
             let plus = suffix.contains('+');
-            match prefix {
+            let expr = match prefix {
                 "r" => {
                     if plus {
-                        expr!(
+                        format!(
                             "std::fs::OpenOptions::new()
                                 .read(true)
                                 .write(true)
                                 .open({})
-                                .ok()
-                                .map({}::new)",
+                                .ok()",
                             path,
-                            wrapper
                         )
                     } else {
-                        expr!("std::fs::File::open({}).ok().map({}::new)", path, wrapper)
+                        format!("std::fs::File::open({}).ok()", path)
                     }
                 }
                 "w" => {
                     if plus {
-                        expr!(
+                        format!(
                             "std::fs::OpenOptions::new()
                                 .write(true)
                                 .create(true)
                                 .truncate(true)
                                 .read(true)
                                 .open({})
-                                .ok()
-                                .map({}::new)",
+                                .ok()",
                             path,
-                            wrapper
                         )
                     } else {
-                        expr!("std::fs::File::create({}).ok().map({}::new)", path, wrapper)
+                        format!("std::fs::File::create({}).ok()", path)
                     }
                 }
                 "a" => {
                     if plus {
-                        expr!(
+                        format!(
                             "std::fs::OpenOptions::new()
                                 .append(true)
                                 .create(true)
                                 .read(true)
                                 .open({})
-                                .ok()
-                                .map({}::new)",
+                                .ok()",
                             path,
-                            wrapper
                         )
                     } else {
-                        expr!(
+                        format!(
                             "std::fs::OpenOptions::new()
                                 .append(true)
                                 .create(true)
                                 .open({})
-                                .ok()
-                                .map({}::new)",
+                                .ok()",
                             path,
-                            wrapper
                         )
                     }
                 }
                 _ => panic!("{:?}", mode),
-            }
+            };
+            (expr, StreamType::Option(&FILE_TY))
         }
         LikelyLit::If(_, _, _) => todo!(),
         LikelyLit::Path(_) => todo!(),
         LikelyLit::Other(_) => todo!(),
-    }
+    };
+    expr!("{}", pot.ty.assign_to(ty, &expr))
 }
 
 fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
