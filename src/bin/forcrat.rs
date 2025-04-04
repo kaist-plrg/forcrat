@@ -16,6 +16,8 @@ enum Command {
         show_api_names: bool,
         #[arg(long, default_value = "false")]
         show_unsupported: bool,
+        #[arg(long, default_value = "false")]
+        only_show_total: bool,
     },
     CountReturnValues,
     Steensgaard,
@@ -58,6 +60,7 @@ fn main() {
             distinguish_std_args,
             show_api_names,
             show_unsupported,
+            only_show_total,
         } => {
             if show_api_names {
                 print!("total ");
@@ -75,6 +78,10 @@ fn main() {
                 .chain(std_arg_counts.values())
                 .sum::<usize>();
             print!("{} ", sum);
+            if only_show_total {
+                println!();
+                return;
+            }
             for (name, api_kind) in API_LIST {
                 if distinguish_std_args {
                     let v = counts.get(name).copied().unwrap_or(0);

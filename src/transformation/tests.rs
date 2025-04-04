@@ -724,12 +724,12 @@ fn test_bin_op() {
         r#"
 unsafe fn f(mut stream: *mut FILE) {
     if stream == stdout {
-        putchar('a' as i32);
+        getchar();
         return;
     }
     fputc('a' as i32, stream);
 }"#,
-        &["Write", "write_all", "FILE", "fputc"],
+        &["Read", "read_exact", "FILE", "fputc"],
         &[],
     );
 }

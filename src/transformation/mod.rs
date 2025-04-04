@@ -90,6 +90,13 @@ impl Pass for Transformation {
         let is_stdin_unsupported = analysis_res
             .unsupported
             .contains(analysis_res.loc_ind_map[&Loc::Stdin]);
+        let is_stdout_unsupported = analysis_res
+            .unsupported
+            .contains(analysis_res.loc_ind_map[&Loc::Stdout]);
+        let is_stderr_unsupported = analysis_res
+            .unsupported
+            .contains(analysis_res.loc_ind_map[&Loc::Stderr]);
+
         // all unsupported spans
         let mut unsupported: FxHashSet<_> = analysis_res
             .unsupported
@@ -250,14 +257,18 @@ impl Pass for Transformation {
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
                 tcx,
+
                 static_span_to_lit: &ast_visitor.static_span_to_lit,
                 hir: &hir_ctx,
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
                 api_sig_spans: &api_sig_spans,
                 null_casts: &null_casts,
+
                 unsupported: &unsupported,
                 is_stdin_unsupported,
+                is_stdout_unsupported,
+                is_stderr_unsupported,
 
                 updated: false,
                 updated_field_spans: FxHashSet::default(),
@@ -1128,10 +1139,16 @@ struct TransformVisitor<'tcx, 'a> {
     api_sig_spans: &'a FxHashSet<Span>,
     /// null to file pointer cast expr spans
     null_casts: &'a FxHashSet<Span>,
+
     /// unsupported expr spans
     unsupported: &'a FxHashSet<Span>,
     /// is stdin unsupported
     is_stdin_unsupported: bool,
+    /// is stdout unsupported
+    is_stdout_unsupported: bool,
+    /// is stderr unsupported
+    #[allow(unused)]
+    is_stderr_unsupported: bool,
 
     /// is this file updated
     updated: bool,
@@ -1464,6 +1481,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "printf" => {
+                        if self.is_stdout_unsupported {
+                            return;
+                        }
                         let stream = StdExpr::stdout();
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let new_expr =
@@ -1471,6 +1491,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "wprintf" => {
+                        if self.is_stdout_unsupported {
+                            return;
+                        }
                         let stream = StdExpr::stdout();
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let new_expr =
@@ -1488,6 +1511,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "putchar" => {
+                        if self.is_stdout_unsupported {
+                            return;
+                        }
                         let stream = StdExpr::stdout();
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let new_expr = transform_fputc(&stream, &args[0], ic);
@@ -1504,6 +1530,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "puts" => {
+                        if self.is_stdout_unsupported {
+                            return;
+                        }
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let new_expr = transform_puts(&args[0], ic);
                         self.replace_expr(expr, new_expr);

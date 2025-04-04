@@ -515,11 +515,12 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 self.origin_graph.add_edge(rhs, lhs);
             }
         }
-        let stdout = self.loc_ind_map[&Loc::Stdout];
-        let stderr = self.loc_ind_map[&Loc::Stderr];
-        if lhs != stdout && rhs != stdout && lhs != stderr && rhs != stderr {
-            self.unsupported.union(lhs, rhs);
-        }
+        self.unsupported.union(lhs, rhs);
+        // let stdout = self.loc_ind_map[&Loc::Stdout];
+        // let stderr = self.loc_ind_map[&Loc::Stderr];
+        // if lhs != stdout && rhs != stdout && lhs != stderr && rhs != stderr {
+        //     self.unsupported.union(lhs, rhs);
+        // }
     }
 }
 
