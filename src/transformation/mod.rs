@@ -1136,7 +1136,7 @@ impl<'a> TransformVisitor<'_, 'a> {
         match LikelyLit::from_expr(fmt) {
             LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, wide, ic),
             LikelyLit::If(_, _, _) => todo!(),
-            LikelyLit::Path(span) => {
+            LikelyLit::Path(_, span) => {
                 let loc = self.hir.bound_span_to_loc[&span];
                 let static_span = self.hir.loc_to_binding_span[&loc];
                 let fmt = self.static_span_to_lit[&static_span];
@@ -1341,13 +1341,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        self.replace_expr(callee, expr!("drop"));
                         let loc = self.hir.bound_span_to_loc[&args[0].span];
-                        if matches!(loc, HirLoc::Global(_)) {
-                            let arg = pprust::expr_to_string(&args[0]);
-                            let new_arg = expr!("({}).take()", arg);
-                            self.replace_expr(&mut args[0], new_arg);
-                        }
+                        let is_static = matches!(loc, HirLoc::Global(_));
+                        let new_expr = transform_fclose(&args[0], is_static);
+                        self.replace_expr(expr, new_expr);
                     }
                     "fscanf" => {
                         if self.is_unsupported(&args[0]) {
@@ -1654,16 +1651,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
 fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
     let path = pprust::expr_to_string(path);
-    let path = format!(
-        "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
-        path
-    );
     let mode = LikelyLit::from_expr(mode);
-    let (expr, ty) = match mode {
+    let expr = match mode {
         LikelyLit::Lit(mode) => {
+            let path = format!(
+                "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
+                path
+            );
             let (prefix, suffix) = mode.as_str().split_at(1);
             let plus = suffix.contains('+');
-            let expr = match prefix {
+            match prefix {
                 "r" => {
                     if plus {
                         format!(
@@ -1717,14 +1714,56 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
                     }
                 }
                 _ => panic!("{:?}", mode),
-            };
-            (expr, StreamType::Option(&FILE_TY))
+            }
         }
         LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Path(_) => todo!(),
+        LikelyLit::Path(symbol, _) => {
+            format!(
+                r#"{{
+    let pathname = std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap();
+    let mode = std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap();
+    let (prefix, suffix) = mode.split_at(1);
+    match prefix {{
+        "r" => {{
+            if suffix.contains('+') {{
+                std::fs::OpenOptions::new().read(true).write(true).open(pathname)
+            }} else {{
+                std::fs::File::open(pathname)
+            }}
+        }}
+        "w" => {{
+            if suffix.contains('+') {{
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .open(pathname)
+            }} else {{
+                std::fs::File::create(pathname)
+            }}
+        }}
+        "a" => {{
+            if suffix.contains('+') {{
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .read(true)
+                    .open(pathname)
+            }} else {{
+                std::fs::OpenOptions::new().append(true).create(true).open(pathname)
+            }}
+        }}
+        _ => panic!(),
+    }}.ok()
+}}"#,
+                path,
+                symbol.as_str()
+            )
+        }
         LikelyLit::Other(_) => todo!(),
     };
-    let new_expr = convert_expr(*pot.ty, ty, &expr, true);
+    let new_expr = convert_expr(*pot.ty, StreamType::Option(&FILE_TY), &expr, true);
     expr!("{}", new_expr)
 }
 
@@ -1756,11 +1795,17 @@ fn transform_popen(command: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
             (expr, StreamType::Option(ty))
         }
         LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Path(_) => todo!(),
+        LikelyLit::Path(_, _) => todo!(),
         LikelyLit::Other(_) => todo!(),
     };
     let new_expr = convert_expr(*pot.ty, ty, &expr, true);
     expr!("{}", new_expr)
+}
+
+fn transform_fclose(stream: &Expr, is_static: bool) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    let take = if is_static { ".take()" } else { "" };
+    expr!("{{ drop(({}){}); 0 }}", stream, take)
 }
 
 fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
@@ -1857,7 +1902,7 @@ fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
             )
         }
         LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Path(_) => todo!(),
+        LikelyLit::Path(_, _) => todo!(),
         LikelyLit::Other(_) => todo!(),
     }
 }
@@ -1869,9 +1914,9 @@ fn transform_fgetc<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
         expr!(
             "{{
     use std::io::Read;
-    let mut buf = [0];
-    match ({}).read_exact(&mut buf) {{
-        Ok(_) => buf[0] as _,
+    let mut ___buf = [0];
+    match ({}).read_exact(&mut ___buf) {{
+        Ok(_) => ___buf[0] as _,
         Err(e) => {{
             {}
             libc::EOF
@@ -1885,8 +1930,8 @@ fn transform_fgetc<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
         expr!(
             "{{
     use std::io::Read;
-    let mut buf = [0];
-    ({}).read_exact(&mut buf).map_or(libc::EOF, |_| buf[0] as _)
+    let mut ___buf = [0];
+    ({}).read_exact(&mut ___buf).map_or(libc::EOF, |_| ___buf[0] as _)
 }}",
             stream_str
         )
@@ -1905,11 +1950,11 @@ fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr, ic: IndicatorC
     let mut stream = {};
     let s = {};
     let n = ({}) as usize;
-    let buf: &mut [u8] = std::slice::from_raw_parts_mut(s as _, n);
+    let ___buf: &mut [u8] = std::slice::from_raw_parts_mut(s as _, n);
     let mut pos = 0;
     while pos < n - 1 {{
         let available = match stream.fill_buf() {{
-            Ok(buf) => buf,
+            Ok(___buf) => ___buf,
             Err(e) => {{
                 {}
                 pos = 0;
@@ -1919,17 +1964,17 @@ fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr, ic: IndicatorC
         if available.is_empty() {{
             break;
         }}
-        buf[pos] = available[0];
+        ___buf[pos] = available[0];
         stream.consume(1);
         pos += 1;
-        if buf[pos - 1] == b'\\n' {{
+        if ___buf[pos - 1] == b'\\n' {{
             break;
         }}
     }}
     if pos == 0 {{
         std::ptr::null_mut()
     }} else {{
-        buf[pos] = 0;
+        ___buf[pos] = 0;
         s
     }}
 }}",
@@ -2238,7 +2283,7 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
             )
         }
         LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Path(_) => todo!(),
+        LikelyLit::Path(_, _) => todo!(),
         LikelyLit::Other(_) => todo!(),
     }
 }
@@ -2283,7 +2328,7 @@ fn transform_fileno<S: StreamExpr>(stream: &S) -> Expr {
 pub enum LikelyLit<'a> {
     Lit(Symbol),
     If(&'a Expr, Box<LikelyLit<'a>>, Box<LikelyLit<'a>>),
-    Path(Span),
+    Path(Symbol, Span),
     Other(&'a Expr),
 }
 
@@ -2315,7 +2360,10 @@ impl<'a> LikelyLit<'a> {
             }
             ExprKind::Paren(e) => Self::from_expr(e),
             ExprKind::Unary(UnOp::Deref, e) => Self::from_expr(e),
-            ExprKind::Path(_, path) => LikelyLit::Path(path.span),
+            ExprKind::Path(_, path) => {
+                let symbol = path.segments.last().unwrap().ident.name;
+                LikelyLit::Path(symbol, path.span)
+            }
             ExprKind::Block(block, _) => {
                 let [.., stmt] = &block.stmts[..] else { return LikelyLit::Other(expr) };
                 let StmtKind::Expr(expr) = &stmt.kind else { return LikelyLit::Other(expr) };

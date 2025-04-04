@@ -69,7 +69,7 @@ impl Pass for FileAnalysis {
                     _ => panic!("{:?}", lit),
                 },
                 LikelyLit::If(_, _, _) => todo!(),
-                LikelyLit::Path(_) => todo!(),
+                LikelyLit::Path(_, _) => todo!(),
                 LikelyLit::Other(_) => todo!(),
             })
             .collect();

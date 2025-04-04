@@ -944,6 +944,21 @@ unsafe fn f(mut x: libc::c_int) {
     );
 }
 
+#[test]
+fn test_fopen_non_lit_mode() {
+    run_test(
+        r#"
+unsafe fn f(mut mode: *const libc::c_char) {
+    let mut stream: *mut FILE = fopen(b"a\0" as *const u8 as *const libc::c_char, mode);
+    fgetc(stream);
+    fgetc(stream);
+    fclose(stream);
+}"#,
+        &["Read", "open", "read_exact", "drop"],
+        &["FILE", "fopen", "fgetc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
