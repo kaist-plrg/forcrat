@@ -137,7 +137,10 @@ impl Pass for Transformation {
                             (loc, is_param)
                         }
                         hir::ItemKind::Static(_, _, _) => {
-                            todo!()
+                            if local.as_u32() != 0 {
+                                continue;
+                            }
+                            (HirLoc::Global(*def_id), false)
                         }
                         _ => panic!(),
                     }
@@ -260,7 +263,7 @@ impl Pass for Transformation {
 }
 
 struct AstVisitor {
-    /// static variable definition's span to its literal
+    /// static variable definition body span to its literal
     static_span_to_lit: FxHashMap<Span, Symbol>,
 }
 
@@ -271,7 +274,7 @@ impl<'ast> Visitor<'ast> for AstVisitor {
         }) = &item.kind
         {
             if let LikelyLit::Lit(lit) = LikelyLit::from_expr(expr) {
-                self.static_span_to_lit.insert(item.span, lit);
+                self.static_span_to_lit.insert(expr.span, lit);
             }
         }
         visit::walk_item(self, item);
@@ -806,7 +809,7 @@ impl HirLoc {
 #[derive(Debug, Default)]
 struct HirCtx {
     /// location to binding occurrence span
-    /// * global (var): item span
+    /// * global (var): body span
     /// * global (fn): sig span
     /// * local: pat span
     /// * field: field span
@@ -872,9 +875,12 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         intravisit::walk_item(self, item);
 
         match item.kind {
-            hir::ItemKind::Static(_, _, _) => {
+            hir::ItemKind::Static(_, _, body_id) => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
-                self.add_binding(loc, item.span);
+                let body = self.tcx.hir().body(body_id);
+                self.add_binding(loc, body.value.span);
+                self.add_bound(loc, body.value.span);
+                self.add_assignment(body.value.span, body.value.span);
             }
             hir::ItemKind::Fn(sig, _, _) => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
@@ -1168,44 +1174,52 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
         mut_visit::noop_visit_item_kind(item, self);
 
-        if let ItemKind::Fn(f) = item {
-            let HirLoc::Global(def_id) = self.hir.binding_span_to_loc[&f.sig.span] else {
-                panic!()
-            };
-            let mut tparams = vec![];
-            for (i, param) in f.sig.decl.inputs.iter_mut().enumerate() {
-                if self.unsupported.contains(&param.pat.span) {
-                    continue;
-                }
-                let p = Param::new(def_id, i);
-                let pot = some_or!(self.param_pot(p), continue);
-                *param.ty = ty!("Option<TT{}>", i);
-                self.updated = true;
-                tparams.push((i, pot));
+        match item {
+            ItemKind::Static(box item) => {
+                let body = some_or!(&item.expr, return);
+                let loc = self.hir.binding_span_to_loc[&body.span];
+                let pot = some_or!(self.loc_to_pot.get(&loc), return);
+                self.replace_ty(&mut item.ty, ty!("{}", pot.ty));
             }
-            for (i, po) in tparams {
-                let tparam = if po.permissions.is_empty() {
-                    ty_param!("TT{}", i)
-                } else {
-                    let StreamType::Option(ty) = po.ty else { panic!() };
-                    ty_param!("TT{}: {}", i, ty)
+            ItemKind::Fn(box item) => {
+                let HirLoc::Global(def_id) = self.hir.binding_span_to_loc[&item.sig.span] else {
+                    panic!()
                 };
-                f.generics.params.push(tparam);
-            }
-            if let Some(eofs) = self.hir.feof_functions.get(&def_id) {
-                let stmts = &mut f.body.as_mut().unwrap().stmts;
-                for eof in eofs {
-                    let stmt = stmt!("let mut {}_eof = 0;", eof);
-                    stmts.insert(0, stmt);
+                let mut tparams = vec![];
+                for (i, param) in item.sig.decl.inputs.iter_mut().enumerate() {
+                    if self.unsupported.contains(&param.pat.span) {
+                        continue;
+                    }
+                    let p = Param::new(def_id, i);
+                    let pot = some_or!(self.param_pot(p), continue);
+                    self.replace_ty(&mut param.ty, ty!("Option<TT{}>", i));
+                    tparams.push((i, pot));
+                }
+                for (i, po) in tparams {
+                    let tparam = if po.permissions.is_empty() {
+                        ty_param!("TT{}", i)
+                    } else {
+                        let StreamType::Option(ty) = po.ty else { panic!() };
+                        ty_param!("TT{}: {}", i, ty)
+                    };
+                    item.generics.params.push(tparam);
+                }
+                if let Some(eofs) = self.hir.feof_functions.get(&def_id) {
+                    let stmts = &mut item.body.as_mut().unwrap().stmts;
+                    for eof in eofs {
+                        let stmt = stmt!("let mut {}_eof = 0;", eof);
+                        stmts.insert(0, stmt);
+                    }
+                }
+                if let Some(errors) = self.hir.ferror_functions.get(&def_id) {
+                    let stmts = &mut item.body.as_mut().unwrap().stmts;
+                    for error in errors {
+                        let stmt = stmt!("let mut {}_error = 0;", error);
+                        stmts.insert(0, stmt);
+                    }
                 }
             }
-            if let Some(errors) = self.hir.ferror_functions.get(&def_id) {
-                let stmts = &mut f.body.as_mut().unwrap().stmts;
-                for error in errors {
-                    let stmt = stmt!("let mut {}_error = 0;", error);
-                    stmts.insert(0, stmt);
-                }
-            }
+            _ => {}
         }
     }
 
@@ -1263,6 +1277,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             return;
                         }
                         self.replace_expr(callee, expr!("drop"));
+                        let loc = self.hir.bound_span_to_loc[&args[0].span];
+                        if matches!(loc, HirLoc::Global(_)) {
+                            let arg = pprust::expr_to_string(&args[0]);
+                            let new_arg = expr!("({}).take()", arg);
+                            self.replace_expr(&mut args[0], new_arg);
+                        }
                     }
                     "fscanf" => {
                         if self.is_unsupported(&args[0]) {

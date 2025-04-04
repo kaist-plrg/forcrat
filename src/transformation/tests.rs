@@ -881,6 +881,25 @@ unsafe fn f() -> libc::c_int {
     );
 }
 
+#[test]
+fn test_static() {
+    run_test(
+        r#"
+static mut stream: *mut FILE = 0 as *const FILE as *mut FILE;
+unsafe fn f() {
+    stream = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream);
+    fgetc(stream);
+    fclose(stream);
+}"#,
+        &["Read", "read_exact", "drop"],
+        &["FILE", "fgetc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
