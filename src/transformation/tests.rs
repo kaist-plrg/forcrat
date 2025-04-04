@@ -974,6 +974,25 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_fdopen() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut fd: libc::c_int = open(
+        b"a\0" as *const u8 as *const libc::c_char,
+        0 as libc::c_int,
+    );
+    let mut stream: *mut FILE = fdopen(fd, b"r\0" as *const u8 as *const libc::c_char);
+    fgetc(stream);
+    fgetc(stream);
+    fclose(stream);
+}"#,
+        &["Read", "from_raw_fd", "read_exact", "drop"],
+        &["FILE", "fdopen", "fgetc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
@@ -985,6 +1004,7 @@ extern "C" {
     static mut stdin: *mut FILE;
     static mut stdout: *mut FILE;
     static mut stderr: *mut FILE;
+    fn open(__file: *const libc::c_char, __oflag: libc::c_int, _: ...) -> libc::c_int;
     fn remove(__filename: *const libc::c_char) -> libc::c_int;
     fn rename(__old: *const libc::c_char, __new: *const libc::c_char) -> libc::c_int;
     fn renameat(

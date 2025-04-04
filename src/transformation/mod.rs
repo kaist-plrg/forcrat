@@ -1373,6 +1373,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         let new_expr = transform_fopen(&args[0], &args[1], pot);
                         self.replace_expr(expr, new_expr);
                     }
+                    "fdopen" => {
+                        let lhs = self.hir.rhs_to_lhs[&expr_span];
+                        let pot = self.bound_pot(lhs).unwrap();
+                        let new_expr = transform_fdopen(&args[0], pot);
+                        self.replace_expr(expr, new_expr);
+                    }
                     "tmpfile" => {
                         let lhs = self.hir.rhs_to_lhs[&expr_span];
                         let pot = self.bound_pot(lhs).unwrap();
@@ -1825,6 +1831,13 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
         LikelyLit::Other(_) => todo!(),
     };
     let new_expr = convert_expr(*pot.ty, StreamType::Option(&FILE_TY), &expr, true);
+    expr!("{}", new_expr)
+}
+
+fn transform_fdopen(fd: &Expr, pot: &Pot<'_>) -> Expr {
+    let fd = pprust::expr_to_string(fd);
+    let expr = format!("std::os::fd::FromRawFd::from_raw_fd({})", fd);
+    let new_expr = convert_expr(*pot.ty, FILE_TY, &expr, true);
     expr!("{}", new_expr)
 }
 
