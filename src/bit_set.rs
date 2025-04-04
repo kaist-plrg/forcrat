@@ -48,9 +48,16 @@ impl<T: Idx> BitSet8<T> {
     }
 
     #[inline]
-    pub fn insert(&mut self, elem: T) {
+    pub fn insert(&mut self, elem: T) -> bool {
         let mask = word_mask(elem);
+        let old_word = self.word;
         self.word |= mask;
+        old_word != self.word
+    }
+
+    #[inline]
+    pub fn insert_all(&mut self, domain_size: usize) {
+        self.word = (1 << domain_size) - 1;
     }
 
     #[inline]

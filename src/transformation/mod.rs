@@ -13,7 +13,7 @@ use rustc_ast_pretty::pprust;
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, def::Res, intravisit, HirId, QPath};
-use rustc_index::{bit_set::BitSet, Idx};
+use rustc_index::Idx;
 use rustc_lexer::unescape;
 use rustc_middle::{
     hir::nested_filter,
@@ -113,8 +113,8 @@ impl Pass for Transformation {
         for ((loc, permissions), origins) in analysis_res
             .locs
             .iter()
-            .zip(&analysis_res.permissions)
-            .zip(&analysis_res.origins)
+            .zip(analysis_res.permissions.iter().copied())
+            .zip(analysis_res.origins.iter().copied())
         {
             let (hir_loc, is_param) = match loc {
                 Loc::Var(def_id, local) => {
@@ -167,8 +167,8 @@ impl Pass for Transformation {
                 _ => continue,
             };
             let loc_id = analysis_res.loc_ind_map[&loc];
-            let permissions = &analysis_res.permissions[loc_id];
-            let origins = &analysis_res.origins[loc_id];
+            let permissions = analysis_res.permissions[loc_id];
+            let origins = analysis_res.origins[loc_id];
             let pot = Pot {
                 permissions,
                 origins,
@@ -285,9 +285,9 @@ fn remove_cast(expr: &Expr) -> &Expr {
 
 #[derive(Debug, Clone, Copy)]
 struct Pot<'a> {
-    permissions: &'a BitSet<Permission>,
+    permissions: BitSet8<Permission>,
     #[allow(unused)]
-    origins: &'a BitSet<Origin>,
+    origins: BitSet8<Origin>,
     ty: &'a StreamType<'a>,
 }
 
@@ -329,8 +329,8 @@ impl<'a> TypeArena<'a> {
 
     fn make_ty(
         &self,
-        permissions: &BitSet<Permission>,
-        origins: &BitSet<Origin>,
+        permissions: BitSet8<Permission>,
+        origins: BitSet8<Origin>,
         is_param: bool,
     ) -> &'a StreamType<'a> {
         if is_param {

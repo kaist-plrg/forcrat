@@ -13,7 +13,7 @@ use rustc_hir::{
     ItemKind, Node,
 };
 use rustc_index::{
-    bit_set::{BitSet, HybridBitSet, HybridIter},
+    bit_set::{HybridBitSet, HybridIter},
     Idx, IndexVec,
 };
 use rustc_middle::{
@@ -29,9 +29,11 @@ use typed_arena::Arena;
 
 use crate::{
     api_list::{def_id_api_kind, is_def_id_api, is_symbol_api, ApiKind, Origin, Permission},
+    bit_set::BitSet8,
     compile_util::{contains_file_ty, is_file_ty, Pass},
     disjoint_set::DisjointSet,
     rustc_ast::visit::Visitor as _,
+    rustc_index::bit_set::BitRelations,
     steensgaard,
     transformation::LikelyLit,
 };
@@ -40,8 +42,8 @@ use crate::{
 pub struct AnalysisResult {
     pub locs: IndexVec<LocId, Loc>,
     pub loc_ind_map: FxHashMap<Loc, LocId>,
-    pub permissions: IndexVec<LocId, BitSet<Permission>>,
-    pub origins: IndexVec<LocId, BitSet<Origin>>,
+    pub permissions: IndexVec<LocId, BitSet8<Permission>>,
+    pub origins: IndexVec<LocId, BitSet8<Origin>>,
     pub unsupported: HybridBitSet<LocId>,
 }
 
@@ -148,10 +150,12 @@ impl Pass for FileAnalysis {
         }
         let loc_ind_map: FxHashMap<_, _> = locs.iter_enumerated().map(|(i, l)| (*l, i)).collect();
 
+        let permission_graph: Graph<LocId, Permission> = Graph::new(locs.len(), Permission::NUM);
         let mut origin_graph: Graph<LocId, Origin> = Graph::new(locs.len(), Origin::NUM);
         origin_graph.add_solution(loc_ind_map[&Loc::Stdin], Origin::Stdin);
         origin_graph.add_solution(loc_ind_map[&Loc::Stdout], Origin::Stdout);
         origin_graph.add_solution(loc_ind_map[&Loc::Stderr], Origin::Stderr);
+
         let arena = Arena::new();
         let mut analyzer = Analyzer {
             tcx,
@@ -160,7 +164,7 @@ impl Pass for FileAnalysis {
             fn_ty_functions,
             // stdio_arg_locs,
             loc_ind_map: &loc_ind_map,
-            permission_graph: Graph::new(locs.len(), Permission::NUM),
+            permission_graph,
             origin_graph,
             unsupported: UnsupportedTracker::new(&arena),
         };
@@ -596,16 +600,17 @@ rustc_index::newtype_index! {
 
 struct Graph<V: Idx, T: Idx> {
     tok_num: usize,
-    solutions: IndexVec<V, BitSet<T>>,
+    solutions: IndexVec<V, BitSet8<T>>,
     edges: IndexVec<V, HybridBitSet<V>>,
 }
 
 impl<V: Idx, T: Idx> Graph<V, T> {
     #[inline]
     fn new(size: usize, tok_num: usize) -> Self {
+        assert!(tok_num <= 8);
         Self {
             tok_num,
-            solutions: IndexVec::from_raw(vec![BitSet::new_empty(tok_num); size]),
+            solutions: IndexVec::from_raw(vec![BitSet8::new_empty(); size]),
             edges: IndexVec::from_raw(vec![HybridBitSet::new_empty(size); size]),
         }
     }
@@ -620,7 +625,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
         self.edges[from].insert(to);
     }
 
-    fn solve(self) -> IndexVec<V, BitSet<T>> {
+    fn solve(self) -> IndexVec<V, BitSet8<T>> {
         let Self {
             tok_num,
             mut solutions,
@@ -673,7 +678,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 for (rep, ids) in &cycles {
                     for id in ids.iter() {
                         if *rep != id {
-                            let set = std::mem::replace(&mut deltas[id], BitSet::new_empty(size));
+                            let set = std::mem::replace(&mut deltas[id], BitSet8::new_empty());
                             deltas[*rep].union(&set);
                         }
                     }
@@ -681,17 +686,16 @@ impl<V: Idx, T: Idx> Graph<V, T> {
 
                 // update solutions
                 for (rep, ids) in &cycles {
-                    let mut intersection = BitSet::new_empty(tok_num);
-                    intersection.insert_all();
+                    let mut intersection = BitSet8::new_empty();
+                    intersection.insert_all(tok_num);
                     for id in ids.iter() {
                         intersection.intersect(&solutions[id]);
                         if *rep != id {
-                            let set =
-                                std::mem::replace(&mut solutions[id], BitSet::new_empty(tok_num));
+                            let set = std::mem::replace(&mut solutions[id], BitSet8::new_empty());
                             solutions[*rep].union(&set);
                         }
                     }
-                    let mut union = solutions[*rep].clone();
+                    let mut union = solutions[*rep];
                     union.subtract(&intersection);
                     deltas[*rep].union(&union);
                 }
@@ -710,7 +714,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 if deltas[v].is_empty() {
                     continue;
                 }
-                let delta = std::mem::replace(&mut deltas[v], BitSet::new_empty(size));
+                let delta = std::mem::replace(&mut deltas[v], BitSet8::new_empty());
 
                 for l in edges[v].iter() {
                     if l == v {
@@ -727,7 +731,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
 
         for (id, rep) in id_to_rep.iter_enumerated() {
             if id != *rep {
-                solutions[id] = solutions[*rep].clone();
+                solutions[id] = solutions[*rep];
             }
         }
 
