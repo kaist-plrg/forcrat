@@ -352,7 +352,11 @@ impl<'a> TypeArena<'a> {
                 Origin::Stdout => &STDOUT_TY,
                 Origin::Stderr => &STDERR_TY,
                 Origin::File => {
-                    if permissions.contains(Permission::Write) {
+                    if permissions.contains(Permission::Read)
+                        && permissions.contains(Permission::Write)
+                    {
+                        &FILE_TY
+                    } else if permissions.contains(Permission::Write) {
                         self.buf_writer(&FILE_TY)
                     } else if permissions.contains(Permission::Read)
                         || permissions.contains(Permission::BufRead)
@@ -474,7 +478,7 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
         (Impl(traits), File | Stdout | Stderr | ChildStdin | ChildStdout) => {
             if consume {
                 expr.to_string()
-            } else if traits.contains(StreamTrait::AsRawFd) {
+            } else if traits == BitSet8::new([StreamTrait::AsRawFd]) {
                 format!("std::os::fd::AsFd::as_fd(&({}))", expr)
             } else {
                 format!("&mut ({})", expr)
@@ -484,7 +488,7 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             Impl(traits),
             Ref(File) | Ref(Stdout) | Ref(Stderr) | Ref(ChildStdin) | Ref(ChildStdout),
         ) => {
-            if traits.contains(StreamTrait::AsRawFd) {
+            if traits == BitSet8::new([StreamTrait::AsRawFd]) {
                 format!("std::os::fd::AsFd::as_fd({})", expr)
             } else {
                 expr.to_string()
@@ -495,14 +499,14 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
                 format!("({}).lock()", expr)
             } else if consume {
                 expr.to_string()
-            } else if traits.contains(StreamTrait::AsRawFd) {
+            } else if traits == BitSet8::new([StreamTrait::AsRawFd]) {
                 format!("std::os::fd::AsFd::as_fd(&({}))", expr)
             } else {
                 format!("&mut ({})", expr)
             }
         }
         (Impl(traits), BufWriter(from) | BufReader(from)) => {
-            if traits.contains(StreamTrait::AsRawFd) {
+            if traits == BitSet8::new([StreamTrait::AsRawFd]) {
                 if consume {
                     let inner = format!("({}).into_inner().unwrap()", expr);
                     convert_expr(to, *from, &inner, true)
@@ -517,7 +521,7 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             }
         }
         (Impl(traits), Ref(BufWriter(from)) | Ref(BufReader(from))) => {
-            if traits.contains(StreamTrait::AsRawFd) {
+            if traits == BitSet8::new([StreamTrait::AsRawFd]) {
                 let inner = format!("({}).get_mut()", expr);
                 convert_expr(to, Ref(from), &inner, true)
             } else {

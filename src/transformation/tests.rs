@@ -900,6 +900,24 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_read_write() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w+\0" as *const u8 as *const libc::c_char,
+    );
+    let mut c: libc::c_int = fgetc(stream);
+    fputc(c, stream);
+    fclose(stream);
+}"#,
+        &["File", "Read", "read_exact", "Write", "write_all", "drop"],
+        &["FILE", "fgetc", "fputc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
