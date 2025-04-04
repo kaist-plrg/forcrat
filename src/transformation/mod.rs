@@ -1145,6 +1145,7 @@ struct TransformVisitor<'tcx, 'a> {
     /// is stdin unsupported
     is_stdin_unsupported: bool,
     /// is stdout unsupported
+    #[allow(unused)]
     is_stdout_unsupported: bool,
     /// is stderr unsupported
     #[allow(unused)]
@@ -1481,9 +1482,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "printf" => {
-                        if self.is_stdout_unsupported {
-                            return;
-                        }
+                        // if self.is_stdout_unsupported {
+                        //     return;
+                        // }
                         let stream = StdExpr::stdout();
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let new_expr =
@@ -1491,9 +1492,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "wprintf" => {
-                        if self.is_stdout_unsupported {
-                            return;
-                        }
+                        // if self.is_stdout_unsupported {
+                        //     return;
+                        // }
                         let stream = StdExpr::stdout();
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let new_expr =
@@ -1511,9 +1512,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "putchar" => {
-                        if self.is_stdout_unsupported {
-                            return;
-                        }
+                        // if self.is_stdout_unsupported {
+                        //     return;
+                        // }
                         let stream = StdExpr::stdout();
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let new_expr = transform_fputc(&stream, &args[0], ic);
@@ -1530,9 +1531,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "puts" => {
-                        if self.is_stdout_unsupported {
-                            return;
-                        }
+                        // if self.is_stdout_unsupported {
+                        //     return;
+                        // }
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let new_expr = transform_puts(&args[0], ic);
                         self.replace_expr(expr, new_expr);
