@@ -65,6 +65,9 @@ fn main() {
             if show_api_names {
                 print!("total ");
                 for (name, api_kind) in API_LIST {
+                    if api_kind.is_not_io() {
+                        continue;
+                    }
                     print!("{} ", name);
                     if distinguish_std_args && (api_kind.is_read() || api_kind.is_write()) {
                         print!("{}_std ", name);
@@ -83,6 +86,9 @@ fn main() {
                 return;
             }
             for (name, api_kind) in API_LIST {
+                if api_kind.is_not_io() {
+                    continue;
+                }
                 if distinguish_std_args {
                     let v = counts.get(name).copied().unwrap_or(0);
                     print!("{} ", v);

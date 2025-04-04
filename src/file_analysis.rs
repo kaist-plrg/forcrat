@@ -455,7 +455,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 }
                             }
                         }
-                        ApiKind::Operation(None) | ApiKind::StdioOperation | ApiKind::NotIO => {}
+                        ApiKind::Operation(None)
+                        | ApiKind::StdioOperation
+                        | ApiKind::Ignore
+                        | ApiKind::NotIO => {}
                     }
                 } else if let Some(callee) = def_id.as_local() {
                     self.transfer_non_api_call(callee, args, *destination, ctx);

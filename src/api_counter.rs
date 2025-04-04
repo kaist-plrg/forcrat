@@ -68,6 +68,9 @@ impl<'tcx> ApiVisitor<'tcx> {
         let symbol = some_or!(def_id_to_value_symbol(def_id, self.tcx), return true);
         let name = normalize_api_name(symbol.as_str());
         let (name, api_kind) = some_or!(API_MAP.get_key_value(name), return true);
+        if api_kind.is_not_io() {
+            return true;
+        }
         let counts = if (api_kind.is_read() || api_kind.is_write())
             && args.iter().any(|arg| is_std_io_expr(arg, self.tcx))
         {

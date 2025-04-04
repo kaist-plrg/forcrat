@@ -120,8 +120,9 @@ pub enum ApiKind {
     PipeOpen,
     Operation(Option<Permission>),
     StdioOperation,
-    NotIO,
     Unsupported,
+    Ignore,
+    NotIO,
 }
 
 impl ApiKind {
@@ -139,13 +140,18 @@ impl ApiKind {
     pub fn is_unsupported(self) -> bool {
         matches!(self, Unsupported)
     }
+
+    #[inline]
+    pub fn is_not_io(self) -> bool {
+        matches!(self, NotIO)
+    }
 }
 
 lazy_static! {
     pub static ref API_MAP: FxHashMap<&'static str, ApiKind> = API_LIST.iter().copied().collect();
 }
 
-pub static API_LIST: [(&str, ApiKind); 81] = [
+pub static API_LIST: [(&str, ApiKind); 91] = [
     // stdio.h
     // Open (6)
     ("fopen", Open(File)),
@@ -169,12 +175,12 @@ pub static API_LIST: [(&str, ApiKind); 81] = [
     ("getdelim", Operation(Some(BufRead))),
     // Read stdin (5)
     ("scanf", StdioOperation),
-    ("vscanf", StdioOperation),
+    ("vscanf", Unsupported),
     ("getchar", StdioOperation), // unlocked
     ("gets", StdioOperation),    // removed
     // Read string (2)
-    // ("sscanf", NotIO),
-    // ("vsscanf", NotIO),
+    ("sscanf", NotIO),
+    ("vsscanf", NotIO),
     // Write (8)
     ("fprintf", Operation(Some(Write))),
     ("vfprintf", Unsupported),
@@ -185,18 +191,18 @@ pub static API_LIST: [(&str, ApiKind); 81] = [
     ("fflush", Operation(Some(Write))),
     // Write stdout/stderr (6)
     ("printf", StdioOperation),
-    ("vprintf", StdioOperation),
+    ("vprintf", Unsupported),
     ("putchar", StdioOperation), // unlocked
     ("puts", StdioOperation),
     ("perror", StdioOperation),
     // Write fd (2)
-    ("dprintf", Unsupported),
-    ("vdprintf", Unsupported),
+    ("dprintf", Ignore),
+    ("vdprintf", Ignore),
     // Write string (4)
-    // ("sprintf", NotIO),
-    // ("vsprintf", NotIO),
-    // ("snprintf", NotIO),
-    // ("vsnprintf", NotIO),
+    ("sprintf", NotIO),
+    ("vsprintf", NotIO),
+    ("snprintf", NotIO),
+    ("vsnprintf", NotIO),
     // Positioning (7)
     ("fseek", Operation(Some(Seek))),
     ("fseeko", Operation(Some(Seek))),
@@ -220,12 +226,12 @@ pub static API_LIST: [(&str, ApiKind); 81] = [
     ("freopen", Unsupported),
     ("fileno", Operation(Some(AsRawFd))),
     // File system (6)
-    ("rename", NotIO),
-    ("renameat", NotIO),
-    ("remove", NotIO),
-    ("tmpnam", NotIO),
-    ("tempnam", NotIO), // removed
-    ("ctermid", NotIO),
+    ("rename", Unsupported),
+    ("renameat", Unsupported),
+    ("remove", Unsupported),
+    ("tmpnam", Unsupported),
+    ("tempnam", Unsupported), // removed
+    ("ctermid", Unsupported),
     // GNU libc
     ("__fpending", Unsupported),
     ("__freading", Unsupported),
@@ -243,11 +249,11 @@ pub static API_LIST: [(&str, ApiKind); 81] = [
     ("ungetwc", Unsupported),
     // Read stdin (3)
     ("wscanf", StdioOperation),
-    ("vwscanf", StdioOperation),
+    ("vwscanf", Unsupported),
     ("getwchar", StdioOperation),
     // Read string (2)
-    // ("swscanf", NotIO),
-    // ("vswscanf", NotIO),
+    ("swscanf", NotIO),
+    ("vswscanf", NotIO),
     // Write (5)
     ("fwprintf", Operation(Some(Write))),
     ("vfwprintf", Unsupported),
@@ -256,11 +262,11 @@ pub static API_LIST: [(&str, ApiKind); 81] = [
     ("fputws", Operation(Some(Write))),
     // Write stdout/stderr (3)
     ("wprintf", StdioOperation),
-    ("vwprintf", StdioOperation),
+    ("vwprintf", Unsupported),
     ("putwchar", StdioOperation),
     // Write string (2)
-    // ("swprintf", NotIO),
-    // ("vswprintf", NotIO),
+    ("swprintf", NotIO),
+    ("vswprintf", NotIO),
     // Orientation (1)
     ("fwide", Unsupported),
 ];
