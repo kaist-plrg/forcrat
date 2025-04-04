@@ -25,6 +25,7 @@ use rustc_middle::{
     ty::{self, AdtDef, TyCtxt},
 };
 use rustc_span::{def_id::LocalDefId, symbol::Ident, FileName, RealFileName, Span, Symbol};
+use toml_edit::DocumentMut;
 use typed_arena::Arena;
 
 use crate::{
@@ -36,19 +37,34 @@ use crate::{
     rustc_middle::mir::visit::Visitor as _,
 };
 
-pub fn write_to_files(fss: &[(FileName, String)]) -> std::io::Result<()> {
-    for (f, s) in fss {
+pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
+    for (f, s) in &res.files {
         let FileName::Real(RealFileName::LocalPath(p)) = f else { panic!() };
-        fs::write(p, s)?;
+        fs::write(p, s).unwrap();
     }
-    Ok(())
+    if res.tmpfile {
+        let path = dir.join("Cargo.toml");
+        let content = fs::read_to_string(&path).unwrap();
+        let mut doc = content.parse::<DocumentMut>().unwrap();
+        let dependencies = doc["dependencies"].as_table_mut().unwrap();
+        if !dependencies.contains_key("tempfile") {
+            dependencies["tempfile"] = toml_edit::value("3.19.1");
+            fs::write(path, doc.to_string()).unwrap();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TransformationResult {
+    files: Vec<(FileName, String)>,
+    tmpfile: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Transformation;
 
 impl Pass for Transformation {
-    type Out = Vec<(FileName, String)>;
+    type Out = TransformationResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         // collect information from AST
@@ -213,10 +229,11 @@ impl Pass for Transformation {
             }
         }
 
-        let parse_sess = new_parse_sess();
-        let mut updated = vec![];
-
         let source_map = tcx.sess.source_map();
+        let parse_sess = new_parse_sess();
+        let mut files = vec![];
+        let mut tmpfile = false;
+
         for file in source_map.files().iter() {
             if !matches!(
                 file.name,
@@ -233,7 +250,6 @@ impl Pass for Transformation {
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
                 tcx,
-                updated: false,
                 static_span_to_lit: &ast_visitor.static_span_to_lit,
                 hir: &hir_ctx,
                 param_to_loc: &param_to_hir_loc,
@@ -242,7 +258,10 @@ impl Pass for Transformation {
                 null_casts: &null_casts,
                 unsupported: &unsupported,
                 is_stdin_unsupported,
+
+                updated: false,
                 updated_field_spans: FxHashSet::default(),
+                tmpfile: false,
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
@@ -258,11 +277,12 @@ impl Pass for Transformation {
                 }
 
                 let s = pprust::crate_to_string_for_macros(&krate);
-                updated.push((file.name.clone(), s));
+                files.push((file.name.clone(), s));
+                tmpfile |= visitor.tmpfile;
             }
         }
 
-        updated
+        TransformationResult { files, tmpfile }
     }
 }
 
@@ -1116,6 +1136,7 @@ struct TransformVisitor<'tcx, 'a> {
     /// is this file updated
     updated: bool,
     updated_field_spans: FxHashSet<Span>,
+    tmpfile: bool,
 }
 
 impl<'a> TransformVisitor<'_, 'a> {
@@ -1256,6 +1277,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let p = Param::new(def_id, i);
                     let pot = some_or!(self.param_pot(p), continue);
                     self.replace_ty(&mut param.ty, ty!("Option<TT{}>", i));
+                    if let PatKind::Ident(BindingAnnotation(_, m), _, _) = &mut param.pat.kind {
+                        *m = Mutability::Mut;
+                    }
                     tparams.push((i, pot));
                 }
                 for (i, po) in tparams {
@@ -1330,6 +1354,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         let pot = self.bound_pot(lhs).unwrap();
                         let new_expr = transform_fopen(&args[0], &args[1], pot);
                         self.replace_expr(expr, new_expr);
+                    }
+                    "tmpfile" => {
+                        let lhs = self.hir.rhs_to_lhs[&expr_span];
+                        let pot = self.bound_pot(lhs).unwrap();
+                        let new_expr = transform_tmpfile(pot);
+                        self.replace_expr(expr, new_expr);
+                        self.tmpfile = true;
                     }
                     "popen" => {
                         let lhs = self.hir.rhs_to_lhs[&expr_span];
@@ -1764,6 +1795,13 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
         LikelyLit::Other(_) => todo!(),
     };
     let new_expr = convert_expr(*pot.ty, StreamType::Option(&FILE_TY), &expr, true);
+    expr!("{}", new_expr)
+}
+
+fn transform_tmpfile(pot: &Pot<'_>) -> Expr {
+    let expr = "tempfile::tempfile().ok()";
+    let ty = StreamType::Option(&FILE_TY);
+    let new_expr = convert_expr(*pot.ty, ty, expr, true);
     expr!("{}", new_expr)
 }
 

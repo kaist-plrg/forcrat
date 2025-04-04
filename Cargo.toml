@@ -13,6 +13,8 @@ etrace = "1.1.1"
 rustfix = "0.8.2"
 lazy_static = "1.5.0"
 typed-arena = "2.0.2"
+toml = "0.8.20"
+toml_edit = "0.22.24"
 
 [package.metadata.rust-analyzer]
 rustc_private = true

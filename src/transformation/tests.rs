@@ -5,8 +5,8 @@ use crate::{compile_util::Pass, formatter, ty_checker};
 fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
-    let v = super::Transformation.run_on_str(&code);
-    let [(_, s)] = &v[..] else { panic!() };
+    let res = super::Transformation.run_on_str(&code);
+    let [(_, s)] = &res.files[..] else { panic!() };
     let stripped = s.strip_prefix(FORMATTED_PREAMBLE.as_str()).unwrap();
     assert!(ty_checker::TyChecker.run_on_str(&s), "{}", stripped);
     for s in includes {
@@ -956,6 +956,21 @@ unsafe fn f(mut mode: *const libc::c_char) {
 }"#,
         &["Read", "open", "read_exact", "drop"],
         &["FILE", "fopen", "fgetc", "fclose"],
+    );
+}
+
+#[test]
+fn test_tmpfile() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut stream: *mut FILE = tmpfile();
+    fputc('a' as i32, stream);
+    fputc('a' as i32, stream);
+    fclose(stream);
+}"#,
+        &["Write", "tempfile", "write_all", "drop"],
+        &["FILE", "tmpfile", "fputc", "fclose"],
     );
 }
 

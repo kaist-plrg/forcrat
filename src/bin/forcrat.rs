@@ -133,7 +133,7 @@ fn main() {
             let file = output.join("c2rust-lib.rs");
 
             let updated = transformation::Transformation.run_on_path(&file);
-            transformation::write_to_files(&updated).unwrap();
+            transformation::write_to_files(&updated, &output);
         }
     }
 }
