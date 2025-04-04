@@ -918,6 +918,32 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_read_box() {
+    run_test(
+        r#"
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    if x != 0 {
+        stream = fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        );
+    } else {
+        stream = popen(
+            b"ls\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        );
+    }
+    fgetc(stream);
+    fgetc(stream);
+    fclose(stream);
+}"#,
+        &["Box", "Read", "read_exact", "drop"],
+        &["FILE", "fopen", "popen", "fgetc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

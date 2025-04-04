@@ -1,4 +1,8 @@
-use std::{fmt::Write as _, fs, ops::Deref};
+use std::{
+    fmt::Write as _,
+    fs,
+    ops::{Deref, DerefMut},
+};
 
 use etrace::some_or;
 use rustc_abi::{FieldIdx, VariantIdx};
@@ -341,7 +345,7 @@ impl<'a> TypeArena<'a> {
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
             }
-            let ty = self.alloc(StreamType::Impl(traits));
+            let ty = self.alloc(StreamType::Impl(TraitBound(traits)));
             self.option(ty)
         } else if origins.is_empty() {
             self.option(&FILE_TY)
@@ -377,7 +381,12 @@ impl<'a> TypeArena<'a> {
                 self.ptr(ty)
             }
         } else {
-            todo!("{:?}", origins)
+            let mut traits = BitSet8::new_empty();
+            for p in permissions.iter() {
+                traits.insert(some_or!(StreamTrait::from_permission(p), continue));
+            }
+            let ty = self.alloc(StreamType::BoxDyn(TraitBound(traits)));
+            self.option(ty)
         }
     }
 }
@@ -396,7 +405,8 @@ enum StreamType<'a> {
     BufReader(&'a StreamType<'a>),
     Ptr(&'a StreamType<'a>),
     Ref(&'a StreamType<'a>),
-    Impl(BitSet8<StreamTrait>),
+    BoxDyn(TraitBound),
+    Impl(TraitBound),
 }
 
 static STDIN_TY: StreamType<'static> = StreamType::Stdin;
@@ -420,15 +430,8 @@ impl std::fmt::Display for StreamType<'_> {
             Self::BufReader(t) => write!(f, "std::io::BufReader<{}>", t),
             Self::Ptr(t) => write!(f, "*mut {}", t),
             Self::Ref(t) => write!(f, "&mut {}", t),
-            Self::Impl(traits) => {
-                for (i, t) in traits.iter().enumerate() {
-                    if i != 0 {
-                        write!(f, " + ")?;
-                    }
-                    write!(f, "{}", t)?;
-                }
-                Ok(())
-            }
+            Self::BoxDyn(traits) => write!(f, "Box<dyn {}>", traits),
+            Self::Impl(traits) => write!(f, "impl {}", traits),
         }
     }
 }
@@ -478,7 +481,7 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
         (Impl(traits), File | Stdout | Stderr | ChildStdin | ChildStdout) => {
             if consume {
                 expr.to_string()
-            } else if traits == BitSet8::new([StreamTrait::AsRawFd]) {
+            } else if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
                 format!("std::os::fd::AsFd::as_fd(&({}))", expr)
             } else {
                 format!("&mut ({})", expr)
@@ -488,7 +491,7 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             Impl(traits),
             Ref(File) | Ref(Stdout) | Ref(Stderr) | Ref(ChildStdin) | Ref(ChildStdout),
         ) => {
-            if traits == BitSet8::new([StreamTrait::AsRawFd]) {
+            if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
                 format!("std::os::fd::AsFd::as_fd({})", expr)
             } else {
                 expr.to_string()
@@ -499,14 +502,14 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
                 format!("({}).lock()", expr)
             } else if consume {
                 expr.to_string()
-            } else if traits == BitSet8::new([StreamTrait::AsRawFd]) {
+            } else if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
                 format!("std::os::fd::AsFd::as_fd(&({}))", expr)
             } else {
                 format!("&mut ({})", expr)
             }
         }
         (Impl(traits), BufWriter(from) | BufReader(from)) => {
-            if traits == BitSet8::new([StreamTrait::AsRawFd]) {
+            if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
                 if consume {
                     let inner = format!("({}).into_inner().unwrap()", expr);
                     convert_expr(to, *from, &inner, true)
@@ -521,7 +524,7 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             }
         }
         (Impl(traits), Ref(BufWriter(from)) | Ref(BufReader(from))) => {
-            if traits == BitSet8::new([StreamTrait::AsRawFd]) {
+            if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
                 let inner = format!("({}).get_mut()", expr);
                 convert_expr(to, Ref(from), &inner, true)
             } else {
@@ -539,6 +542,23 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             } else {
                 format!("&mut *({})", expr)
             }
+        }
+        (Impl(_), Ref(BoxDyn(_))) => {
+            if consume {
+                expr.to_string()
+            } else {
+                format!("&mut *({})", expr)
+            }
+        }
+        (
+            BoxDyn(traits),
+            File | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+        ) => {
+            assert!(consume);
+            format!(
+                "{{ let stream: Box<dyn {}> = Box::new({}); stream }}",
+                traits, expr
+            )
         }
         (BufWriter(to), from) if *to == from => {
             assert!(consume);
@@ -563,6 +583,7 @@ impl StreamType<'_> {
             | Self::ChildStdout
             | Self::BufWriter(_)
             | Self::BufReader(_)
+            | Self::BoxDyn(_)
             | Self::Impl(_) => false,
             Self::Ref(_) => false,
             Self::Ptr(_) => true,
@@ -639,13 +660,13 @@ trait StreamExpr {
 
     #[inline]
     fn borrow_for(&self, tr: StreamTrait) -> String {
-        let to = StreamType::Impl(BitSet8::new([tr]));
+        let to = StreamType::Impl(TraitBound::new([tr]));
         convert_expr(to, self.ty(), &self.expr(), false)
     }
 
     #[inline]
     fn opt_borrow_for(&self, tr: StreamTrait) -> String {
-        let ty = StreamType::Impl(BitSet8::new([tr]));
+        let ty = StreamType::Impl(TraitBound::new([tr]));
         let to = StreamType::Option(&ty);
         convert_expr(to, self.ty(), &self.expr(), false)
     }
@@ -774,6 +795,44 @@ impl Idx for StreamTrait {
     #[inline]
     fn index(self) -> usize {
         self as _
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraitBound(BitSet8<StreamTrait>);
+
+impl std::fmt::Display for TraitBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, t) in self.0.iter().enumerate() {
+            if i != 0 {
+                write!(f, " + ")?;
+            }
+            write!(f, "{}", t)?;
+        }
+        Ok(())
+    }
+}
+
+impl Deref for TraitBound {
+    type Target = BitSet8<StreamTrait>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for TraitBound {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl TraitBound {
+    #[inline]
+    fn new<I: IntoIterator<Item = StreamTrait>>(traits: I) -> Self {
+        Self(BitSet8::new(traits))
     }
 }
 
@@ -1200,11 +1259,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     tparams.push((i, pot));
                 }
                 for (i, po) in tparams {
-                    let tparam = if po.permissions.is_empty() {
+                    let StreamType::Option(StreamType::Impl(bound)) = po.ty else { panic!() };
+                    let tparam = if bound.is_empty() {
                         ty_param!("TT{}", i)
                     } else {
-                        let StreamType::Option(ty) = po.ty else { panic!() };
-                        ty_param!("TT{}: {}", i, ty)
+                        ty_param!("TT{}: {}", i, bound)
                     };
                     item.generics.params.push(tparam);
                 }
@@ -1273,7 +1332,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     "popen" => {
-                        let new_expr = transform_popen(&args[0], &args[1]);
+                        let lhs = self.hir.rhs_to_lhs[&expr_span];
+                        let pot = self.bound_pot(lhs).unwrap();
+                        let new_expr = transform_popen(&args[0], &args[1], pot);
                         self.replace_expr(expr, new_expr);
                     }
                     "fclose" | "pclose" => {
@@ -1667,21 +1728,21 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
     expr!("{}", new_expr)
 }
 
-fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
+fn transform_popen(command: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
     let command = pprust::expr_to_string(command);
     let command = format!(
         "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
         command
     );
     let mode = LikelyLit::from_expr(mode);
-    match mode {
+    let (expr, ty) = match mode {
         LikelyLit::Lit(mode) => {
-            let field = match &mode.as_str()[..1] {
-                "r" => "stdout",
-                "w" => "stdin",
+            let (field, ty) = match &mode.as_str()[..1] {
+                "r" => ("stdout", &CHILD_STDOUT_TY),
+                "w" => ("stdin", &CHILD_STDIN_TY),
                 _ => panic!("{:?}", mode),
             };
-            expr!(
+            let expr = format!(
                 r#"std::process::Command::new("sh")
                 .arg("-c")
                 .arg("--")
@@ -1690,14 +1751,16 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
                 .spawn()
                 .ok()
                 .and_then(|child| child.{1})"#,
-                command,
-                field
-            )
+                command, field
+            );
+            (expr, StreamType::Option(ty))
         }
         LikelyLit::If(_, _, _) => todo!(),
         LikelyLit::Path(_) => todo!(),
         LikelyLit::Other(_) => todo!(),
-    }
+    };
+    let new_expr = convert_expr(*pot.ty, ty, &expr, true);
+    expr!("{}", new_expr)
 }
 
 fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
