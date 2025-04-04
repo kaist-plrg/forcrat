@@ -105,7 +105,13 @@ impl Pass for Transformation {
                 let loc = analysis_res.locs[loc_id];
                 match loc {
                     Loc::Var(def_id, local) => {
-                        let body = tcx.optimized_mir(def_id);
+                        let node = hir.get_by_def_id(def_id);
+                        let hir::Node::Item(item) = node else { panic!() };
+                        let body = match item.kind {
+                            hir::ItemKind::Fn(_, _, _) => tcx.optimized_mir(def_id),
+                            hir::ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
+                            _ => panic!(),
+                        };
                         let local_decl = &body.local_decls[local];
                         let span = local_decl.source_info.span;
                         Some(span)
@@ -1697,7 +1703,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let lhs_pot = some_or!(self.bound_pot(lhs.span), return);
                 let rhs_pot = some_or!(self.bound_pot(rhs.span), return);
                 let rhs_str = pprust::expr_to_string(rhs);
-                let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, false);
+                let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, true);
                 let new_rhs = expr!("{}", new_rhs);
                 self.replace_expr(rhs, new_rhs);
             }
@@ -1706,7 +1712,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let lhs_pot = some_or!(self.bound_pot(f.ident.span), return);
                     let rhs_pot = some_or!(self.bound_pot(f.expr.span), return);
                     let rhs_str = pprust::expr_to_string(&f.expr);
-                    let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, false);
+                    let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, true);
                     let new_rhs = expr!("{}", new_rhs);
                     self.replace_expr(&mut f.expr, new_rhs);
                 }
@@ -2110,7 +2116,6 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
     wide: bool,
     ic: IndicatorCheck<'_>,
 ) -> Expr {
-    assert!(!ic.has_check());
     // from rustc_ast/src/util/literal.rs
     let s = fmt.as_str();
     let mut buf = Vec::with_capacity(s.len());
@@ -2160,15 +2165,33 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
         }
     }
     let stream = stream.borrow_for(StreamTrait::Write);
-    expr!(
-        "{{
+    if ic.has_check() {
+        expr!(
+            "{{
+    use std::io::Write;
+    match write!({}, \"{}\", {}) {{
+        Ok(_) => {{}}
+        Err(e) => {{
+            {}
+        }}
+    }}
+}}",
+            stream,
+            fmt,
+            new_args,
+            ic.error_handling_no_eof(),
+        )
+    } else {
+        expr!(
+            "{{
     use std::io::Write;
     write!({}, \"{}\", {})
 }}",
-        stream,
-        fmt,
-        new_args
-    )
+            stream,
+            fmt,
+            new_args
+        )
+    }
 }
 
 #[inline]

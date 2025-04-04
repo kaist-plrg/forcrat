@@ -56,8 +56,8 @@ impl<T: Idx> BitSet8<T> {
     }
 
     #[inline]
-    pub fn insert_all(&mut self, domain_size: usize) {
-        self.word = (1 << domain_size) - 1;
+    pub fn insert_all(&mut self, domain_size: u32) {
+        self.word = 1u8.overflowing_shl(domain_size).0 - 1;
     }
 
     #[inline]

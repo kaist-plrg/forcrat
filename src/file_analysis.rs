@@ -690,7 +690,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 // update solutions
                 for (rep, ids) in &cycles {
                     let mut intersection = BitSet8::new_empty();
-                    intersection.insert_all(tok_num);
+                    intersection.insert_all(tok_num as _);
                     for id in ids.iter() {
                         intersection.intersect(&solutions[id]);
                         if *rep != id {
