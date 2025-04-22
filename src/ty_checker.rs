@@ -9,6 +9,7 @@ impl Pass for TyChecker {
     type Out = bool;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        tcx.analysis(()).is_ok()
+        let () = tcx.analysis(());
+        tcx.dcx().err_count() == 0
     }
 }

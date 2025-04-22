@@ -4,13 +4,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{ForeignItemKind, ItemKind};
 use rustc_middle::{
     mir::{
-        interpret::{ConstValue, GlobalAlloc, Scalar},
-        BinOp, ConstantKind, Local, Operand, Rvalue, Statement, StatementKind, Terminator,
+        interpret::{GlobalAlloc, Scalar},
+        BinOp, Const, ConstValue, Local, Operand, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
-use rustc_span::def_id::{DefId, LocalDefId};
+use rustc_span::{
+    def_id::{DefId, LocalDefId},
+    source_map::Spanned,
+};
 use typed_arena::Arena;
 
 use crate::{compile_util::Pass, disjoint_set::DisjointSet};
@@ -22,14 +25,12 @@ impl Pass for Steensgaard {
     type Out = AnalysisResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> AnalysisResult {
-        let hir = tcx.hir();
-
-        let var_arena = typed_arena::Arena::new();
-        let fn_arena = typed_arena::Arena::new();
+        let var_arena = Arena::new();
+        let fn_arena = Arena::new();
         let mut analyzer = Analyzer::new(tcx, &var_arena, &fn_arena);
 
-        for item_id in hir.items() {
-            let item = hir.item(item_id);
+        for item_id in tcx.hir_free_items() {
+            let item = tcx.hir_item(item_id);
             if item.ident.name.as_str() == "main" {
                 continue;
             }
@@ -38,8 +39,8 @@ impl Pass for Steensgaard {
             match item.kind {
                 ItemKind::ForeignMod { items, .. } => {
                     for item_ref in items {
-                        let item = hir.foreign_item(item_ref.id);
-                        if !matches!(item.kind, ForeignItemKind::Static(_, _)) {
+                        let item = tcx.hir_foreign_item(item_ref.id);
+                        if !matches!(item.kind, ForeignItemKind::Static(_, _, _)) {
                             continue;
                         }
                         let id = VarId::Global(item.owner_id.def_id);
@@ -58,7 +59,7 @@ impl Pass for Steensgaard {
                     analyzer.insert_and_allocate(id);
                     analyzer.x_eq_y(id, VarId::Local(local_def_id, Local::from_u32(0)));
                 }
-                ItemKind::Fn(_, _, _) => {
+                ItemKind::Fn { .. } => {
                     let body = tcx.optimized_mir(def_id);
 
                     for (i, _) in body.local_decls.iter_enumerated() {
@@ -74,9 +75,9 @@ impl Pass for Steensgaard {
             }
         }
 
-        for item_id in hir.items() {
-            let item = hir.item(item_id);
-            if !matches!(item.kind, ItemKind::Static(_, _, _) | ItemKind::Fn(_, _, _)) {
+        for item_id in tcx.hir_free_items() {
+            let item = tcx.hir_item(item_id);
+            if !matches!(item.kind, ItemKind::Static(_, _, _) | ItemKind::Fn { .. }) {
                 continue;
             }
             if item.ident.name.as_str() == "main" {
@@ -85,7 +86,7 @@ impl Pass for Steensgaard {
 
             let local_def_id = item.owner_id.def_id;
             let def_id = local_def_id.to_def_id();
-            let body = if matches!(item.kind, ItemKind::Fn(_, _, _)) {
+            let body = if matches!(item.kind, ItemKind::Fn { .. }) {
                 tcx.optimized_mir(def_id)
             } else {
                 tcx.mir_for_ctfe(def_id)
@@ -474,14 +475,14 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 let r_id = VarId::Global(def_id.as_local().unwrap());
                 self.x_eq_ref_y(l_id, r_id);
             }
-            Rvalue::AddressOf(_, r) => {
+            Rvalue::RawPtr(_, r) => {
                 assert!(!l_deref);
                 assert!(r.is_indirect_first_projection());
                 let r_id = VarId::Local(func, r.local);
                 self.x_eq_y(l_id, r_id);
             }
             Rvalue::Len(_) => unreachable!(),
-            Rvalue::BinaryOp(op, box (r1, r2)) | Rvalue::CheckedBinaryOp(op, box (r1, r2)) => {
+            Rvalue::BinaryOp(op, box (r1, r2)) => {
                 if !matches!(
                     op,
                     BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt
@@ -507,6 +508,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                     self.x_eq_y(l_id, r_id);
                 }
             }
+            Rvalue::WrapUnsafeBinder(_, _) => unreachable!(),
         }
     }
 
@@ -522,23 +524,25 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                     (true, true) => self.deref_x_eq_deref_y(l_id, r_id),
                 }
             }
-            Operand::Constant(box constant) => match constant.literal {
-                ConstantKind::Ty(_) => unreachable!(),
-                ConstantKind::Unevaluated(_, _) => {}
-                ConstantKind::Val(value, ty) => match value {
+            Operand::Constant(box constant) => match constant.const_ {
+                Const::Ty(_, _) => unreachable!(),
+                Const::Unevaluated(_, _) => {}
+                Const::Val(value, ty) => match value {
                     ConstValue::Scalar(scalar) => match scalar {
                         Scalar::Int(_) => {}
-                        Scalar::Ptr(ptr, _) => match self.tcx.global_alloc(ptr.provenance) {
-                            GlobalAlloc::Static(def_id) => {
-                                let r_id = VarId::Global(def_id.as_local().unwrap());
-                                assert!(!l_deref);
-                                self.x_eq_ref_y(l_id, r_id);
+                        Scalar::Ptr(ptr, _) => {
+                            match self.tcx.global_alloc(ptr.provenance.alloc_id()) {
+                                GlobalAlloc::Static(def_id) => {
+                                    let r_id = VarId::Global(def_id.as_local().unwrap());
+                                    assert!(!l_deref);
+                                    self.x_eq_ref_y(l_id, r_id);
+                                }
+                                GlobalAlloc::Memory(_) => {
+                                    self.x_eq_alloc(l_id);
+                                }
+                                _ => unreachable!(),
                             }
-                            GlobalAlloc::Memory(_) => {
-                                self.x_eq_alloc(l_id);
-                            }
-                            _ => unreachable!(),
-                        },
+                        }
                     },
                     ConstValue::ZeroSized => {
                         let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
@@ -550,7 +554,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                         }
                     }
                     ConstValue::Slice { .. } => unreachable!(),
-                    ConstValue::ByRef { .. } => unreachable!(),
+                    ConstValue::Indirect { .. } => unreachable!(),
                 },
             },
         }
@@ -576,7 +580,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 self.transfer_intra_call(caller, callee, args, d_id);
             }
             Operand::Constant(box constant) => {
-                let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                let Const::Val(value, ty) = constant.const_ else { unreachable!() };
                 assert!(matches!(value, ConstValue::ZeroSized));
                 let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
                 let name = self.def_id_to_string(*def_id);
@@ -617,7 +621,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         &mut self,
         caller: LocalDefId,
         callee: VarId,
-        args: &[Operand<'_>],
+        args: &[Spanned<Operand<'_>>],
         dst: VarId,
     ) {
         let (_, ft) = self.variable_type(callee);
@@ -630,7 +634,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         let ret = *ret;
 
         for (p, a) in params.clone().into_iter().zip(args) {
-            match a {
+            match a.node {
                 Operand::Copy(a) | Operand::Move(a) => {
                     assert!(!a.is_indirect_first_projection());
                     let a_id = VarId::Local(caller, a.local);
@@ -655,7 +659,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         name: &str,
         inputs: &[Ty<'_>],
         output: Ty<'_>,
-        args: &[Operand<'_>],
+        args: &[Spanned<Operand<'_>>],
         dst: VarId,
     ) {
         if (output.is_unit() || output.is_never() || output.is_primitive())
@@ -663,26 +667,26 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             || name.contains("printf")
             || NO_OP_C_FNS.contains(name)
         {
-        } else if output.is_unsafe_ptr() && inputs.iter().all(|t| t.is_primitive())
+        } else if output.is_raw_ptr() && inputs.iter().all(|t| t.is_primitive())
             || ALLOC_C_FNS.contains(name)
         {
             self.x_eq_alloc(dst);
         } else if name == "realloc" {
-            self.transfer_operand(caller, dst, false, &args[0]);
+            self.transfer_operand(caller, dst, false, &args[0].node);
             self.x_eq_alloc(dst);
         } else if RET_0_C_FNS.contains(name) {
-            self.transfer_operand(caller, dst, false, &args[0]);
+            self.transfer_operand(caller, dst, false, &args[0].node);
         } else if name == "bcopy" {
-            let l = args[1].place().unwrap();
-            let r = args[0].place().unwrap();
+            let l = args[1].node.place().unwrap();
+            let r = args[0].node.place().unwrap();
             assert!(!l.is_indirect_first_projection());
             assert!(!r.is_indirect_first_projection());
             let l_id = VarId::Local(caller, l.local);
             let r_id = VarId::Local(caller, r.local);
             self.deref_x_eq_deref_y(l_id, r_id);
         } else if COPY_C_FNS.contains(name) {
-            let l = args[0].place().unwrap();
-            let r = args[1].place().unwrap();
+            let l = args[0].node.place().unwrap();
+            let r = args[1].node.place().unwrap();
             assert!(!l.is_indirect_first_projection());
             assert!(!r.is_indirect_first_projection());
             let l_id = VarId::Local(caller, l.local);
@@ -700,7 +704,7 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
         name: (&str, &str, &str, &str),
         inputs: &[Ty<'_>],
         output: Ty<'_>,
-        args: &[Operand<'_>],
+        args: &[Spanned<Operand<'_>>],
         dst: VarId,
     ) {
         if (output.is_unit() || output.is_never() || output.is_primitive())
@@ -715,19 +719,19 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
             | ("", "option", _, "unwrap")
             | ("", "result", _, "unwrap")
             | ("", "vec", _, "as_mut_ptr" | "leak") => {
-                self.transfer_operand(caller, dst, false, &args[0]);
+                self.transfer_operand(caller, dst, false, &args[0].node);
             }
             ("", "", "ptr", "write_volatile") => {
-                let l = args[0].place().unwrap();
+                let l = args[0].node.place().unwrap();
                 assert!(!l.is_indirect_first_projection());
                 let l_id = VarId::Local(caller, l.local);
-                self.transfer_operand(caller, l_id, true, &args[1]);
+                self.transfer_operand(caller, l_id, true, &args[1].node);
             }
             ("", "clone", "Clone", "clone")
             | ("", "ffi", _, "as_va_list")
             | ("", "ffi", _, "arg")
             | ("", "", "ptr", "read_volatile") => {
-                let a = args[0].place().unwrap();
+                let a = args[0].node.place().unwrap();
                 assert!(!a.is_indirect_first_projection());
                 let a_id = VarId::Local(caller, a.local);
                 self.x_eq_deref_y(dst, a_id);
@@ -736,8 +740,8 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 self.x_eq_alloc(dst);
             }
             ("", "unix", _, "memcpy") => {
-                let l = args[0].place().unwrap();
-                let r = args[1].place().unwrap();
+                let l = args[0].node.place().unwrap();
+                let r = args[1].node.place().unwrap();
                 assert!(!l.is_indirect_first_projection());
                 assert!(!r.is_indirect_first_projection());
                 let l_id = VarId::Local(caller, l.local);
@@ -746,8 +750,8 @@ impl<'tcx, 'a> Analyzer<'tcx, 'a> {
                 self.x_eq_y(dst, l_id);
             }
             ("", "num", _, name) if name.starts_with("overflowing_") => {
-                self.transfer_operand(caller, dst, false, &args[0]);
-                self.transfer_operand(caller, dst, false, &args[1]);
+                self.transfer_operand(caller, dst, false, &args[0].node);
+                self.transfer_operand(caller, dst, false, &args[1].node);
             }
             (_, _, "AsmCastTrait", _)
             | ("", "cast", "ToPrimitive", _)

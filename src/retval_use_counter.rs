@@ -4,7 +4,7 @@ use rustc_hir::ItemKind;
 use rustc_middle::{
     mir::{
         visit::{MutatingUseContext, PlaceContext, Visitor},
-        ConstantKind, Local, Location, Place, Terminator, TerminatorKind,
+        Const, Local, Location, Place, Terminator, TerminatorKind,
     },
     ty::{TyCtxt, TyKind},
 };
@@ -27,17 +27,16 @@ impl Pass for RetValCounter {
     type Out = FxHashMap<&'static str, UseCounts>;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        let hir = tcx.hir();
         let mut counts: FxHashMap<&'static str, UseCounts> = FxHashMap::default();
-        for item_id in hir.items() {
-            let item = hir.item(item_id);
+        for item_id in tcx.hir_free_items() {
+            let item = tcx.hir_item(item_id);
             let name = item.ident.name;
             if name.as_str() == "main" || is_symbol_api(name) {
                 continue;
             }
             let def_id = item.owner_id.to_def_id();
             let body = match item.kind {
-                ItemKind::Fn(_, _, _) => tcx.optimized_mir(def_id),
+                ItemKind::Fn { .. } => tcx.optimized_mir(def_id),
                 ItemKind::Static(_, _, _) | ItemKind::Const(_, _, _) => tcx.mir_for_ctfe(def_id),
                 _ => continue,
             };
@@ -79,7 +78,7 @@ impl<'tcx> RetValVisitor<'tcx> {
             return;
         };
         let constant = some_or!(func.constant(), return);
-        let ConstantKind::Val(_, ty) = constant.literal else { return };
+        let Const::Val(_, ty) = constant.const_ else { return };
         let TyKind::FnDef(def_id, _) = ty.kind() else { return };
         let symbol = some_or!(def_id_to_value_symbol(def_id, self.tcx), return);
         let name = normalize_api_name(symbol.as_str());

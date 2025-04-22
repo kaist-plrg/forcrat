@@ -25,20 +25,19 @@ impl Pass for ApiCounter {
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let mut visitor = ApiVisitor::new(tcx);
 
-        let hir = tcx.hir();
-        for item_id in hir.items() {
-            let item = hir.item(item_id);
+        for item_id in tcx.hir_free_items() {
+            let item = tcx.hir_item(item_id);
             let name = item.ident.name;
             if name.as_str() == "main" || is_symbol_api(name) {
                 continue;
             }
-            let (ItemKind::Fn(_, _, body_id)
+            let (ItemKind::Fn { body: body_id, .. }
             | ItemKind::Static(_, _, body_id)
             | ItemKind::Const(_, _, body_id)) = item.kind
             else {
                 continue;
             };
-            let body = hir.body(body_id);
+            let body = tcx.hir_body(body_id);
             visitor.visit_body(body);
         }
 
@@ -94,8 +93,8 @@ impl<'tcx> ApiVisitor<'tcx> {
 impl<'tcx> Visitor<'tcx> for ApiVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {

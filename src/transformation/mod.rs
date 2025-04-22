@@ -2,26 +2,27 @@ use std::{
     fmt::Write as _,
     fs,
     ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
 use etrace::some_or;
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_ast::{
     ast::*,
-    mut_visit,
-    mut_visit::MutVisitor,
+    mut_visit::{self, MutVisitor},
     ptr::P,
+    tokenstream::{AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream},
     visit::{self, Visitor},
 };
 use rustc_ast_pretty::pprust;
-use rustc_const_eval::interpret::{ConstValue, Scalar};
+use rustc_const_eval::interpret::Scalar;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, def::Res, intravisit, HirId, QPath};
 use rustc_index::Idx;
 use rustc_lexer::unescape;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{self, CastKind, Constant, ConstantKind, Location, Operand, Rvalue},
+    mir::{self, CastKind, ConstOperand, ConstValue, Location, Operand, Rvalue},
     ty::{self, AdtDef, TyCtxt},
 };
 use rustc_span::{def_id::LocalDefId, symbol::Ident, FileName, RealFileName, Span, Symbol};
@@ -68,7 +69,7 @@ impl Pass for Transformation {
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         // collect information from AST
-        let stolen = tcx.resolver_for_lowering(()).borrow();
+        let stolen = tcx.resolver_for_lowering().borrow();
         let (_, krate) = stolen.deref();
         let mut ast_visitor = AstVisitor {
             static_span_to_lit: FxHashMap::default(),
@@ -76,7 +77,6 @@ impl Pass for Transformation {
         visit::walk_crate(&mut ast_visitor, krate);
         drop(stolen);
 
-        let hir = tcx.hir();
         let analysis_res = file_analysis::FileAnalysis.run(tcx);
 
         // collect information from HIR
@@ -84,31 +84,31 @@ impl Pass for Transformation {
             tcx,
             ctx: HirCtx::default(),
         };
-        hir.visit_all_item_likes_in_crate(&mut hir_visitor);
+        tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
         let hir_ctx = hir_visitor.ctx;
 
         let is_stdin_unsupported = analysis_res
             .unsupported
-            .contains(analysis_res.loc_ind_map[&Loc::Stdin]);
+            .contains(&analysis_res.loc_ind_map[&Loc::Stdin]);
         let is_stdout_unsupported = analysis_res
             .unsupported
-            .contains(analysis_res.loc_ind_map[&Loc::Stdout]);
+            .contains(&analysis_res.loc_ind_map[&Loc::Stdout]);
         let is_stderr_unsupported = analysis_res
             .unsupported
-            .contains(analysis_res.loc_ind_map[&Loc::Stderr]);
+            .contains(&analysis_res.loc_ind_map[&Loc::Stderr]);
 
         // all unsupported spans
         let mut unsupported: FxHashSet<_> = analysis_res
             .unsupported
             .iter()
             .filter_map(|loc_id| {
-                let loc = analysis_res.locs[loc_id];
+                let loc = analysis_res.locs[*loc_id];
                 match loc {
                     Loc::Var(def_id, local) => {
-                        let node = hir.get_by_def_id(def_id);
+                        let node = tcx.hir_node_by_def_id(def_id);
                         let hir::Node::Item(item) = node else { panic!() };
                         let body = match item.kind {
-                            hir::ItemKind::Fn(_, _, _) => tcx.optimized_mir(def_id),
+                            hir::ItemKind::Fn { .. } => tcx.optimized_mir(def_id),
                             hir::ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
                             _ => panic!(),
                         };
@@ -151,9 +151,9 @@ impl Pass for Transformation {
         {
             let (hir_loc, is_param) = match loc {
                 Loc::Var(def_id, local) => {
-                    let hir::Node::Item(item) = hir.get_by_def_id(*def_id) else { panic!() };
+                    let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     match item.kind {
-                        hir::ItemKind::Fn(sig, _, _) => {
+                        hir::ItemKind::Fn { sig, .. } => {
                             let body = tcx.optimized_mir(*def_id);
                             let local_decl = &body.local_decls[*local];
                             let span = local_decl.source_info.span;
@@ -217,10 +217,10 @@ impl Pass for Transformation {
         let mut api_sig_spans = FxHashSet::default();
         let mut null_casts = FxHashSet::default();
 
-        for item_id in hir.items() {
-            let item = hir.item(item_id);
+        for item_id in tcx.hir_free_items() {
+            let item = tcx.hir_item(item_id);
             let local_def_id = item.owner_id.def_id;
-            if let hir::ItemKind::Fn(sig, _, _) = item.kind {
+            if let hir::ItemKind::Fn { sig, .. } = item.kind {
                 if item.ident.name.as_str() == "main" {
                     continue;
                 }
@@ -259,7 +259,8 @@ impl Pass for Transformation {
                 &parse_sess,
                 file.name.clone(),
                 src.to_string(),
-            );
+            )
+            .unwrap();
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
                 tcx,
@@ -284,8 +285,8 @@ impl Pass for Transformation {
             if visitor.updated {
                 for item in &mut krate.items {
                     let ItemKind::Struct(vd, _) = &item.kind else { continue };
-                    let VariantData::Struct(fs, _) = vd else { continue };
-                    if fs
+                    let VariantData::Struct { fields, .. } = vd else { continue };
+                    if fields
                         .iter()
                         .any(|f| visitor.updated_field_spans.contains(&f.span))
                     {
@@ -428,7 +429,6 @@ impl<'a> TypeArena<'a> {
     }
 }
 
-#[allow(unused_tuple_struct_fields)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamType<'a> {
     File,
@@ -967,8 +967,8 @@ impl HirVisitor<'_> {
 impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
@@ -977,19 +977,19 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         match item.kind {
             hir::ItemKind::Static(_, _, body_id) => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
-                let body = self.tcx.hir().body(body_id);
+                let body = self.tcx.hir_body(body_id);
                 self.add_binding(loc, body.value.span);
                 self.add_bound(loc, body.value.span);
                 self.add_assignment(body.value.span, body.value.span);
             }
-            hir::ItemKind::Fn(sig, _, _) => {
+            hir::ItemKind::Fn { sig, .. } => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
                 self.add_binding(loc, sig.span);
             }
             hir::ItemKind::Struct(vd, _) => {
-                let hir::VariantData::Struct(fs, _) = vd else { return };
+                let hir::VariantData::Struct { fields, .. } = vd else { return };
                 let def_id = item.owner_id.def_id;
-                for (i, f) in fs.iter().enumerate() {
+                for (i, f) in fields.iter().enumerate() {
                     let loc = HirLoc::Field(def_id, FieldIdx::from_usize(i));
                     self.add_binding(loc, f.span);
                 }
@@ -998,7 +998,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         }
     }
 
-    fn visit_local(&mut self, local: &'tcx hir::Local<'tcx>) {
+    fn visit_local(&mut self, local: &'tcx hir::LetStmt<'tcx>) {
         intravisit::walk_local(self, local);
 
         if let Some(init) = local.init {
@@ -1116,15 +1116,15 @@ struct MirVisitor<'tcx> {
 impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
         if let Rvalue::Cast(
-            CastKind::PointerFromExposedAddress,
-            Operand::Constant(box Constant {
-                literal: ConstantKind::Val(ConstValue::Scalar(Scalar::Int(i)), _),
+            CastKind::PointerWithExposedProvenance,
+            Operand::Constant(box ConstOperand {
+                const_: mir::Const::Val(ConstValue::Scalar(Scalar::Int(i)), _),
                 ..
             }),
             ty,
         ) = rvalue
         {
-            if i.try_to_u64() == Ok(0) && compile_util::contains_file_ty(*ty, self.tcx) {
+            if i.to_u64() == 0 && compile_util::contains_file_ty(*ty, self.tcx) {
                 self.nulls.insert(location);
             }
         }
@@ -1218,12 +1218,12 @@ impl<'a> TransformVisitor<'_, 'a> {
             .hir
             .feof_functions
             .get(&curr_func)
-            .map_or(false, |s| s.contains(name));
+            .is_some_and(|s| s.contains(name));
         let error = self
             .hir
             .ferror_functions
             .get(&curr_func)
-            .map_or(false, |s| s.contains(name));
+            .is_some_and(|s| s.contains(name));
         IndicatorCheck {
             name: name.as_str(),
             eof,
@@ -1238,12 +1238,12 @@ impl<'a> TransformVisitor<'_, 'a> {
             .hir
             .feof_functions
             .get(&curr_func)
-            .map_or(false, |s| s.iter().any(|n| n.as_str() == name));
+            .is_some_and(|s| s.iter().any(|n| n.as_str() == name));
         let error = self
             .hir
             .ferror_functions
             .get(&curr_func)
-            .map_or(false, |s| s.iter().any(|n| n.as_str() == name));
+            .is_some_and(|s| s.iter().any(|n| n.as_str() == name));
         IndicatorCheck { name, eof, error }
     }
 
@@ -1273,16 +1273,16 @@ impl<'a> TransformVisitor<'_, 'a> {
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
-    fn visit_item_kind(&mut self, item: &mut ItemKind) {
-        if let ItemKind::Fn(f) = item {
+    fn visit_item(&mut self, item: &mut P<Item>) {
+        if let ItemKind::Fn(f) = &item.kind {
             if self.api_sig_spans.contains(&f.sig.span) {
                 return;
             }
         }
 
-        mut_visit::noop_visit_item_kind(item, self);
+        mut_visit::walk_item(self, item);
 
-        match item {
+        match &mut item.kind {
             ItemKind::Static(box item) => {
                 let body = some_or!(&item.expr, return);
                 let loc = self.hir.binding_span_to_loc[&body.span];
@@ -1301,7 +1301,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     let p = Param::new(def_id, i);
                     let pot = some_or!(self.param_pot(p), continue);
                     self.replace_ty(&mut param.ty, ty!("Option<TT{}>", i));
-                    if let PatKind::Ident(BindingAnnotation(_, m), _, _) = &mut param.pat.kind {
+                    if let PatKind::Ident(BindingMode(_, m), _, _) = &mut param.pat.kind {
                         *m = Mutability::Mut;
                     }
                     tparams.push((i, pot));
@@ -1334,10 +1334,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         }
     }
 
-    fn visit_variant_data(&mut self, vdata: &mut VariantData) {
-        mut_visit::noop_visit_variant_data(vdata, self);
+    fn visit_variant_data(&mut self, vd: &mut VariantData) {
+        walk_variant_data(self, vd);
 
-        let VariantData::Struct(fields, _) = vdata else { return };
+        let VariantData::Struct { fields, .. } = vd else { return };
         for f in fields {
             if let Some(ty) = self.binding_ty(f.span) {
                 self.updated_field_spans.insert(f.span);
@@ -1347,7 +1347,34 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn visit_local(&mut self, local: &mut P<Local>) {
-        mut_visit::noop_visit_local(local, self);
+        // walk_local is private
+        let Local {
+            id,
+            pat,
+            ty,
+            kind,
+            span,
+            colon_sp,
+            attrs,
+            tokens,
+        } = local.deref_mut();
+        self.visit_id(id);
+        visit_attrs(self, attrs);
+        self.visit_pat(pat);
+        visit_opt(ty, |ty| self.visit_ty(ty));
+        match kind {
+            LocalKind::Decl => {}
+            LocalKind::Init(init) => {
+                self.visit_expr(init);
+            }
+            LocalKind::InitElse(init, els) => {
+                self.visit_expr(init);
+                self.visit_block(els);
+            }
+        }
+        visit_lazy_tts(self, tokens);
+        visit_opt(colon_sp, |sp| self.visit_span(sp));
+        self.visit_span(span);
 
         if self.unsupported.contains(&local.pat.span) {
             return;
@@ -1359,7 +1386,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
-        mut_visit::noop_visit_expr(expr, self);
+        mut_visit::walk_expr(self, expr);
         let expr_span = expr.span;
         if self.is_unsupported(expr) {
             return;
@@ -1609,10 +1636,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         self.replace_expr(expr, new_expr);
                     }
                     _ => {
-                        let hir::Node::Item(item) = self.tcx.hir().get_by_def_id(*def_id) else {
+                        let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(*def_id) else {
                             return;
                         };
-                        let hir::ItemKind::Fn(sig, _, _) = item.kind else { panic!() };
+                        let hir::ItemKind::Fn { sig, .. } = item.kind else { panic!() };
                         let mut targs = vec![];
                         for (i, arg) in args[..sig.decl.inputs.len()].iter_mut().enumerate() {
                             if self.is_unsupported(arg) {
@@ -1719,6 +1746,84 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             _ => {}
         }
+    }
+}
+
+#[inline]
+fn visit_opt<T, F>(opt: &mut Option<T>, mut visit_elem: F)
+where F: FnMut(&mut T) {
+    if let Some(elem) = opt {
+        visit_elem(elem);
+    }
+}
+
+#[inline]
+fn visit_attrs<T: MutVisitor>(vis: &mut T, attrs: &mut AttrVec) {
+    for attr in attrs.iter_mut() {
+        vis.visit_attribute(attr);
+    }
+}
+
+fn visit_lazy_tts_opt_mut<T: MutVisitor>(vis: &mut T, lazy_tts: Option<&mut LazyAttrTokenStream>) {
+    if T::VISIT_TOKENS {
+        if let Some(lazy_tts) = lazy_tts {
+            let mut tts = lazy_tts.to_attr_token_stream();
+            visit_attr_tts(vis, &mut tts);
+            *lazy_tts = LazyAttrTokenStream::new(tts);
+        }
+    }
+}
+
+#[inline]
+fn visit_lazy_tts<T: MutVisitor>(vis: &mut T, lazy_tts: &mut Option<LazyAttrTokenStream>) {
+    visit_lazy_tts_opt_mut(vis, lazy_tts.as_mut());
+}
+
+fn visit_attr_tts<T: MutVisitor>(vis: &mut T, AttrTokenStream(tts): &mut AttrTokenStream) {
+    if T::VISIT_TOKENS && !tts.is_empty() {
+        let tts = Arc::make_mut(tts);
+        visit_vec(tts, |tree| visit_attr_tt(vis, tree));
+    }
+}
+
+fn visit_attr_tt<T: MutVisitor>(vis: &mut T, tt: &mut AttrTokenTree) {
+    match tt {
+        AttrTokenTree::Token(token, _spacing) => {
+            mut_visit::visit_token(vis, token);
+        }
+        AttrTokenTree::Delimited(dspan, _spacing, _delim, tts) => {
+            visit_attr_tts(vis, tts);
+            mut_visit::visit_delim_span(vis, dspan);
+        }
+        AttrTokenTree::AttrsTarget(AttrsTarget { attrs, tokens }) => {
+            visit_attrs(vis, attrs);
+            visit_lazy_tts_opt_mut(vis, Some(tokens));
+        }
+    }
+}
+
+#[inline]
+fn visit_vec<T, F>(elems: &mut Vec<T>, mut visit_elem: F)
+where F: FnMut(&mut T) {
+    for elem in elems {
+        visit_elem(elem);
+    }
+}
+
+fn walk_variant_data<T: MutVisitor>(vis: &mut T, vdata: &mut VariantData) {
+    use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
+    match vdata {
+        VariantData::Struct {
+            fields,
+            recovered: _,
+        } => {
+            fields.flat_map_in_place(|field| vis.flat_map_field_def(field));
+        }
+        VariantData::Tuple(fields, id) => {
+            vis.visit_id(id);
+            fields.flat_map_in_place(|field| vis.flat_map_field_def(field));
+        }
+        VariantData::Unit(id) => vis.visit_id(id),
     }
 }
 
@@ -2119,7 +2224,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
     // from rustc_ast/src/util/literal.rs
     let s = fmt.as_str();
     let mut buf = Vec::with_capacity(s.len());
-    unescape::unescape_literal(fmt.as_str(), unescape::Mode::ByteStr, &mut |_, c| {
+    unescape::unescape_unicode(fmt.as_str(), unescape::Mode::ByteStr, &mut |_, c| {
         buf.push(unescape::byte_from_char(c.unwrap()))
     });
 

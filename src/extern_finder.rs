@@ -5,9 +5,9 @@ use lazy_static::lazy_static;
 use rustc_hir::{
     def::{DefKind, Res},
     def_id::LocalDefId,
-    intravisit::{self, Visitor as HVisitor},
-    BodyId, Expr, ExprKind, FieldDef, FnDecl, FnRetTy, ForeignItemKind, HirId, Item, ItemKind,
-    MutTy, Node, QPath, TyKind,
+    intravisit::{self, Visitor as HVisitor, VisitorExt},
+    AmbigArg, BodyId, Expr, ExprKind, FieldDef, FnDecl, FnRetTy, ForeignItemKind, HirId, Item,
+    ItemKind, MutTy, Node, QPath, TyKind,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::Symbol;
@@ -21,9 +21,8 @@ impl Pass for ExternFinder {
     type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) {
-        let hir = tcx.hir();
         let mut visitor = ExternVisitor::new(tcx);
-        hir.visit_all_item_likes_in_crate(&mut visitor);
+        tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
         println!(
             "{} {} {} {} ",
@@ -86,8 +85,8 @@ impl<'tcx> ExternVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for ExternVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -107,7 +106,7 @@ impl<'tcx> HVisitor<'tcx> for ExternVisitor<'tcx> {
         intravisit::walk_field_def(self, fd);
     }
 
-    fn visit_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
+    fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         self.handle_local(local);
         intravisit::walk_local(self, local);
     }
@@ -173,7 +172,7 @@ impl<'tcx> ExternVisitor<'tcx> {
             ExprKind::Field(e, _) => {
                 let ty = self.tcx.typeck(current_func).expr_ty(e);
                 let rustc_middle::ty::TyKind::Adt(adt_def, _) = ty.kind() else { return };
-                let node = some_or!(self.tcx.hir().get_if_local(adt_def.did()), return);
+                let node = some_or!(self.tcx.hir_get_if_local(adt_def.did()), return);
                 let Node::Item(item) = node else { return };
                 if item.ident.name.to_ident_string() == "_IO_FILE" {
                     self.file_internal_fns.insert(current_func);
@@ -190,7 +189,7 @@ impl<'tcx> ExternVisitor<'tcx> {
         }
     }
 
-    fn handle_local(&mut self, local: &'tcx rustc_hir::Local<'tcx>) {
+    fn handle_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
         let ty = some_or!(local.ty, return);
         if self.has_file_ty(ty) {
             self.file_locals.insert(local.hir_id);
@@ -201,15 +200,15 @@ impl<'tcx> ExternVisitor<'tcx> {
         if let Some(api_fn) = self.file_fns.get(&def_id) {
             return Some(api_fn.clone());
         }
-        let node = self.tcx.hir().get_if_local(def_id.to_def_id()).unwrap();
+        let node = self.tcx.hir_get_if_local(def_id.to_def_id()).unwrap();
         let (name, decl, is_extern) = match node {
             Node::Item(item) => {
-                let ItemKind::Fn(sig, _, _) = item.kind else { return None };
+                let ItemKind::Fn { sig, .. } = item.kind else { return None };
                 (item.ident.name, sig.decl, false)
             }
             Node::ForeignItem(item) => {
-                let ForeignItemKind::Fn(decl, _, _) = item.kind else { return None };
-                (item.ident.name, decl, true)
+                let ForeignItemKind::Fn(sig, _, _) = item.kind else { return None };
+                (item.ident.name, sig.decl, true)
             }
             _ => return None,
         };
@@ -251,7 +250,7 @@ impl<'tcx> ExternVisitor<'tcx> {
 
     fn has_file_ty(&self, ty: &'tcx rustc_hir::Ty<'tcx>) -> bool {
         let mut visitor = TyVisitor::new(self.tcx);
-        visitor.visit_ty(ty);
+        visitor.visit_ty_unambig(ty);
         if visitor.has_file {
             tracing::info!(
                 "{}",
@@ -263,7 +262,7 @@ impl<'tcx> ExternVisitor<'tcx> {
 
     fn is_std_io(&self, expr: &'tcx Expr<'tcx>) -> bool {
         let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind else { return false };
-        let Res::Def(DefKind::Static(_), def_id) = path.res else { return false };
+        let Res::Def(DefKind::Static { .. }, def_id) = path.res else { return false };
         if !self.tcx.is_foreign_item(def_id) {
             return false;
         }
@@ -297,12 +296,12 @@ impl<'tcx> TyVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for TyVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
-    fn visit_ty(&mut self, t: &'tcx rustc_hir::Ty<'tcx>) {
-        if let rustc_hir::TyKind::Path(QPath::Resolved(_, path)) = t.kind {
+    fn visit_ty(&mut self, t: &'tcx rustc_hir::Ty<'tcx, AmbigArg>) {
+        if let TyKind::Path(QPath::Resolved(_, path)) = t.kind {
             let seg = path.segments.last().unwrap();
             let name = seg.ident.name.to_ident_string();
             if name == "FILE" {
@@ -377,7 +376,7 @@ lazy_static! {
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-struct FmtTy<'tcx>(rustc_hir::Ty<'tcx>);
+pub struct FmtTy<'tcx>(rustc_hir::Ty<'tcx>);
 
 impl std::fmt::Display for FmtTy<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

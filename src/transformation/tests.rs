@@ -8,7 +8,8 @@ fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let res = super::Transformation.run_on_str(&code);
     let [(_, s)] = &res.files[..] else { panic!() };
     let stripped = s.strip_prefix(FORMATTED_PREAMBLE.as_str()).unwrap();
-    assert!(ty_checker::TyChecker.run_on_str(&s), "{}", stripped);
+    let res = ty_checker::TyChecker.try_on_str(&s).expect(&stripped);
+    assert!(res, "{}", stripped);
     for s in includes {
         assert!(stripped.contains(s), "{}\nmust contain {}", stripped, s);
     }

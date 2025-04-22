@@ -2,16 +2,19 @@ use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use etrace::ok_or;
-use rustc_data_structures::sync::Lrc;
 use rustc_errors::{
-    emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Handler, Level,
+    emitter::{Emitter, HumanEmitter},
+    fallback_fluent_bundle,
+    registry::Registry,
+    translation::Translate,
+    ColorConfig, DiagInner, FatalError, FluentBundle, Level,
 };
 use rustc_feature::UnstableFeatures;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use rustc_hir::{
     def::{DefKind, Res},
     definitions::DefPathData,
@@ -24,15 +27,10 @@ use rustc_middle::{
     ty::{Ty, TyCtxt, TyKind, TypeVisitor},
 };
 use rustc_session::{
-    config::{CheckCfg, CrateType, ErrorOutputType, Input, Options},
-    EarlyErrorHandler,
+    config::{CrateType, ErrorOutputType, Input, Options},
+    EarlyDiagCtxt,
 };
-use rustc_span::{
-    def_id::DefId,
-    edition::Edition,
-    source_map::{FileName, SourceMap},
-    RealFileName, Span, Symbol,
-};
+use rustc_span::{def_id::DefId, edition::Edition, source_map::SourceMap, FileName, Symbol};
 
 use crate::rustc_middle::ty::{TypeSuperVisitable, TypeVisitable};
 
@@ -42,35 +40,47 @@ pub trait Pass: Sync {
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out;
 
     #[inline]
-    fn config(input: Input) -> Config {
-        make_no_warning_config(input)
+    fn try_on_input(&self, input: Input) -> Result<Self::Out, FatalError> {
+        run_compiler(make_config(input), |tcx| self.run(tcx))
+    }
+
+    #[inline]
+    fn try_on_path(&self, path: &Path) -> Result<Self::Out, FatalError> {
+        self.try_on_input(path_to_input(path))
+    }
+
+    #[inline]
+    fn try_on_str(&self, code: &str) -> Result<Self::Out, FatalError> {
+        self.try_on_input(str_to_input(code))
     }
 
     #[inline]
     fn run_on_input(&self, input: Input) -> Self::Out {
-        let config = Self::config(input);
-        run_compiler(config, |tcx| self.run(tcx)).unwrap()
+        self.try_on_input(input).unwrap()
     }
 
     #[inline]
     fn run_on_path(&self, path: &Path) -> Self::Out {
-        self.run_on_input(path_to_input(path))
+        self.try_on_path(path).unwrap()
     }
 
     #[inline]
     fn run_on_str(&self, code: &str) -> Self::Out {
-        self.run_on_input(str_to_input(code))
+        self.try_on_str(code).unwrap()
     }
 }
 
 #[inline]
-pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(config: Config, f: F) -> Option<R> {
+pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(
+    config: Config,
+    f: F,
+) -> Result<R, FatalError> {
     rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config, |compiler| {
-            compiler.enter(|queries| queries.global_ctxt().ok()?.enter(|tcx| Some(f(tcx))))
+            let krate = rustc_interface::parse(&compiler.sess);
+            rustc_interface::create_and_enter_global_ctxt(compiler, krate, f)
         })
     })
-    .ok()?
 }
 
 #[inline]
@@ -87,50 +97,27 @@ pub fn make_config(input: Input) -> Config {
             edition: Edition::Edition2021,
             ..Options::default()
         },
-        crate_cfg: FxHashSet::default(),
-        crate_check_cfg: CheckCfg::default(),
+        crate_cfg: Vec::new(),
+        crate_check_cfg: Vec::new(),
         input,
         output_dir: None,
         output_file: None,
-        ice_file: rustc_driver::ice_path().clone(),
+        ice_file: None,
         file_loader: None,
-        locale_resources: rustc_driver_impl::DEFAULT_LOCALE_RESOURCES,
+        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
         lint_caps: FxHashMap::default(),
-        parse_sess_created: None,
+        psess_created: Some(Box::new(|ps| {
+            let sm = ps.clone_source_map();
+            ps.dcx().set_emitter(Box::new(SilentEmitter::new(sm)));
+        })),
         register_lints: None,
         override_queries: None,
         make_codegen_backend: None,
-        registry: Registry::new(rustc_error_codes::DIAGNOSTICS),
+        registry: Registry::new(rustc_errors::codes::DIAGNOSTICS),
+        hash_untracked_state: None,
+        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
+        expanded_args: Vec::new(),
     }
-}
-
-pub fn make_no_warning_config(input: Input) -> Config {
-    let mut config = make_config(input);
-    config.parse_sess_created = Some(Box::new(|ps| {
-        let mut dummy = Handler::with_emitter(Box::new(SilentEmitter));
-        std::mem::swap(&mut ps.span_diagnostic, &mut dummy);
-        dummy = dummy.disable_warnings();
-        std::mem::swap(&mut ps.span_diagnostic, &mut dummy);
-    }));
-    config
-}
-
-pub fn make_silent_config(input: Input) -> Config {
-    let mut config = make_config(input);
-    config.parse_sess_created = Some(Box::new(|ps| {
-        ps.span_diagnostic = Handler::with_emitter(Box::new(SilentEmitter));
-    }));
-    config
-}
-
-pub fn make_counting_config(input: Input) -> (Config, Arc<Mutex<usize>>) {
-    let mut config = make_config(input);
-    let arc = Arc::new(Mutex::new(0));
-    let emitter = CountingEmitter(arc.clone());
-    config.parse_sess_created = Some(Box::new(|ps| {
-        ps.span_diagnostic = Handler::with_emitter(Box::new(emitter));
-    }));
-    (config, arc)
 }
 
 pub fn str_to_input(code: &str) -> Input {
@@ -144,56 +131,40 @@ pub fn path_to_input(path: &Path) -> Input {
     Input::File(path.to_path_buf())
 }
 
-pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
-    if let FileName::Real(RealFileName::LocalPath(p)) = source_map.span_to_filename(span) {
-        Some(p)
-    } else {
-        None
+struct SilentEmitter(HumanEmitter);
+
+impl SilentEmitter {
+    fn new(sm: Arc<SourceMap>) -> Self {
+        let bundle = fallback_fluent_bundle(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(), false);
+        let emitter = HumanEmitter::new(
+            rustc_errors::emitter::stderr_destination(ColorConfig::Auto),
+            bundle,
+        )
+        .sm(Some(sm));
+        Self(emitter)
     }
 }
-
-struct CountingEmitter(Arc<Mutex<usize>>);
-
-impl Translate for CountingEmitter {
-    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
-        None
-    }
-
-    fn fallback_fluent_bundle(&self) -> &FluentBundle {
-        panic!()
-    }
-}
-
-impl Emitter for CountingEmitter {
-    fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
-        if matches!(diag.level(), Level::Error { .. }) {
-            *self.0.lock().unwrap() += 1;
-        }
-    }
-
-    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
-        None
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct SilentEmitter;
 
 impl Translate for SilentEmitter {
-    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
-        None
+    fn fluent_bundle(&self) -> Option<&FluentBundle> {
+        #[allow(clippy::needless_borrow)]
+        (&self.0).fluent_bundle()
     }
 
     fn fallback_fluent_bundle(&self) -> &FluentBundle {
-        panic!()
+        self.0.fallback_fluent_bundle()
     }
 }
 
 impl Emitter for SilentEmitter {
-    fn emit_diagnostic(&mut self, _: &rustc_errors::Diagnostic) {}
+    fn source_map(&self) -> Option<&SourceMap> {
+        self.0.source_map()
+    }
 
-    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
-        None
+    fn emit_diagnostic(&mut self, diag: DiagInner, registry: &Registry) {
+        if matches!(diag.level(), Level::Fatal | Level::Error) {
+            self.0.emit_diagnostic(diag, registry);
+        }
     }
 }
 
@@ -220,7 +191,7 @@ fn find_deps() -> Options {
         }
     }
 
-    let mut handler = EarlyErrorHandler::new(ErrorOutputType::default());
+    let mut handler = EarlyDiagCtxt::new(ErrorOutputType::default());
     let matches = rustc_driver::handle_options(&handler, &args).unwrap();
     rustc_session::config::build_session_options(&mut handler, &matches)
 }
@@ -298,7 +269,7 @@ pub fn def_id_to_value_symbol(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -
 
 pub fn is_std_io_expr<'tcx>(expr: &Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind else { return false };
-    let Res::Def(DefKind::Static(_), def_id) = path.res else { return false };
+    let Res::Def(DefKind::Static { .. }, def_id) = path.res else { return false };
     if !tcx.is_foreign_item(def_id) {
         return false;
     }
@@ -325,9 +296,9 @@ struct FileTypeVisitor<'tcx> {
 }
 
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for FileTypeVisitor<'tcx> {
-    type BreakTy = ();
+    type Result = ControlFlow<()>;
 
-    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
+    fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
         if let TyKind::Adt(adt_def, _) = t.kind() {
             if is_file_ty(adt_def.did(), self.tcx) {
                 return ControlFlow::Break(());

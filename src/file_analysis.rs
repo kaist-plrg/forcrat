@@ -2,29 +2,24 @@ use std::{collections::hash_map::Entry, ops::Deref as _};
 
 use etrace::some_or;
 use rustc_abi::{FieldIdx, FIRST_VARIANT};
-use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
-use rustc_data_structures::graph::{
-    scc::Sccs, DirectedGraph, GraphSuccessors, WithNumNodes, WithSuccessors,
-};
+use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
+use rustc_data_structures::graph::{scc::Sccs, DirectedGraph, Successors};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     def_id::{DefId, LocalDefId},
     definitions::DefPathData,
     ItemKind, Node,
 };
-use rustc_index::{
-    bit_set::{HybridBitSet, HybridIter},
-    Idx, IndexVec,
-};
+use rustc_index::{bit_set::MixedBitSet, Idx, IndexVec};
 use rustc_middle::{
     mir::{
-        AggregateKind, CastKind, Constant, ConstantKind, Local, LocalDecl, Operand, Place,
+        AggregateKind, CastKind, Const, ConstOperand, ConstValue, Local, LocalDecl, Operand, Place,
         ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
     },
-    query::{IntoQueryParam, Key},
-    ty::{List, Ty, TyCtxt, TyKind, TypeAndMut},
+    query::IntoQueryParam,
+    ty::{List, Ty, TyCtxt, TyKind},
 };
-use rustc_span::Span;
+use rustc_span::{source_map::Spanned, Span};
 use typed_arena::Arena;
 
 use crate::{
@@ -44,7 +39,7 @@ pub struct AnalysisResult {
     pub loc_ind_map: FxHashMap<Loc, LocId>,
     pub permissions: IndexVec<LocId, BitSet8<Permission>>,
     pub origins: IndexVec<LocId, BitSet8<Origin>>,
-    pub unsupported: HybridBitSet<LocId>,
+    pub unsupported: FxHashSet<LocId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -54,7 +49,7 @@ impl Pass for FileAnalysis {
     type Out = AnalysisResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        let krate = tcx.resolver_for_lowering(());
+        let krate = tcx.resolver_for_lowering();
         let krate_ref = krate.borrow();
         let (_, krate) = krate_ref.deref();
         let mut ast_visitor = AstVisitor::default();
@@ -77,7 +72,6 @@ impl Pass for FileAnalysis {
 
         let steensgaard = steensgaard::Steensgaard.run(tcx);
         tracing::info!("\n{:?}", steensgaard);
-        let hir = tcx.hir();
 
         // let mut visitor = StdioArgVisitor::new(tcx);
         // hir.visit_all_item_likes_in_crate(&mut visitor);
@@ -92,11 +86,11 @@ impl Pass for FileAnalysis {
         let mut locs: IndexVec<LocId, Loc> =
             IndexVec::from_raw(vec![Loc::Stdin, Loc::Stdout, Loc::Stderr]);
 
-        for item_id in hir.items() {
-            let item = hir.item(item_id);
+        for item_id in tcx.hir_free_items() {
+            let item = tcx.hir_item(item_id);
             let local_def_id = item.owner_id.def_id;
             let body = match item.kind {
-                ItemKind::Fn(_, _, _) => {
+                ItemKind::Fn { .. } => {
                     if is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
                         continue;
                     }
@@ -169,11 +163,11 @@ impl Pass for FileAnalysis {
             unsupported: UnsupportedTracker::new(&arena),
         };
 
-        for item_id in hir.items() {
-            let item = hir.item(item_id);
+        for item_id in tcx.hir_free_items() {
+            let item = tcx.hir_item(item_id);
             let local_def_id = item.owner_id.def_id;
             let body = match item.kind {
-                ItemKind::Fn(_, _, _) => {
+                ItemKind::Fn { .. } => {
                     if is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
                         continue;
                     }
@@ -206,14 +200,14 @@ impl Pass for FileAnalysis {
             tracing::info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
         }
 
-        let unsupported = analyzer.unsupported.compute_all(locs.len());
+        let unsupported = analyzer.unsupported.compute_all();
         if unsupported.is_empty() {
             tracing::info!("No unsupported locations");
         } else {
             tracing::info!("Unsupported locations:");
         }
         for loc_id in unsupported.iter() {
-            tracing::info!("{:?}", locs[loc_id]);
+            tracing::info!("{:?}", locs[*loc_id]);
         }
 
         AnalysisResult {
@@ -271,7 +265,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     (None, false) => {}
                 }
             }
-            Rvalue::Cast(CastKind::PointerFromExposedAddress, _, _) => {}
+            Rvalue::Cast(CastKind::PointerWithExposedProvenance, _, _) => {}
             Rvalue::Cast(_, _, _) => assert!(variance.is_none()),
             Rvalue::BinaryOp(_, box (op1, op2)) => {
                 let ty = op1.ty(ctx.local_decls, self.tcx);
@@ -318,7 +312,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     }
                     Rvalue::Cast(_, _, _) => unreachable!(),
                     Rvalue::Ref(_, _, place)
-                    | Rvalue::AddressOf(_, place)
+                    | Rvalue::RawPtr(_, place)
                     | Rvalue::CopyForDeref(place) => {
                         let r = self.transfer_place(*place, ctx).unwrap();
                         self.assign(l, r, variance);
@@ -356,20 +350,22 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         } else {
             let (last, init) = place.projection.split_last().unwrap();
             let ty = Place::ty_from(place.local, init, ctx.local_decls, self.tcx).ty;
-            let def_id = ty.ty_adt_id().unwrap().expect_local();
+            let def_id = ty.ty_adt_def().unwrap().did().expect_local();
             let ProjectionElem::Field(f, _) = last else { panic!() };
             Loc::Field(def_id, *f)
         };
         Some(self.loc_ind_map[&loc])
     }
 
-    fn transfer_constant(&self, constant: Constant<'tcx>) -> LocId {
-        let ConstantKind::Val(value, _) = constant.literal else { panic!() };
+    fn transfer_constant(&self, constant: ConstOperand<'tcx>) -> LocId {
+        let Const::Val(value, _) = constant.const_ else { panic!() };
         let ConstValue::Scalar(scalar) = value else { panic!() };
         let Scalar::Ptr(ptr, _) = scalar else { panic!() };
-        let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance) else { panic!() };
+        let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance.alloc_id()) else {
+            panic!()
+        };
         let def_id = def_id.expect_local();
-        let node = self.tcx.hir().find_by_def_id(def_id).unwrap();
+        let node = self.tcx.hir_node_by_def_id(def_id);
         let loc = if matches!(node, Node::ForeignItem(_)) {
             let key = self.tcx.def_key(def_id);
             let DefPathData::ValueNs(name) = key.disambiguated_data.data else { panic!() };
@@ -410,7 +406,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 }
             }
             Operand::Constant(box constant) => {
-                let ConstantKind::Val(value, ty) = constant.literal else { unreachable!() };
+                let Const::Val(value, ty) = constant.const_ else { unreachable!() };
                 assert!(matches!(value, ConstValue::ZeroSized));
                 let TyKind::FnDef(def_id, _) = ty.kind() else { unreachable!() };
                 if let Some(kind) = def_id_api_kind(def_id, self.tcx) {
@@ -436,7 +432,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
-                                    if let Some(x) = self.transfer_operand(arg, ctx) {
+                                    if let Some(x) = self.transfer_operand(&arg.node, ctx) {
                                         self.add_permission(x, permission);
                                     }
                                     break;
@@ -448,7 +444,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
-                                    if let Some(x) = self.transfer_operand(arg, ctx) {
+                                    if let Some(x) = self.transfer_operand(&arg.node, ctx) {
                                         self.unsupported.add(x);
                                     }
                                     break;
@@ -470,7 +466,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
     fn transfer_non_api_call(
         &mut self,
         callee: LocalDefId,
-        args: &[Operand<'tcx>],
+        args: &[Spanned<Operand<'tcx>>],
         destination: Place<'tcx>,
         ctx: Ctx<'_, 'tcx>,
     ) {
@@ -479,7 +475,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             if let Some(variance) = file_type_variance(*t, self.tcx) {
                 let l = Loc::Var(callee, Local::new(i + 1));
                 let l = self.loc_ind_map[&l];
-                let r = self.transfer_operand(arg, ctx).unwrap();
+                let r = self.transfer_operand(&arg.node, ctx).unwrap();
                 self.assign(l, r, variance);
             }
         }
@@ -534,7 +530,7 @@ enum Variance {
 
 fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance> {
     match ty.kind() {
-        TyKind::RawPtr(TypeAndMut { ty, mutbl }) | TyKind::Ref(_, ty, mutbl) => {
+        TyKind::RawPtr(ty, mutbl) | TyKind::Ref(_, ty, mutbl) => {
             if let TyKind::Adt(adt_def, _) = ty.kind() {
                 if is_file_ty(adt_def.did(), tcx) {
                     Some(Variance::Covariant)
@@ -604,7 +600,7 @@ rustc_index::newtype_index! {
 struct Graph<V: Idx, T: Idx> {
     tok_num: usize,
     solutions: IndexVec<V, BitSet8<T>>,
-    edges: IndexVec<V, HybridBitSet<V>>,
+    edges: IndexVec<V, MixedBitSet<V>>,
 }
 
 impl<V: Idx, T: Idx> Graph<V, T> {
@@ -614,7 +610,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
         Self {
             tok_num,
             solutions: IndexVec::from_raw(vec![BitSet8::new_empty(); size]),
-            edges: IndexVec::from_raw(vec![HybridBitSet::new_empty(size); size]),
+            edges: IndexVec::from_raw(vec![MixedBitSet::new_empty(size); size]),
         }
     }
 
@@ -642,7 +638,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
         while deltas.iter().any(|s| !s.is_empty()) {
             let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&edges));
 
-            let mut components = vec![HybridBitSet::new_empty(size); sccs.num_sccs()];
+            let mut components = vec![MixedBitSet::new_empty(size); sccs.num_sccs()];
             for i in solutions.indices() {
                 let scc = sccs.scc(i);
                 components[scc.index()].insert(i);
@@ -704,7 +700,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 }
 
                 // update edges
-                edges = IndexVec::from_raw(vec![HybridBitSet::new_empty(size); size]);
+                edges = IndexVec::from_raw(vec![MixedBitSet::new_empty(size); size]);
                 for (scc, rep) in scc_to_rep.iter().enumerate() {
                     let succs = &mut edges[*rep];
                     for succ in sccs.successors(scc) {
@@ -743,31 +739,24 @@ impl<V: Idx, T: Idx> Graph<V, T> {
 }
 
 #[inline]
-fn contains_multiple<T: Idx>(set: &HybridBitSet<T>) -> bool {
+fn contains_multiple<T: Idx>(set: &MixedBitSet<T>) -> bool {
     let mut iter = set.iter();
     iter.next().is_some() && iter.next().is_some()
 }
 
 #[repr(transparent)]
-struct VecBitSet<'a, T: Idx>(&'a IndexVec<T, HybridBitSet<T>>);
+struct VecBitSet<'a, T: Idx>(&'a IndexVec<T, MixedBitSet<T>>);
 
 impl<T: Idx> DirectedGraph for VecBitSet<'_, T> {
     type Node = T;
-}
 
-impl<T: Idx> WithNumNodes for VecBitSet<'_, T> {
     fn num_nodes(&self) -> usize {
         self.0.len()
     }
 }
 
-impl<'a, T: Idx> GraphSuccessors<'_> for VecBitSet<'a, T> {
-    type Item = T;
-    type Iter = HybridIter<'a, T>;
-}
-
-impl<T: Idx> WithSuccessors for VecBitSet<'_, T> {
-    fn successors(&self, node: Self::Node) -> <Self as GraphSuccessors<'_>>::Iter {
+impl<T: Idx> Successors for VecBitSet<'_, T> {
+    fn successors(&self, node: T) -> impl Iterator<Item = Self::Node> {
         self.0[node].iter()
     }
 }
@@ -808,14 +797,14 @@ impl<'a> UnsupportedTracker<'a> {
         self.unsupported.insert(loc);
     }
 
-    fn compute_all(&self, len: usize) -> HybridBitSet<LocId> {
-        let mut unsupported = HybridBitSet::new_empty(len);
+    fn compute_all(&self) -> FxHashSet<LocId> {
+        let mut unsupported = FxHashSet::default();
         for loc_id in &self.unsupported {
             unsupported.insert(self.locs[loc_id].find_set().id());
         }
         for (loc, set) in &self.locs {
             let root = set.find_set().id();
-            if unsupported.contains(root) {
+            if unsupported.contains(&root) {
                 unsupported.insert(*loc);
             }
         }
