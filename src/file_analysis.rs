@@ -6,12 +6,14 @@ use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::{scc::Sccs, DirectedGraph, Successors};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
+    def::{DefKind, Res},
     def_id::{DefId, LocalDefId},
     definitions::DefPathData,
-    ItemKind, Node,
+    intravisit, HirId, ItemKind, Node,
 };
 use rustc_index::{bit_set::MixedBitSet, Idx, IndexVec};
 use rustc_middle::{
+    hir::nested_filter,
     mir::{
         AggregateKind, CastKind, Const, ConstOperand, ConstValue, Local, LocalDecl, Operand, Place,
         ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
@@ -19,7 +21,7 @@ use rustc_middle::{
     query::IntoQueryParam,
     ty::{List, Ty, TyCtxt, TyKind},
 };
-use rustc_span::{source_map::Spanned, Span};
+use rustc_span::{source_map::Spanned, Span, Symbol};
 use typed_arena::Arena;
 
 use crate::{
@@ -27,10 +29,10 @@ use crate::{
     bit_set::BitSet8,
     compile_util::{contains_file_ty, is_file_ty, Pass},
     disjoint_set::DisjointSet,
+    likely_lit::LikelyLit,
     rustc_ast::visit::Visitor as _,
     rustc_index::bit_set::BitRelations,
     steensgaard,
-    transformation::LikelyLit,
 };
 
 #[derive(Debug)]
@@ -40,6 +42,7 @@ pub struct AnalysisResult {
     pub permissions: IndexVec<LocId, BitSet8<Permission>>,
     pub origins: IndexVec<LocId, BitSet8<Origin>>,
     pub unsupported: FxHashSet<LocId>,
+    pub static_span_to_lit: FxHashMap<Span, Symbol>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,9 +52,8 @@ impl Pass for FileAnalysis {
     type Out = AnalysisResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        let krate = tcx.resolver_for_lowering();
-        let krate_ref = krate.borrow();
-        let (_, krate) = krate_ref.deref();
+        let stolen = tcx.resolver_for_lowering().borrow();
+        let (_, krate) = stolen.deref();
         let mut ast_visitor = AstVisitor::default();
         ast_visitor.visit_crate(krate);
         let popen_read: FxHashMap<_, _> = ast_visitor
@@ -68,10 +70,29 @@ impl Pass for FileAnalysis {
                 LikelyLit::Other(_) => todo!(),
             })
             .collect();
-        drop(krate_ref);
+        let mut fprintf_path_spans: FxHashMap<_, _> = ast_visitor
+            .fprintf_args
+            .into_iter()
+            .filter_map(|(call_span, arg)| match arg {
+                LikelyLit::Lit(_) => None,
+                LikelyLit::If(_, _, _) => todo!(),
+                LikelyLit::Path(_, path_span) => Some((call_span, path_span)),
+                LikelyLit::Other(_) => todo!(),
+            })
+            .collect();
+        let static_span_to_lit = ast_visitor.static_span_to_lit;
+        drop(stolen);
 
         let steensgaard = steensgaard::Steensgaard.run(tcx);
         tracing::info!("\n{:?}", steensgaard);
+
+        let mut visitor = HirVisitor::new(tcx);
+        tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
+        fprintf_path_spans.retain(|_, path_span| {
+            let def_id = some_or!(visitor.bound_span_to_def_id.get(path_span), return true);
+            let static_span = visitor.def_id_to_binding_span[def_id];
+            !static_span_to_lit.contains_key(&static_span)
+        });
 
         // let mut visitor = StdioArgVisitor::new(tcx);
         // hir.visit_all_item_likes_in_crate(&mut visitor);
@@ -79,8 +100,8 @@ impl Pass for FileAnalysis {
         // for span in &stdio_args {
         //     tracing::info!("{:?}", span);
         // }
-
         // let mut stdio_arg_locs: FxHashSet<Loc> = FxHashSet::default();
+
         let mut fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>> =
             FxHashMap::default();
         let mut locs: IndexVec<LocId, Loc> =
@@ -156,6 +177,7 @@ impl Pass for FileAnalysis {
             popen_read,
             steensgaard: &steensgaard,
             fn_ty_functions,
+            fprintf_path_spans,
             // stdio_arg_locs,
             loc_ind_map: &loc_ind_map,
             permission_graph,
@@ -216,6 +238,7 @@ impl Pass for FileAnalysis {
             permissions,
             origins,
             unsupported,
+            static_span_to_lit,
         }
     }
 }
@@ -226,6 +249,7 @@ struct Analyzer<'a, 'tcx> {
     // stdio_arg_locs: FxHashSet<Loc>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
+    fprintf_path_spans: FxHashMap<Span, Span>,
     steensgaard: &'a steensgaard::AnalysisResult,
     permission_graph: Graph<LocId, Permission>,
     origin_graph: Graph<LocId, Origin>,
@@ -429,11 +453,17 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             }
                         }
                         ApiKind::Operation(Some(permission)) => {
+                            let unsupported =
+                                self.fprintf_path_spans.contains_key(&term.source_info.span);
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
                                     if let Some(x) = self.transfer_operand(&arg.node, ctx) {
-                                        self.add_permission(x, permission);
+                                        if unsupported {
+                                            self.unsupported.add(x);
+                                        } else {
+                                            self.add_permission(x, permission);
+                                        }
                                     }
                                     break;
                                 }
@@ -857,20 +887,86 @@ impl<'a> UnsupportedTracker<'a> {
 
 #[derive(Default)]
 struct AstVisitor<'ast> {
+    /// static variable definition body span to its literal
+    static_span_to_lit: FxHashMap<Span, Symbol>,
+
+    fprintf_args: Vec<(Span, LikelyLit<'ast>)>,
     popen_args: Vec<(Span, LikelyLit<'ast>)>,
 }
 
 impl<'ast> rustc_ast::visit::Visitor<'ast> for AstVisitor<'ast> {
+    fn visit_item(&mut self, item: &'ast rustc_ast::Item) {
+        rustc_ast::visit::walk_item(self, item);
+
+        let rustc_ast::ItemKind::Static(box rustc_ast::StaticItem {
+            expr: Some(expr), ..
+        }) = &item.kind
+        else {
+            return;
+        };
+        if let LikelyLit::Lit(lit) = LikelyLit::from_expr(expr) {
+            self.static_span_to_lit.insert(expr.span, lit);
+        }
+    }
+
     fn visit_expr(&mut self, expr: &'ast rustc_ast::Expr) {
         rustc_ast::visit::walk_expr(self, expr);
 
         use rustc_ast::ExprKind;
         let ExprKind::Call(callee, args) = &expr.kind else { return };
         let ExprKind::Path(_, path) = &callee.kind else { return };
-        if path.segments.last().unwrap().ident.name.as_str() != "popen" {
-            return;
+        match path.segments.last().unwrap().ident.name.as_str() {
+            "fprintf" => {
+                self.fprintf_args
+                    .push((expr.span, LikelyLit::from_expr(&args[1])));
+            }
+            "popen" => {
+                self.popen_args
+                    .push((expr.span, LikelyLit::from_expr(&args[1])));
+            }
+            _ => {}
         }
-        self.popen_args
-            .push((expr.span, LikelyLit::from_expr(&args[1])));
+    }
+}
+
+struct HirVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    bound_span_to_def_id: FxHashMap<Span, LocalDefId>,
+    def_id_to_binding_span: FxHashMap<LocalDefId, Span>,
+}
+
+impl<'tcx> HirVisitor<'tcx> {
+    #[inline]
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            bound_span_to_def_id: FxHashMap::default(),
+            def_id_to_binding_span: FxHashMap::default(),
+        }
+    }
+}
+
+impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
+        intravisit::walk_item(self, item);
+
+        let ItemKind::Static(_, _, body_id) = item.kind else { return };
+        let loc = item.owner_id.def_id;
+        let body = self.tcx.hir_body(body_id);
+        self.def_id_to_binding_span.insert(loc, body.value.span);
+    }
+
+    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, _: HirId) {
+        intravisit::walk_path(self, path);
+
+        let Res::Def(DefKind::Static { .. }, def_id) = path.res else { return };
+        let def_id = some_or!(def_id.as_local(), return);
+        self.bound_span_to_def_id.insert(path.span, def_id);
     }
 }

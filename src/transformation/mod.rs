@@ -12,7 +12,6 @@ use rustc_ast::{
     mut_visit::{self, MutVisitor},
     ptr::P,
     tokenstream::{AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream},
-    visit::{self, Visitor},
 };
 use rustc_ast_pretty::pprust;
 use rustc_const_eval::interpret::Scalar;
@@ -35,6 +34,7 @@ use crate::{
     bit_set::BitSet8,
     compile_util::{self, Pass},
     file_analysis::{self, Loc},
+    likely_lit::LikelyLit,
     rustc_middle::mir::visit::Visitor as _,
 };
 
@@ -68,15 +68,6 @@ impl Pass for Transformation {
     type Out = TransformationResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        // collect information from AST
-        let stolen = tcx.resolver_for_lowering().borrow();
-        let (_, krate) = stolen.deref();
-        let mut ast_visitor = AstVisitor {
-            static_span_to_lit: FxHashMap::default(),
-        };
-        visit::walk_crate(&mut ast_visitor, krate);
-        drop(stolen);
-
         let analysis_res = file_analysis::FileAnalysis.run(tcx);
 
         // collect information from HIR
@@ -98,29 +89,34 @@ impl Pass for Transformation {
             .contains(&analysis_res.loc_ind_map[&Loc::Stderr]);
 
         // all unsupported spans
-        let mut unsupported: FxHashSet<_> = analysis_res
-            .unsupported
-            .iter()
-            .filter_map(|loc_id| {
-                let loc = analysis_res.locs[*loc_id];
-                match loc {
-                    Loc::Var(def_id, local) => {
-                        let node = tcx.hir_node_by_def_id(def_id);
-                        let hir::Node::Item(item) = node else { panic!() };
-                        let body = match item.kind {
-                            hir::ItemKind::Fn { .. } => tcx.optimized_mir(def_id),
-                            hir::ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(def_id),
-                            _ => panic!(),
-                        };
-                        let local_decl = &body.local_decls[local];
-                        let span = local_decl.source_info.span;
-                        Some(span)
-                    }
-                    Loc::Field(_, _) => todo!(),
-                    Loc::Stdin | Loc::Stdout | Loc::Stderr => None,
+        let mut unsupported = FxHashSet::default();
+        for loc_id in &analysis_res.unsupported {
+            let loc = analysis_res.locs[*loc_id];
+            match loc {
+                Loc::Var(def_id, local) => {
+                    let node = tcx.hir_node_by_def_id(def_id);
+                    let hir::Node::Item(item) = node else { panic!() };
+                    let body = match item.kind {
+                        hir::ItemKind::Fn { .. } => tcx.optimized_mir(def_id),
+                        hir::ItemKind::Static(_, _, body_id) => {
+                            if local.as_usize() == 0 {
+                                let body = tcx.hir_body(body_id);
+                                unsupported.insert(body.value.span);
+                                unsupported.insert(item.ident.span);
+                                continue;
+                            }
+                            tcx.mir_for_ctfe(def_id)
+                        }
+                        _ => panic!(),
+                    };
+                    let local_decl = &body.local_decls[local];
+                    let span = local_decl.source_info.span;
+                    unsupported.insert(span);
                 }
-            })
-            .collect();
+                Loc::Field(_, _) => todo!(),
+                Loc::Stdin | Loc::Stdout | Loc::Stderr => {}
+            }
+        }
         let mut unsupported_locs = FxHashSet::default();
         for (span, loc) in &hir_ctx.binding_span_to_loc {
             if !unsupported.contains(span) {
@@ -265,7 +261,7 @@ impl Pass for Transformation {
             let mut visitor = TransformVisitor {
                 tcx,
 
-                static_span_to_lit: &ast_visitor.static_span_to_lit,
+                static_span_to_lit: &analysis_res.static_span_to_lit,
                 hir: &hir_ctx,
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
@@ -301,25 +297,6 @@ impl Pass for Transformation {
         }
 
         TransformationResult { files, tmpfile }
-    }
-}
-
-struct AstVisitor {
-    /// static variable definition body span to its literal
-    static_span_to_lit: FxHashMap<Span, Symbol>,
-}
-
-impl<'ast> Visitor<'ast> for AstVisitor {
-    fn visit_item(&mut self, item: &'ast Item) {
-        if let ItemKind::Static(box StaticItem {
-            expr: Some(expr), ..
-        }) = &item.kind
-        {
-            if let LikelyLit::Lit(lit) = LikelyLit::from_expr(expr) {
-                self.static_span_to_lit.insert(expr.span, lit);
-            }
-        }
-        visit::walk_item(self, item);
     }
 }
 
@@ -1124,7 +1101,7 @@ impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
             ty,
         ) = rvalue
         {
-            if i.to_u64() == 0 && compile_util::contains_file_ty(*ty, self.tcx) {
+            if i.to_uint(i.size()) == 0 && compile_util::contains_file_ty(*ty, self.tcx) {
                 self.nulls.insert(location);
             }
         }
@@ -1285,6 +1262,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         match &mut item.kind {
             ItemKind::Static(box item) => {
                 let body = some_or!(&item.expr, return);
+                if self.unsupported.contains(&body.span) {
+                    return;
+                }
                 let loc = self.hir.binding_span_to_loc[&body.span];
                 let pot = some_or!(self.loc_to_pot.get(&loc), return);
                 self.replace_ty(&mut item.ty, ty!("{}", pot.ty));
@@ -2531,56 +2511,6 @@ fn transform_fileno<S: StreamExpr>(stream: &S) -> Expr {
 }}",
         stream
     )
-}
-
-#[derive(Debug)]
-pub enum LikelyLit<'a> {
-    Lit(Symbol),
-    If(&'a Expr, Box<LikelyLit<'a>>, Box<LikelyLit<'a>>),
-    Path(Symbol, Span),
-    Other(&'a Expr),
-}
-
-impl<'a> LikelyLit<'a> {
-    pub fn from_expr(expr: &'a Expr) -> Self {
-        match &expr.kind {
-            ExprKind::MethodCall(box MethodCall { receiver: e, .. }) | ExprKind::Cast(e, _) => {
-                Self::from_expr(e)
-            }
-            ExprKind::Lit(lit) => LikelyLit::Lit(lit.symbol),
-            ExprKind::If(c, t, Some(f)) => {
-                let [t] = &t.stmts[..] else { panic!() };
-                let StmtKind::Expr(t) = &t.kind else { panic!() };
-                let t = Self::from_expr(t);
-                let f = Self::from_expr(f);
-                LikelyLit::If(c, Box::new(t), Box::new(f))
-            }
-            ExprKind::Call(callee, args) => {
-                if let ExprKind::Path(_, path) = &callee.kind {
-                    let callee = path.segments.last().unwrap().ident.name.as_str();
-                    match callee {
-                        "dcgettext" => Self::from_expr(&args[1]),
-                        "transmute" => Self::from_expr(&args[0]),
-                        _ => LikelyLit::Other(expr),
-                    }
-                } else {
-                    LikelyLit::Other(expr)
-                }
-            }
-            ExprKind::Paren(e) => Self::from_expr(e),
-            ExprKind::Unary(UnOp::Deref, e) => Self::from_expr(e),
-            ExprKind::Path(_, path) => {
-                let symbol = path.segments.last().unwrap().ident.name;
-                LikelyLit::Path(symbol, path.span)
-            }
-            ExprKind::Block(block, _) => {
-                let [.., stmt] = &block.stmts[..] else { return LikelyLit::Other(expr) };
-                let StmtKind::Expr(expr) = &stmt.kind else { return LikelyLit::Other(expr) };
-                Self::from_expr(expr)
-            }
-            _ => LikelyLit::Other(expr),
-        }
-    }
 }
 
 mod printf;

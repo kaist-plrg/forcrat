@@ -409,6 +409,20 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_fprintf_unknown() {
+    run_test(
+        r#"
+static mut s1: *const libc::c_char = b"%d\0" as *const u8 as *const libc::c_char;
+unsafe fn f(mut s2: *const libc::c_char) {
+    fprintf(stdout, s1, 0 as libc::c_int);
+    fprintf(stderr, s2, 0 as libc::c_int);
+}"#,
+        &["write!", "fprintf", "stderr"],
+        &[],
+    );
+}
+
+#[test]
 fn test_fputc() {
     run_test(
         "
@@ -711,6 +725,21 @@ unsafe fn f(mut p: *mut libc::c_void) {
     if stream.is_null() {
         return;
     }
+    fputc('a' as i32, stream);
+    putchar('a' as i32);
+}"#,
+        &["Write", "write_all", "FILE", "fputc"],
+        &[],
+    );
+}
+
+#[test]
+fn test_static_void() {
+    run_test(
+        r#"
+static mut stream: *mut FILE = 0 as *const FILE as *mut FILE;
+unsafe fn f(mut p: *mut libc::c_void) {
+    stream = p as *mut FILE;
     fputc('a' as i32, stream);
     putchar('a' as i32);
 }"#,

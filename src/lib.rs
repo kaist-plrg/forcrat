@@ -57,6 +57,7 @@ pub mod disjoint_set;
 pub mod extern_finder;
 pub mod file_analysis;
 pub mod formatter;
+pub mod likely_lit;
 pub mod retval_use_counter;
 pub mod steensgaard;
 pub mod transformation;
