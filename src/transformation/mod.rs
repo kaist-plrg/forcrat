@@ -117,7 +117,16 @@ impl Pass for Transformation {
                     let span = local_decl.source_info.span;
                     unsupported.insert(span);
                 }
-                Loc::Field(_, _) => todo!(),
+                Loc::Field(def_id, field_idx) => {
+                    let node = tcx.hir_node_by_def_id(def_id);
+                    let hir::Node::Item(item) = node else { panic!() };
+                    let (hir::ItemKind::Struct(vd, _) | hir::ItemKind::Union(vd, _)) = item.kind
+                    else {
+                        panic!()
+                    };
+                    let hir::VariantData::Struct { fields, .. } = vd else { panic!() };
+                    unsupported.insert(fields[field_idx.as_usize()].span);
+                }
                 Loc::Stdin | Loc::Stdout | Loc::Stderr => {}
             }
         }
@@ -282,22 +291,11 @@ impl Pass for Transformation {
                 is_stderr_unsupported,
 
                 updated: false,
-                updated_field_spans: FxHashSet::default(),
+                updated_field: false,
                 tmpfile: false,
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
-                for item in &mut krate.items {
-                    let ItemKind::Struct(vd, _) = &item.kind else { continue };
-                    let VariantData::Struct { fields, .. } = vd else { continue };
-                    if fields
-                        .iter()
-                        .any(|f| visitor.updated_field_spans.contains(&f.span))
-                    {
-                        item.attrs.clear();
-                    }
-                }
-
                 let s = pprust::crate_to_string_for_macros(&krate);
                 files.push((file.name.clone(), s));
                 tmpfile |= visitor.tmpfile;
@@ -971,7 +969,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 let loc = HirLoc::Global(item.owner_id.def_id);
                 self.add_binding(loc, sig.span);
             }
-            hir::ItemKind::Struct(vd, _) => {
+            hir::ItemKind::Struct(vd, _) | hir::ItemKind::Union(vd, _) => {
                 let hir::VariantData::Struct { fields, .. } = vd else { return };
                 let def_id = item.owner_id.def_id;
                 for (i, f) in fields.iter().enumerate() {
@@ -1184,7 +1182,7 @@ struct TransformVisitor<'tcx, 'a> {
 
     /// is this file updated
     updated: bool,
-    updated_field_spans: FxHashSet<Span>,
+    updated_field: bool,
     tmpfile: bool,
 }
 
@@ -1364,6 +1362,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                 }
             }
+            ItemKind::Struct(_, _) | ItemKind::Union(_, _) => {
+                if self.updated_field {
+                    item.attrs.clear();
+                    self.updated_field = false;
+                }
+            }
             _ => {}
         }
     }
@@ -1373,10 +1377,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
         let VariantData::Struct { fields, .. } = vd else { return };
         for f in fields {
-            if let Some(ty) = self.binding_ty(f.span) {
-                self.updated_field_spans.insert(f.span);
-                self.replace_ty(&mut f.ty, ty);
+            if self.unsupported.contains(&f.span) {
+                continue;
             }
+            let ty = some_or!(self.binding_ty(f.span), continue);
+            self.replace_ty(&mut f.ty, ty);
+            self.updated_field = true;
         }
     }
 

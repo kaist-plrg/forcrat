@@ -809,6 +809,32 @@ unsafe fn f(mut p: *mut libc::c_void) {
 }
 
 #[test]
+fn test_field_void() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+unsafe fn f(mut p: *mut libc::c_void) {
+    let mut s: s = s { stream: 0 as *mut FILE };
+    s.stream = p as *mut FILE;
+    s
+        .stream = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(s.stream);
+    fclose(s.stream);
+    fgetc(stdin);
+}"#,
+        &["Read", "read_exact", "FILE", "fgetc"],
+        &[],
+    );
+}
+
+#[test]
 fn test_bin_op() {
     run_test(
         r#"
