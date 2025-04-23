@@ -423,6 +423,20 @@ unsafe fn f(mut s2: *const libc::c_char) {
 }
 
 #[test]
+fn test_printf_unknown() {
+    run_test(
+        r#"
+static mut s1: *const libc::c_char = b"%d\0" as *const u8 as *const libc::c_char;
+unsafe fn f(mut s2: *const libc::c_char) {
+    printf(s1, 0 as libc::c_int);
+    printf(s2, 0 as libc::c_int);
+}"#,
+        &["write!", "printf"],
+        &[],
+    );
+}
+
+#[test]
 fn test_printf_width_precision() {
     run_test(
         r#"

@@ -44,6 +44,7 @@ pub struct AnalysisResult {
     pub unsupported: FxHashSet<LocId>,
     pub static_span_to_lit: FxHashMap<Span, Symbol>,
     pub defined_apis: FxHashSet<LocalDefId>,
+    pub unsupported_printf_spans: FxHashSet<Span>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +95,7 @@ impl Pass for FileAnalysis {
             let static_span = visitor.def_id_to_binding_span[def_id];
             !static_span_to_lit.contains_key(&static_span)
         });
+        let unsupported_printf_spans = fprintf_path_spans.keys().copied().collect();
 
         let mut defined_apis = FxHashSet::default();
         let mut worklist = visitor.defined_apis;
@@ -257,6 +259,7 @@ impl Pass for FileAnalysis {
             unsupported,
             static_span_to_lit,
             defined_apis,
+            unsupported_printf_spans,
         }
     }
 }
@@ -937,6 +940,10 @@ impl<'ast> rustc_ast::visit::Visitor<'ast> for AstVisitor<'ast> {
             "fprintf" => {
                 self.fprintf_args
                     .push((expr.span, LikelyLit::from_expr(&args[1])));
+            }
+            "printf" => {
+                self.fprintf_args
+                    .push((expr.span, LikelyLit::from_expr(&args[0])));
             }
             "popen" => {
                 self.popen_args

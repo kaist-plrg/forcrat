@@ -277,7 +277,7 @@ impl Pass for Transformation {
             let mut visitor = TransformVisitor {
                 tcx,
 
-                static_span_to_lit: &analysis_res.static_span_to_lit,
+                analysis_res: &analysis_res,
                 hir: &hir_ctx,
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
@@ -1155,13 +1155,13 @@ impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
 
 struct TransformVisitor<'tcx, 'a> {
     tcx: TyCtxt<'tcx>,
+    analysis_res: &'a file_analysis::AnalysisResult,
     hir: &'a HirCtx,
+
     /// function parameter to HIR location
     param_to_loc: &'a FxHashMap<Param, HirLoc>,
     /// HIR location to permissions and origins
     loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
-    /// static variable definition's span to its literal
-    static_span_to_lit: &'a FxHashMap<Span, Symbol>,
     /// user-defined API functions' signatures' spans
     api_sig_spans: &'a FxHashSet<Span>,
     /// null to file pointer cast expr spans
@@ -1213,7 +1213,7 @@ impl<'a> TransformVisitor<'_, 'a> {
             LikelyLit::Path(_, span) => {
                 let loc = self.hir.bound_span_to_loc[&span];
                 let static_span = self.hir.loc_to_binding_span[&loc];
-                let fmt = self.static_span_to_lit[&static_span];
+                let fmt = self.analysis_res.static_span_to_lit[&static_span];
                 transform_fprintf_lit(stream, fmt, args, ctx)
             }
             LikelyLit::Other(e) => todo!("{:?}", e),
@@ -1573,6 +1573,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         // if self.is_stdout_unsupported {
                         //     return;
                         // }
+                        if self
+                            .analysis_res
+                            .unsupported_printf_spans
+                            .contains(&expr_span)
+                        {
+                            return;
+                        }
                         let stream = StdExpr::stdout();
                         let retval_used = self.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check_std(callee.span, "stdout");
@@ -1588,6 +1595,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         // if self.is_stdout_unsupported {
                         //     return;
                         // }
+                        if self
+                            .analysis_res
+                            .unsupported_printf_spans
+                            .contains(&expr_span)
+                        {
+                            return;
+                        }
                         let stream = StdExpr::stdout();
                         let retval_used = self.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check_std(callee.span, "stdout");
