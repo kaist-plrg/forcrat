@@ -975,6 +975,20 @@ unsafe fn f(mut x: libc::c_int) {
 }
 
 #[test]
+fn test_stdout_stderr() {
+    run_test(
+        r#"
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = if x != 0 { stdout } else { stderr };
+    fputc('a' as i32, stream);
+    fputc('a' as i32, stream);
+}"#,
+        &["Box", "Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
 fn test_fopen_non_lit_mode() {
     run_test(
         r#"

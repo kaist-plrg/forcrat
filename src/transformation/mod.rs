@@ -1724,6 +1724,25 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.replace_expr(&mut f.expr, new_rhs);
                 }
             }
+            ExprKind::If(_, t, Some(f)) => {
+                let lhs = some_or!(self.hir.rhs_to_lhs.get(&expr_span), return);
+                let lhs_pot = some_or!(self.bound_pot(*lhs), return);
+                let StmtKind::Expr(t) = &mut t.stmts.last_mut().unwrap().kind else { panic!() };
+                if let Some(t_pot) = self.bound_pot(t.span) {
+                    let t_str = pprust::expr_to_string(t);
+                    let new_t = convert_expr(*lhs_pot.ty, *t_pot.ty, &t_str, true);
+                    let new_t = expr!("{}", new_t);
+                    self.replace_expr(t, new_t);
+                }
+                let ExprKind::Block(f, _) = &mut f.kind else { panic!() };
+                let StmtKind::Expr(f) = &mut f.stmts.last_mut().unwrap().kind else { panic!() };
+                if let Some(f_pot) = self.bound_pot(f.span) {
+                    let f_str = pprust::expr_to_string(f);
+                    let new_f = convert_expr(*lhs_pot.ty, *f_pot.ty, &f_str, true);
+                    let new_f = expr!("{}", new_f);
+                    self.replace_expr(f, new_f);
+                }
+            }
             _ => {}
         }
     }
