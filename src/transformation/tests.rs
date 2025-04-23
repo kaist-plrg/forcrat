@@ -894,6 +894,42 @@ unsafe fn f(mut stream: *mut FILE) {
 }
 
 #[test]
+fn test_vararg_param() {
+    run_test(
+        r#"
+unsafe extern "C" fn f(mut x: libc::c_int, mut args: ...) {
+    let mut args_0: ::std::ffi::VaListImpl;
+    args_0 = args.clone();
+    let mut stream: *mut FILE = args_0.arg::<*mut FILE>();
+    fputc(x, stream);
+    fputc(x, stdout);
+}"#,
+        &["Write", "write_all", "FILE", "fputc"],
+        &[],
+    );
+}
+
+#[test]
+fn test_vararg_call() {
+    run_test(
+        r#"
+unsafe extern "C" fn g(mut x: libc::c_int, mut args: ...) {}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    g(0 as libc::c_int, stream);
+    fgetc(stream);
+    fclose(stream);
+    fgetc(stdin);
+}"#,
+        &["Read", "read_exact", "FILE", "fgetc"],
+        &[],
+    );
+}
+
+#[test]
 fn test_field() {
     run_test(
         r#"

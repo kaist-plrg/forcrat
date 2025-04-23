@@ -27,7 +27,7 @@ use typed_arena::Arena;
 use crate::{
     api_list::{def_id_api_kind, is_def_id_api, ApiKind, Origin, Permission},
     bit_set::BitSet8,
-    compile_util::{contains_file_ty, is_file_ty, Pass},
+    compile_util::{self, contains_file_ty, is_file_ty, Pass},
     disjoint_set::DisjointSet,
     likely_lit::LikelyLit,
     rustc_ast::visit::Visitor as _,
@@ -509,6 +509,15 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     }
                 } else if let Some(callee) = def_id.as_local() {
                     self.transfer_non_api_call(callee, args, *destination, ctx);
+                } else {
+                    let name = compile_util::def_id_to_value_symbol(def_id, self.tcx).unwrap();
+                    if name.as_str() == "arg" {
+                        let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;
+                        if contains_file_ty(ty, self.tcx) {
+                            let x = self.transfer_place(*destination, ctx).unwrap();
+                            self.unsupported.add(x);
+                        }
+                    }
                 }
             }
         }
@@ -528,6 +537,13 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 let l = self.loc_ind_map[&l];
                 let r = self.transfer_operand(&arg.node, ctx).unwrap();
                 self.assign(l, r, variance);
+            }
+        }
+        for arg in args.iter().skip(sig.inputs().len()) {
+            let ty = arg.node.ty(ctx.local_decls, self.tcx);
+            if contains_file_ty(ty, self.tcx) {
+                let arg = self.transfer_operand(&arg.node, ctx).unwrap();
+                self.unsupported.add(arg);
             }
         }
         if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
