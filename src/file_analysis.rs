@@ -293,18 +293,18 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 let rty = op.ty(ctx.local_decls, self.tcx);
                 match (variance, contains_file_ty(rty, self.tcx)) {
                     (Some(variance), true) => {
-                        let l = self.transfer_place(*l, ctx).unwrap();
-                        let r = self.transfer_operand(op, ctx).unwrap();
+                        let l = self.transfer_place(*l, ctx);
+                        let r = self.transfer_operand(op, ctx);
                         self.assign(l, r, variance);
                     }
                     (Some(_), false) => {
                         println!("{:?}", rty);
-                        let l = self.transfer_place(*l, ctx).unwrap();
+                        let l = self.transfer_place(*l, ctx);
                         self.unsupported.add(l);
                     }
                     (None, true) => {
                         println!("{:?}", ty);
-                        let r = self.transfer_operand(op, ctx).unwrap();
+                        let r = self.transfer_operand(op, ctx);
                         self.unsupported.add(r);
                     }
                     (None, false) => {}
@@ -315,12 +315,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             Rvalue::BinaryOp(_, box (op1, op2)) => {
                 let ty = op1.ty(ctx.local_decls, self.tcx);
                 if contains_file_ty(ty, self.tcx) {
-                    if let Some(op1) = self.transfer_operand(op1, ctx) {
-                        self.unsupported.add(op1);
-                    }
-                    if let Some(op2) = self.transfer_operand(op2, ctx) {
-                        self.unsupported.add(op2);
-                    }
+                    let op1 = self.transfer_operand(op1, ctx);
+                    self.unsupported.add(op1);
+                    let op2 = self.transfer_operand(op2, ctx);
+                    self.unsupported.add(op2);
                 }
             }
             Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, field_idx), fields) => {
@@ -331,7 +329,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     if let Some(variance) = file_type_variance(ty, self.tcx) {
                         let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
                         let l = self.loc_ind_map[&l];
-                        let r = self.transfer_operand(f, ctx).unwrap();
+                        let r = self.transfer_operand(f, ctx);
                         self.assign(l, r, variance);
                     }
                 } else {
@@ -340,7 +338,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         if let Some(variance) = file_type_variance(ty, self.tcx) {
                             let l = Loc::Field(def_id.expect_local(), idx);
                             let l = self.loc_ind_map[&l];
-                            let r = self.transfer_operand(f, ctx).unwrap();
+                            let r = self.transfer_operand(f, ctx);
                             self.assign(l, r, variance);
                         }
                     }
@@ -348,24 +346,23 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
             _ => {
                 let variance = some_or!(variance, return);
-                let l = some_or!(self.transfer_place(*l, ctx), return);
+                let l = self.transfer_place(*l, ctx);
                 match r {
                     Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
-                        if let Some(r) = self.transfer_operand(op, ctx) {
-                            self.assign(l, r, variance);
-                        }
+                        let r = self.transfer_operand(op, ctx);
+                        self.assign(l, r, variance);
                     }
                     Rvalue::Cast(_, _, _) => unreachable!(),
                     Rvalue::Ref(_, _, place)
                     | Rvalue::RawPtr(_, place)
                     | Rvalue::CopyForDeref(place) => {
-                        let r = self.transfer_place(*place, ctx).unwrap();
+                        let r = self.transfer_place(*place, ctx);
                         self.assign(l, r, variance);
                     }
                     Rvalue::Aggregate(box kind, fields) => {
                         assert!(matches!(kind, AggregateKind::Array(_)));
                         for f in fields {
-                            let r = self.transfer_operand(f, ctx).unwrap();
+                            let r = self.transfer_operand(f, ctx);
                             self.assign(l, r, variance);
                         }
                     }
@@ -375,14 +372,14 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         }
     }
 
-    fn transfer_operand(&self, operand: &Operand<'tcx>, ctx: Ctx<'_, 'tcx>) -> Option<LocId> {
+    fn transfer_operand(&self, operand: &Operand<'tcx>, ctx: Ctx<'_, 'tcx>) -> LocId {
         match operand {
             Operand::Copy(p) | Operand::Move(p) => self.transfer_place(*p, ctx),
-            Operand::Constant(box c) => Some(self.transfer_constant(*c)),
+            Operand::Constant(box c) => self.transfer_constant(*c),
         }
     }
 
-    fn transfer_place(&self, place: Place<'tcx>, ctx: Ctx<'_, 'tcx>) -> Option<LocId> {
+    fn transfer_place(&self, place: Place<'tcx>, ctx: Ctx<'_, 'tcx>) -> LocId {
         let loc = if place.projection.is_empty()
             || place.projection.len() == 1 && place.is_indirect_first_projection()
         {
@@ -399,7 +396,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             let ProjectionElem::Field(f, _) = last else { panic!() };
             Loc::Field(def_id, *f)
         };
-        Some(self.loc_ind_map[&loc])
+        self.loc_ind_map[&loc]
     }
 
     fn transfer_constant(&self, constant: ConstOperand<'tcx>) -> LocId {
@@ -457,11 +454,11 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 if let Some(kind) = def_id_api_kind(def_id, self.tcx) {
                     match kind {
                         ApiKind::Open(origin) => {
-                            let x = self.transfer_place(*destination, ctx).unwrap();
+                            let x = self.transfer_place(*destination, ctx);
                             self.add_origin(x, origin);
                         }
                         ApiKind::PipeOpen => {
-                            let x = self.transfer_place(*destination, ctx).unwrap();
+                            let x = self.transfer_place(*destination, ctx);
                             if let Some(read) = self.popen_read.get(&term.source_info.span) {
                                 let origin = if *read {
                                     Origin::PipeRead
@@ -479,12 +476,11 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
-                                    if let Some(x) = self.transfer_operand(&arg.node, ctx) {
-                                        if unsupported {
-                                            self.unsupported.add(x);
-                                        } else {
-                                            self.add_permission(x, permission);
-                                        }
+                                    let x = self.transfer_operand(&arg.node, ctx);
+                                    if unsupported {
+                                        self.unsupported.add(x);
+                                    } else {
+                                        self.add_permission(x, permission);
                                     }
                                     break;
                                 }
@@ -495,9 +491,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
-                                    if let Some(x) = self.transfer_operand(&arg.node, ctx) {
-                                        self.unsupported.add(x);
-                                    }
+                                    let x = self.transfer_operand(&arg.node, ctx);
+                                    self.unsupported.add(x);
                                     break;
                                 }
                             }
@@ -514,7 +509,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     if name.as_str() == "arg" {
                         let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;
                         if contains_file_ty(ty, self.tcx) {
-                            let x = self.transfer_place(*destination, ctx).unwrap();
+                            let x = self.transfer_place(*destination, ctx);
                             self.unsupported.add(x);
                         }
                     }
@@ -535,19 +530,19 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             if let Some(variance) = file_type_variance(*t, self.tcx) {
                 let l = Loc::Var(callee, Local::new(i + 1));
                 let l = self.loc_ind_map[&l];
-                let r = self.transfer_operand(&arg.node, ctx).unwrap();
+                let r = self.transfer_operand(&arg.node, ctx);
                 self.assign(l, r, variance);
             }
         }
         for arg in args.iter().skip(sig.inputs().len()) {
             let ty = arg.node.ty(ctx.local_decls, self.tcx);
             if contains_file_ty(ty, self.tcx) {
-                let arg = self.transfer_operand(&arg.node, ctx).unwrap();
+                let arg = self.transfer_operand(&arg.node, ctx);
                 self.unsupported.add(arg);
             }
         }
         if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
-            let l = self.transfer_place(destination, ctx).unwrap();
+            let l = self.transfer_place(destination, ctx);
             let r = Loc::Var(callee, RETURN_PLACE);
             let r = self.loc_ind_map[&r];
             self.assign(l, r, variance);
