@@ -1463,16 +1463,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let loc = self.hir.bound_span_to_loc[&args[0].span];
-                        let is_static = if let HirLoc::Global(def_id) = loc {
-                            let name =
-                                compile_util::def_id_to_value_symbol(def_id, self.tcx).unwrap();
-                            let name = name.as_str();
-                            name != "stdin" && name != "stdout" && name != "stderr"
-                        } else {
-                            false
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let is_option = match ty {
+                            StreamType::Ref(_) | StreamType::Ptr(_) => panic!(),
+                            StreamType::Option(_) => true,
+                            _ => false,
                         };
-                        let new_expr = transform_fclose(&args[0], is_static);
+                        let new_expr = transform_fclose(&args[0], is_option);
                         self.replace_expr(expr, new_expr);
                     }
                     "fscanf" => {
@@ -2069,9 +2066,9 @@ fn transform_popen(command: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
     expr!("{}", new_expr)
 }
 
-fn transform_fclose(stream: &Expr, is_static: bool) -> Expr {
+fn transform_fclose(stream: &Expr, is_option: bool) -> Expr {
     let stream = pprust::expr_to_string(stream);
-    let take = if is_static { ".take()" } else { "" };
+    let take = if is_option { ".take()" } else { "" };
     expr!("{{ drop(({}){}); 0 }}", stream, take)
 }
 

@@ -1097,6 +1097,46 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_fclose() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+static mut stream0: *mut FILE = 0 as *const FILE as *mut FILE;
+unsafe fn f() {
+    let mut stream0_0: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream0_0);
+    fgetc(stream0_0);
+    fclose(stream0_0);
+    let mut stream1: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream1);
+    fgetc(stream1);
+    fclose(stream1);
+    let mut s: *mut s = malloc(::std::mem::size_of::<s>() as libc::c_ulong) as *mut s;
+    (*s)
+        .stream = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc((*s).stream);
+    fgetc((*s).stream);
+    fclose((*s).stream);
+}"#,
+        &["Read", "read_exact", "drop"],
+        &["FILE", "fopen", "fgetc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
@@ -1108,6 +1148,7 @@ extern "C" {
     static mut stdin: *mut FILE;
     static mut stdout: *mut FILE;
     static mut stderr: *mut FILE;
+    fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
     fn open(__file: *const libc::c_char, __oflag: libc::c_int, _: ...) -> libc::c_int;
     fn remove(__filename: *const libc::c_char) -> libc::c_int;
     fn rename(__old: *const libc::c_char, __new: *const libc::c_char) -> libc::c_int;
