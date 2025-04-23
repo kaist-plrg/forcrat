@@ -42,6 +42,35 @@ fn test_stdout() {
 }
 
 #[test]
+fn test_stdout_var() {
+    run_test(
+        "
+unsafe fn f() {
+    let mut stream: *mut FILE = stdout;
+    fputc('a' as i32, stream);
+    fputc('b' as i32, stream);
+}",
+        &["Stdout", "write_all", "std::io::stdout"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
+fn test_stdout_var_assign() {
+    run_test(
+        "
+unsafe fn f() {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    stream = stdout;
+    fputc('a' as i32, stream);
+    fputc('b' as i32, stream);
+}",
+        &["Stdout", "write_all", "std::io::stdout"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
 fn test_stderr() {
     run_test(
         "unsafe fn f() { fputc('a' as i32, stderr); }",

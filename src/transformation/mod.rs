@@ -396,7 +396,11 @@ impl<'a> TypeArena<'a> {
                 Origin::PipeDyn => todo!(),
                 Origin::Buffer => todo!(),
             };
-            if permissions.contains(Permission::Close) {
+            if permissions.contains(Permission::Close)
+                || origins.contains(Origin::Stdin)
+                || origins.contains(Origin::Stdout)
+                || origins.contains(Origin::Stderr)
+            {
                 self.option(ty)
             } else {
                 self.ptr(ty)
@@ -1753,21 +1757,21 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ExprKind::Path(None, path) => {
                 if let [seg] = &path.segments[..] {
-                    match seg.ident.name.as_str() {
-                        "stdin" => {
-                            let new_expr = expr!("std::io::stdin()");
-                            self.replace_expr(expr, new_expr);
-                        }
-                        "stdout" => {
-                            let new_expr = expr!("std::io::stdout()");
-                            self.replace_expr(expr, new_expr);
-                        }
-                        "stderr" => {
-                            let new_expr = expr!("std::io::stderr()");
-                            self.replace_expr(expr, new_expr);
-                        }
-                        _ => {}
-                    }
+                    let name = seg.ident.name.as_str();
+                    let ty = match name {
+                        "stdin" => STDIN_TY,
+                        "stdout" => STDOUT_TY,
+                        "stderr" => STDERR_TY,
+                        _ => return,
+                    };
+                    let new_expr = if let Some(lhs) = self.hir.rhs_to_lhs.get(&expr_span) {
+                        let new_expr = format!("std::io::{}()", name);
+                        let pot = self.bound_pot(*lhs).unwrap();
+                        expr!("{}", convert_expr(*pot.ty, ty, &new_expr, true))
+                    } else {
+                        expr!("std::io::{}()", name)
+                    };
+                    self.replace_expr(expr, new_expr);
                 }
             }
             ExprKind::MethodCall(box MethodCall { receiver, seg, .. }) => {
@@ -1801,7 +1805,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ExprKind::Assign(lhs, rhs, _) => {
                 let lhs_pot = some_or!(self.bound_pot(lhs.span), return);
-                let rhs_pot = some_or!(self.bound_pot(rhs.span), return);
+                let rhs_loc = some_or!(self.hir.bound_span_to_loc.get(&rhs.span), return);
+                if let HirLoc::Global(def_id) = rhs_loc {
+                    let name = compile_util::def_id_to_value_symbol(*def_id, self.tcx).unwrap();
+                    let name = name.as_str();
+                    if name == "stdin" || name == "stdout" || name == "stderr" {
+                        return;
+                    }
+                }
+                let rhs_pot = some_or!(self.loc_to_pot.get(rhs_loc), return);
                 let rhs_str = pprust::expr_to_string(rhs);
                 let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, true);
                 let new_rhs = expr!("{}", new_rhs);
