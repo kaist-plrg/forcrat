@@ -1,6 +1,17 @@
-pub(super) fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>) {
+use std::fmt::Write as _;
+
+#[derive(Debug)]
+pub(super) struct RustFormat {
+    pub(super) format: String,
+    pub(super) casts: Vec<&'static str>,
+    pub(super) width_args: Vec<usize>,
+}
+
+pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
     let mut format = String::new();
     let mut casts = vec![];
+    let mut width_count = 0;
+    let mut width_args = vec![];
     loop {
         let res = parse_format(remaining);
         for c in res.prefix {
@@ -17,7 +28,6 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>
                     if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || *c == b' ' {
                         format.push(*c as char);
                     } else {
-                        use std::fmt::Write;
                         write!(format, "\\u{{{:x}}}", *c).unwrap();
                     }
                 }
@@ -26,10 +36,11 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>
         if let Some(cs) = res.conversion_spec {
             let mut fmt = String::new();
             let mut conv = String::new();
+            let mut minus = false;
             for flag in cs.flags {
                 match flag {
                     FlagChar::Apostrophe => todo!(),
-                    FlagChar::Minus => fmt.push('<'),
+                    FlagChar::Minus => minus = true,
                     FlagChar::Plus => fmt.push('+'),
                     FlagChar::Space => todo!(),
                     FlagChar::Hash => fmt.push('#'),
@@ -37,15 +48,26 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>
                 }
             }
             if let Some(width) = cs.width {
+                if !minus {
+                    fmt.push('>');
+                }
                 match width {
-                    Width::Asterisk => todo!(),
+                    Width::Asterisk => {
+                        write!(fmt, "width{}$", width_count).unwrap();
+                        width_count += 1;
+                        width_args.push(casts.len());
+                        casts.push("usize");
+                    }
                     Width::Decimal(n) => fmt.push_str(&n.to_string()),
                 }
             }
             if let Some(precision) = cs.precision {
                 fmt.push('.');
                 match precision {
-                    Width::Asterisk => fmt.push('*'),
+                    Width::Asterisk => {
+                        fmt.push('*');
+                        casts.push("usize");
+                    }
                     Width::Decimal(n) => fmt.push_str(&n.to_string()),
                 }
             }
@@ -85,7 +107,11 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> (String, Vec<&'static str>
             break;
         }
     }
-    (format, casts)
+    RustFormat {
+        format,
+        casts,
+        width_args,
+    }
 }
 
 struct ParseResult<'a> {

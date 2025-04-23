@@ -2235,20 +2235,39 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
         }
         buf = new_buf;
     }
-    let (fmt, casts) = printf::to_rust_format(&buf);
-    assert!(args.len() == casts.len());
+    let rsfmt = printf::to_rust_format(&buf);
+    assert!(args.len() == rsfmt.casts.len());
     let mut new_args = String::new();
-    for (arg, cast) in args.iter().zip(casts) {
+    let mut width_args = String::new();
+    for (i, (arg, cast)) in args.iter().zip(rsfmt.casts).enumerate() {
+        let width_arg_idx =
+            rsfmt
+                .width_args
+                .iter()
+                .enumerate()
+                .find_map(|(width_arg_idx, arg_idx)| {
+                    if *arg_idx == i {
+                        Some(width_arg_idx)
+                    } else {
+                        None
+                    }
+                });
+        let args = if let Some(width_arg_idx) = width_arg_idx {
+            write!(width_args, "width{} = ", width_arg_idx).unwrap();
+            &mut width_args
+        } else {
+            &mut new_args
+        };
         let arg = pprust::expr_to_string(arg);
         match cast {
             "&str" => write!(
-                new_args,
+                args,
                 "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap(), ",
                 arg
             )
             .unwrap(),
             "String" => write!(
-                new_args,
+                args,
                 "{{
     let mut p: *const u8 = {} as _;
     let mut s: String = String::new();
@@ -2265,7 +2284,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
                 arg
             )
             .unwrap(),
-            _ => write!(new_args, "({}) as {}, ", arg, cast).unwrap(),
+            _ => write!(args, "({}) as {}, ", arg, cast).unwrap(),
         }
     }
     let stream = stream.borrow_for(StreamTrait::Write);
@@ -2273,7 +2292,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
         expr!(
             "{{
     use std::io::Write;
-    match write!({}, \"{}\", {}) {{
+    match write!({}, \"{}\", {}{}) {{
         Ok(_) => {{}}
         Err(e) => {{
             {}
@@ -2281,19 +2300,21 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
     }}
 }}",
             stream,
-            fmt,
+            rsfmt.format,
             new_args,
+            width_args,
             ic.error_handling_no_eof(),
         )
     } else {
         expr!(
             "{{
     use std::io::Write;
-    write!({}, \"{}\", {})
+    write!({}, \"{}\", {}{})
 }}",
             stream,
-            fmt,
-            new_args
+            rsfmt.format,
+            new_args,
+            width_args,
         )
     }
 }
