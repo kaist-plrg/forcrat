@@ -25,7 +25,7 @@ use rustc_span::{source_map::Spanned, Span, Symbol};
 use typed_arena::Arena;
 
 use crate::{
-    api_list::{def_id_api_kind, is_def_id_api, is_symbol_api, ApiKind, Origin, Permission},
+    api_list::{def_id_api_kind, is_def_id_api, ApiKind, Origin, Permission},
     bit_set::BitSet8,
     compile_util::{contains_file_ty, is_file_ty, Pass},
     disjoint_set::DisjointSet,
@@ -43,6 +43,7 @@ pub struct AnalysisResult {
     pub origins: IndexVec<LocId, BitSet8<Origin>>,
     pub unsupported: FxHashSet<LocId>,
     pub static_span_to_lit: FxHashMap<Span, Symbol>,
+    pub defined_apis: FxHashSet<LocalDefId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +95,22 @@ impl Pass for FileAnalysis {
             !static_span_to_lit.contains_key(&static_span)
         });
 
+        let mut defined_apis = FxHashSet::default();
+        let mut worklist = visitor.defined_apis;
+        while let Some(def_id) = worklist.pop() {
+            if !defined_apis.insert(def_id) {
+                continue;
+            }
+            let callees = some_or!(visitor.dependencies.get(&def_id), continue);
+            for def_id in callees {
+                worklist.push(*def_id);
+            }
+        }
+        tracing::info!("Defined APIs:");
+        for def_id in &defined_apis {
+            tracing::info!("{:?}", def_id);
+        }
+
         // let mut visitor = StdioArgVisitor::new(tcx);
         // hir.visit_all_item_likes_in_crate(&mut visitor);
         // let stdio_args = visitor.stdio_args;
@@ -112,7 +129,7 @@ impl Pass for FileAnalysis {
             let local_def_id = item.owner_id.def_id;
             let body = match item.kind {
                 ItemKind::Fn { .. } => {
-                    if is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
+                    if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
                         continue;
                     }
                     let ty = steensgaard.var_ty(steensgaard.global(local_def_id));
@@ -190,7 +207,7 @@ impl Pass for FileAnalysis {
             let local_def_id = item.owner_id.def_id;
             let body = match item.kind {
                 ItemKind::Fn { .. } => {
-                    if is_symbol_api(item.ident.name) || item.ident.name.as_str() == "main" {
+                    if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
                         continue;
                     }
                     tcx.optimized_mir(local_def_id)
@@ -239,6 +256,7 @@ impl Pass for FileAnalysis {
             origins,
             unsupported,
             static_span_to_lit,
+            defined_apis,
         }
     }
 }
@@ -933,6 +951,8 @@ struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     bound_span_to_def_id: FxHashMap<Span, LocalDefId>,
     def_id_to_binding_span: FxHashMap<LocalDefId, Span>,
+    defined_apis: Vec<LocalDefId>,
+    dependencies: FxHashMap<LocalDefId, Vec<LocalDefId>>,
 }
 
 impl<'tcx> HirVisitor<'tcx> {
@@ -942,6 +962,8 @@ impl<'tcx> HirVisitor<'tcx> {
             tcx,
             bound_span_to_def_id: FxHashMap::default(),
             def_id_to_binding_span: FxHashMap::default(),
+            defined_apis: vec![],
+            dependencies: FxHashMap::default(),
         }
     }
 }
@@ -956,17 +978,38 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
         intravisit::walk_item(self, item);
 
-        let ItemKind::Static(_, _, body_id) = item.kind else { return };
-        let loc = item.owner_id.def_id;
-        let body = self.tcx.hir_body(body_id);
-        self.def_id_to_binding_span.insert(loc, body.value.span);
+        match item.kind {
+            ItemKind::Fn { .. } => {
+                let def_id = item.owner_id.def_id;
+                if is_def_id_api(def_id, self.tcx) {
+                    self.defined_apis.push(def_id);
+                }
+            }
+            ItemKind::Static(_, _, body_id) => {
+                let loc = item.owner_id.def_id;
+                let body = self.tcx.hir_body(body_id);
+                self.def_id_to_binding_span.insert(loc, body.value.span);
+            }
+            _ => {}
+        }
     }
 
-    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, _: HirId) {
+    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, hir_id: HirId) {
         intravisit::walk_path(self, path);
 
-        let Res::Def(DefKind::Static { .. }, def_id) = path.res else { return };
+        let Res::Def(kind, def_id) = path.res else { return };
         let def_id = some_or!(def_id.as_local(), return);
-        self.bound_span_to_def_id.insert(path.span, def_id);
+        match kind {
+            DefKind::Fn => {
+                self.dependencies
+                    .entry(hir_id.owner.def_id)
+                    .or_default()
+                    .push(def_id);
+            }
+            DefKind::Static { .. } => {
+                self.bound_span_to_def_id.insert(path.span, def_id);
+            }
+            _ => {}
+        }
     }
 }

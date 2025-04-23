@@ -220,7 +220,7 @@ impl Pass for Transformation {
                 if item.ident.name.as_str() == "main" {
                     continue;
                 }
-                if api_list::is_symbol_api(item.ident.name) {
+                if analysis_res.defined_apis.contains(&local_def_id) {
                     api_sig_spans.insert(sig.span);
                     continue;
                 }
@@ -1410,7 +1410,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             return;
                         }
                         let loc = self.hir.bound_span_to_loc[&args[0].span];
-                        let is_static = matches!(loc, HirLoc::Global(_));
+                        let is_static = if let HirLoc::Global(def_id) = loc {
+                            let name =
+                                compile_util::def_id_to_value_symbol(def_id, self.tcx).unwrap();
+                            let name = name.as_str();
+                            name != "stdin" && name != "stdout" && name != "stderr"
+                        } else {
+                            false
+                        };
                         let new_expr = transform_fclose(&args[0], is_static);
                         self.replace_expr(expr, new_expr);
                     }
