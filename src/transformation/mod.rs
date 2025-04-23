@@ -21,7 +21,11 @@ use rustc_index::Idx;
 use rustc_lexer::unescape;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{self, CastKind, ConstOperand, ConstValue, Location, Operand, Rvalue},
+    mir::{
+        self,
+        visit::{MutatingUseContext, PlaceContext},
+        CastKind, ConstValue, Location, Operand, Place, Rvalue, Terminator, TerminatorKind,
+    },
     ty::{self, AdtDef, TyCtxt},
 };
 use rustc_span::{def_id::LocalDefId, symbol::Ident, FileName, RealFileName, Span, Symbol};
@@ -212,6 +216,7 @@ impl Pass for Transformation {
 
         let mut api_sig_spans = FxHashSet::default();
         let mut null_casts = FxHashSet::default();
+        let mut retval_used_spans = FxHashSet::default();
 
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
@@ -226,14 +231,16 @@ impl Pass for Transformation {
                 }
 
                 let body = tcx.optimized_mir(local_def_id);
-                let mut visitor = MirVisitor {
-                    tcx,
-                    nulls: FxHashSet::default(),
-                };
+                let mut visitor = MirVisitor::new(tcx);
                 visitor.visit_body(body);
                 for location in visitor.nulls {
                     let stmt = body.stmt_at(location).left().unwrap();
                     null_casts.insert(stmt.source_info.span);
+                }
+                for (span, local) in visitor.destinations {
+                    if visitor.used_locals.contains(&local) {
+                        retval_used_spans.insert(span);
+                    }
                 }
             }
         }
@@ -267,6 +274,7 @@ impl Pass for Transformation {
                 loc_to_pot: &hir_loc_to_pot,
                 api_sig_spans: &api_sig_spans,
                 null_casts: &null_casts,
+                retval_used_spans: &retval_used_spans,
 
                 unsupported: &unsupported,
                 is_stdin_unsupported,
@@ -1088,24 +1096,62 @@ fn find_field(field: Symbol, adt_def: AdtDef<'_>) -> Option<FieldIdx> {
 struct MirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     nulls: FxHashSet<Location>,
+    destinations: Vec<(Span, mir::Local)>,
+    used_locals: FxHashSet<mir::Local>,
+}
+
+impl<'tcx> MirVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            nulls: FxHashSet::default(),
+            destinations: vec![],
+            used_locals: FxHashSet::default(),
+        }
+    }
 }
 
 impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
     fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
-        if let Rvalue::Cast(
-            CastKind::PointerWithExposedProvenance,
-            Operand::Constant(box ConstOperand {
-                const_: mir::Const::Val(ConstValue::Scalar(Scalar::Int(i)), _),
-                ..
-            }),
-            ty,
-        ) = rvalue
-        {
-            if i.to_uint(i.size()) == 0 && compile_util::contains_file_ty(*ty, self.tcx) {
-                self.nulls.insert(location);
-            }
-        }
         self.super_rvalue(rvalue, location);
+
+        let Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, ty) = rvalue else { return };
+        let Operand::Constant(box constant) = op else { return };
+        let mir::Const::Val(value, _) = constant.const_ else { return };
+        let ConstValue::Scalar(scalar) = value else { return };
+        let Scalar::Int(i) = scalar else { return };
+        if i.to_uint(i.size()) == 0 && compile_util::contains_file_ty(*ty, self.tcx) {
+            self.nulls.insert(location);
+        }
+    }
+
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        self.super_place(place, context, location);
+
+        if !matches!(
+            context,
+            PlaceContext::MutatingUse(MutatingUseContext::Call | MutatingUseContext::Store)
+        ) {
+            self.used_locals.insert(place.local);
+        }
+    }
+
+    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
+        self.super_terminator(terminator, location);
+
+        let TerminatorKind::Call {
+            destination, func, ..
+        } = &terminator.kind
+        else {
+            return;
+        };
+        let constant = some_or!(func.constant(), return);
+        let mir::Const::Val(_, ty) = constant.const_ else { return };
+        let ty::TyKind::FnDef(def_id, _) = ty.kind() else { return };
+        if api_list::is_def_id_api(def_id, self.tcx) {
+            self.destinations
+                .push((terminator.source_info.span, destination.local));
+        }
     }
 }
 
@@ -1122,6 +1168,8 @@ struct TransformVisitor<'tcx, 'a> {
     api_sig_spans: &'a FxHashSet<Span>,
     /// null to file pointer cast expr spans
     null_casts: &'a FxHashSet<Span>,
+    /// spans of function calls whose return values are used
+    retval_used_spans: &'a FxHashSet<Span>,
 
     /// unsupported expr spans
     unsupported: &'a FxHashSet<Span>,
@@ -1140,6 +1188,13 @@ struct TransformVisitor<'tcx, 'a> {
     tmpfile: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FprintfCtx<'a> {
+    wide: bool,
+    retval_used: bool,
+    ic: IndicatorCheck<'a>,
+}
+
 impl<'a> TransformVisitor<'_, 'a> {
     #[inline]
     fn is_unsupported(&self, expr: &Expr) -> bool {
@@ -1152,17 +1207,16 @@ impl<'a> TransformVisitor<'_, 'a> {
         stream: &S,
         fmt: &Expr,
         args: &[E],
-        wide: bool,
-        ic: IndicatorCheck<'_>,
+        ctx: FprintfCtx<'_>,
     ) -> Expr {
         match LikelyLit::from_expr(fmt) {
-            LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, wide, ic),
+            LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, ctx),
             LikelyLit::If(_, _, _) => todo!(),
             LikelyLit::Path(_, span) => {
                 let loc = self.hir.bound_span_to_loc[&span];
                 let static_span = self.hir.loc_to_binding_span[&loc];
                 let fmt = self.static_span_to_lit[&static_span];
-                transform_fprintf_lit(stream, fmt, args, wide, ic)
+                transform_fprintf_lit(stream, fmt, args, ctx)
             }
             LikelyLit::Other(e) => todo!("{:?}", e),
         }
@@ -1502,9 +1556,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
+                        let retval_used = self.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check(callee.span);
-                        let new_expr =
-                            self.transform_fprintf(&stream, &args[1], &args[2..], false, ic);
+                        let ctx = FprintfCtx {
+                            wide: false,
+                            retval_used,
+                            ic,
+                        };
+                        let new_expr = self.transform_fprintf(&stream, &args[1], &args[2..], ctx);
                         self.replace_expr(expr, new_expr);
                     }
                     "printf" => {
@@ -1512,9 +1571,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         //     return;
                         // }
                         let stream = StdExpr::stdout();
+                        let retval_used = self.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check_std(callee.span, "stdout");
-                        let new_expr =
-                            self.transform_fprintf(&stream, &args[0], &args[1..], false, ic);
+                        let ctx = FprintfCtx {
+                            wide: false,
+                            retval_used,
+                            ic,
+                        };
+                        let new_expr = self.transform_fprintf(&stream, &args[0], &args[1..], ctx);
                         self.replace_expr(expr, new_expr);
                     }
                     "wprintf" => {
@@ -1522,9 +1586,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         //     return;
                         // }
                         let stream = StdExpr::stdout();
+                        let retval_used = self.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check_std(callee.span, "stdout");
-                        let new_expr =
-                            self.transform_fprintf(&stream, &args[0], &args[1..], true, ic);
+                        let ctx = FprintfCtx {
+                            wide: true,
+                            retval_used,
+                            ic,
+                        };
+                        let new_expr = self.transform_fprintf(&stream, &args[0], &args[1..], ctx);
                         self.replace_expr(expr, new_expr);
                     }
                     "fputc" | "putc" => {
@@ -2224,8 +2293,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
     stream: &S,
     fmt: Symbol,
     args: &[E],
-    wide: bool,
-    ic: IndicatorCheck<'_>,
+    ctx: FprintfCtx<'_>,
 ) -> Expr {
     // from rustc_ast/src/util/literal.rs
     let s = fmt.as_str();
@@ -2234,7 +2302,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
         buf.push(unescape::byte_from_char(c.unwrap()))
     });
 
-    if wide {
+    if ctx.wide {
         let mut new_buf: Vec<u8> = vec![];
         for c in buf.chunks_exact(4) {
             let c = u32::from_le_bytes(c.try_into().unwrap());
@@ -2295,7 +2363,41 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
         }
     }
     let stream = stream.borrow_for(StreamTrait::Write);
-    if ic.has_check() {
+    if ctx.retval_used {
+        if ctx.ic.has_check() {
+            expr!(
+                "{{
+    use std::io::Write;
+    let string_to_print = format!(\"{}\", {}{});
+    match write!({}, \"{{}}\", string_to_print) {{
+        Ok(_) => {{}}
+        Err(e) => {{
+            {}
+        }}
+    }}
+    string_to_print.len() as i32
+}}",
+                rsfmt.format,
+                new_args,
+                width_args,
+                stream,
+                ctx.ic.error_handling_no_eof(),
+            )
+        } else {
+            expr!(
+                "{{
+    use std::io::Write;
+    let string_to_print = format!(\"{}\", {}{});
+    write!({}, \"{{}}\", string_to_print);
+    string_to_print.len() as i32
+}}",
+                rsfmt.format,
+                new_args,
+                width_args,
+                stream,
+            )
+        }
+    } else if ctx.ic.has_check() {
         expr!(
             "{{
     use std::io::Write;
@@ -2310,7 +2412,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
             rsfmt.format,
             new_args,
             width_args,
-            ic.error_handling_no_eof(),
+            ctx.ic.error_handling_no_eof(),
         )
     } else {
         expr!(
@@ -2519,7 +2621,22 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
             )
         }
         LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Path(_, _) => todo!(),
+        LikelyLit::Path(path, _) => {
+            expr!(
+                "{{
+    use std::io::Seek;
+    ({}).seek(match {} {{
+        0 => std::io::SeekFrom::Start(({2}) as _),
+        1 => std::io::SeekFrom::Current(({2}) as _),
+        2 => std::io::SeekFrom::End(({2}) as _),
+        _ => panic!(),
+    }}).map_or(-1, |_| 0)
+}}",
+                stream,
+                path.as_str(),
+                off
+            )
+        }
         LikelyLit::Other(_) => todo!(),
     }
 }

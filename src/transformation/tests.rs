@@ -469,6 +469,20 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_printf_result() {
+    run_test(
+        r#"
+unsafe fn g(mut x: libc::c_int) {}
+unsafe fn f() {
+    g(printf(b"a\0" as *const u8 as *const libc::c_char));
+    printf(b"a\0" as *const u8 as *const libc::c_char);
+}"#,
+        &["write!"],
+        &["printf"],
+    );
+}
+
+#[test]
 fn test_fputc() {
     run_test(
         "
