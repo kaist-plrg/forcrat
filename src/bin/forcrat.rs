@@ -22,6 +22,7 @@ enum Command {
         only_show_total: bool,
     },
     CountReturnValues,
+    FindFileReturns,
     Steensgaard,
     Analyze,
     Transformation {
@@ -125,6 +126,9 @@ fn main() {
             for (name, counts) in counts {
                 println!("{} {} {}", name, counts.used, counts.unused);
             }
+        }
+        Command::FindFileReturns => {
+            return_finder::ReturnFinder.run_on_path(&file);
         }
         Command::Steensgaard => {
             let res = steensgaard::Steensgaard.run_on_path(&file);
