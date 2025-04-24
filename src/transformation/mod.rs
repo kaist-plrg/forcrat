@@ -153,14 +153,23 @@ impl Pass for Transformation {
             .zip(analysis_res.permissions.iter().copied())
             .zip(analysis_res.origins.iter().copied())
         {
-            let (hir_loc, is_param) = match loc {
+            let (hir_locs, is_param) = match loc {
                 Loc::Var(def_id, local) => {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     match item.kind {
                         hir::ItemKind::Fn { sig, .. } => {
+                            let mut locs = vec![];
+                            if *local == mir::Local::ZERO {
+                                locs.push(HirLoc::Return(*def_id));
+                            }
                             let span =
                                 mir_local_span(*def_id, *local, &return_locals, &hir_ctx, tcx);
-                            let loc = *some_or!(hir_ctx.binding_span_to_loc.get(&span), continue);
+                            if let Some(loc) = hir_ctx.binding_span_to_loc.get(&span) {
+                                locs.push(*loc);
+                            }
+                            if locs.is_empty() {
+                                continue;
+                            }
                             let arity = sig.decl.inputs.len();
                             let is_param = (1..=arity).contains(&local.as_usize());
                             if is_param {
@@ -168,33 +177,35 @@ impl Pass for Transformation {
                                     func: *def_id,
                                     index: local.as_usize() - 1,
                                 };
-                                param_to_hir_loc.insert(param, loc);
+                                param_to_hir_loc.insert(param, locs[0]);
                             }
-                            (loc, is_param)
+                            (locs, is_param)
                         }
                         hir::ItemKind::Static(_, _, _) => {
                             if *local != mir::Local::ZERO {
                                 continue;
                             }
-                            (HirLoc::Global(*def_id), false)
+                            (vec![HirLoc::Global(*def_id)], false)
                         }
                         _ => panic!(),
                     }
                 }
-                Loc::Field(def_id, field) => (HirLoc::Field(*def_id, *field), false),
+                Loc::Field(def_id, field) => (vec![HirLoc::Field(*def_id, *field)], false),
                 _ => continue,
             };
-            if unsupported_locs.contains(&hir_loc) {
-                continue;
+            for hir_loc in hir_locs {
+                if unsupported_locs.contains(&hir_loc) {
+                    continue;
+                }
+                let ty = type_arena.make_ty(permissions, origins, is_param);
+                let pot = Pot {
+                    permissions,
+                    origins,
+                    ty,
+                };
+                let old = hir_loc_to_pot.insert(hir_loc, pot);
+                assert!(old.is_none());
             }
-            let ty = type_arena.make_ty(permissions, origins, is_param);
-            let pot = Pot {
-                permissions,
-                origins,
-                ty,
-            };
-            let old = hir_loc_to_pot.insert(hir_loc, pot);
-            assert!(old.is_none());
         }
         for hir_loc in hir_ctx.loc_to_bound_spans.keys() {
             let HirLoc::Global(def_id) = hir_loc else { continue };
@@ -901,6 +912,7 @@ impl Param {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HirLoc {
     Global(LocalDefId),
+    Return(LocalDefId),
     Local(HirId),
     Field(LocalDefId, FieldIdx),
 }
@@ -1395,6 +1407,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         ty_param!("TT{}: {}", i, bound)
                     };
                     item.generics.params.push(tparam);
+                }
+                if let Some(pot) = self.loc_to_pot.get(&HirLoc::Return(def_id)) {
+                    let FnRetTy::Ty(ty) = &mut item.sig.decl.output else { panic!() };
+                    self.replace_ty(ty, ty!("{}", pot.ty));
                 }
                 if let Some(eofs) = self.hir.feof_functions.get(&def_id) {
                     let stmts = &mut item.body.as_mut().unwrap().stmts;
