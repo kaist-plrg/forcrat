@@ -878,6 +878,20 @@ unsafe fn f(mut p: *mut libc::c_void) {
 }
 
 #[test]
+fn test_return_void() {
+    run_test(
+        r#"
+unsafe fn f(mut p: *mut libc::c_void) -> *mut FILE {
+    getchar();
+    let mut stream: *mut FILE = p as *mut FILE;
+    return stream;
+}"#,
+        &["Read", "read_exact", "FILE"],
+        &[],
+    );
+}
+
+#[test]
 fn test_bin_op() {
     run_test(
         r#"
@@ -1255,6 +1269,35 @@ unsafe fn g() -> *mut FILE {
 }
 unsafe fn f() {
     let mut stream: *mut FILE = g();
+    fgetc(stream);
+    fgetc(stream);
+    fclose(stream);
+}"#,
+        &["Read", "read_exact", "drop"],
+        &["FILE", "fopen", "fgetc", "fclose"],
+    );
+}
+
+#[test]
+fn test_return_box_close() {
+    run_test(
+        r#"
+unsafe fn g(mut x: libc::c_int) -> *mut FILE {
+    let mut stream: *mut FILE = if x != 0 {
+        fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        )
+    } else {
+        popen(
+            b"ls\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        )
+    };
+    return stream;
+}
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = g(x);
     fgetc(stream);
     fgetc(stream);
     fclose(stream);

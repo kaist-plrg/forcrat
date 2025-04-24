@@ -14,9 +14,12 @@ use rustc_ast::{
     tokenstream::{AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream},
 };
 use rustc_ast_pretty::pprust;
-use rustc_const_eval::interpret::Scalar;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{self as hir, def::Res, intravisit, HirId, QPath};
+use rustc_hir::{
+    self as hir,
+    def::{DefKind, Res},
+    intravisit, HirId, QPath,
+};
 use rustc_index::Idx;
 use rustc_lexer::unescape;
 use rustc_middle::{
@@ -24,7 +27,7 @@ use rustc_middle::{
     mir::{
         self,
         visit::{MutatingUseContext, PlaceContext},
-        CastKind, ConstValue, Location, Operand, Place, Rvalue, Terminator, TerminatorKind,
+        Location, Place, Terminator, TerminatorKind,
     },
     ty::{self, AdtDef, TyCtxt},
 };
@@ -105,12 +108,16 @@ impl Pass for Transformation {
 
         // all unsupported spans
         let mut unsupported = FxHashSet::default();
+        let mut unsupported_returns = FxHashSet::default();
         for loc_id in &analysis_res.unsupported {
             let loc = analysis_res.locs[*loc_id];
             match loc {
                 Loc::Var(def_id, local) => {
                     let span = mir_local_span(def_id, local, &return_locals, &hir_ctx, tcx);
                     unsupported.insert(span);
+                    if local == mir::Local::ZERO {
+                        unsupported_returns.insert(def_id);
+                    }
                 }
                 Loc::Field(def_id, field_idx) => {
                     let node = tcx.hir_node_by_def_id(def_id);
@@ -204,7 +211,9 @@ impl Pass for Transformation {
                     ty,
                 };
                 let old = hir_loc_to_pot.insert(hir_loc, pot);
-                assert!(old.is_none());
+                if let Some(old) = old {
+                    assert_eq!(pot, old, "{:?}", hir_loc);
+                }
             }
         }
         for hir_loc in hir_ctx.loc_to_bound_spans.keys() {
@@ -229,7 +238,6 @@ impl Pass for Transformation {
         }
 
         let mut api_ident_spans = FxHashSet::default();
-        let mut null_casts = FxHashSet::default();
         let mut retval_used_spans = FxHashSet::default();
 
         for item_id in tcx.hir_free_items() {
@@ -247,10 +255,6 @@ impl Pass for Transformation {
                 let body = tcx.optimized_mir(local_def_id);
                 let mut visitor = MirVisitor::new(tcx);
                 visitor.visit_body(body);
-                for location in visitor.nulls {
-                    let stmt = body.stmt_at(location).left().unwrap();
-                    null_casts.insert(stmt.source_info.span);
-                }
                 for (span, local) in visitor.destinations {
                     if visitor.used_locals.contains(&local) {
                         retval_used_spans.insert(span);
@@ -287,10 +291,10 @@ impl Pass for Transformation {
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
                 api_ident_spans: &api_ident_spans,
-                null_casts: &null_casts,
                 retval_used_spans: &retval_used_spans,
 
                 unsupported: &unsupported,
+                unsupported_returns: &unsupported_returns,
                 is_stdin_unsupported,
                 is_stdout_unsupported,
                 is_stderr_unsupported,
@@ -298,6 +302,7 @@ impl Pass for Transformation {
                 updated: false,
                 updated_field: false,
                 tmpfile: false,
+                current_fn: None,
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
@@ -347,7 +352,7 @@ fn remove_cast(expr: &Expr) -> &Expr {
     remove_cast(expr)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pot<'a> {
     permissions: BitSet8<Permission>,
     #[allow(unused)]
@@ -955,12 +960,13 @@ struct HirCtx {
     feof_functions: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
     /// function def_id to ferror argument names
     ferror_functions: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
-    /// call span to stream argument name
+    /// callee span to stream argument name
     callee_span_to_stream_name: FxHashMap<Span, Symbol>,
 
     /// callee span to expr hir_id
     callee_span_to_hir_id: FxHashMap<Span, HirId>,
-
+    /// call expr span to callee id
+    call_span_to_callee_id: FxHashMap<Span, LocalDefId>,
     /// function def_id to returned local hir_ids
     return_locals: FxHashMap<LocalDefId, FxHashSet<Option<HirId>>>,
 }
@@ -1007,7 +1013,6 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 let body = self.tcx.hir_body(body_id);
                 self.add_binding(loc, item.ident.span);
                 self.add_bound(loc, item.ident.span);
-                self.add_bound(loc, body.value.span);
                 self.add_assignment(item.ident.span, body.value.span);
             }
             hir::ItemKind::Fn { .. } => {
@@ -1075,6 +1080,11 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 self.ctx
                     .callee_span_to_hir_id
                     .insert(path.span, expr.hir_id);
+                if let Res::Def(DefKind::Fn, def_id) = path.res {
+                    if let Some(def_id) = def_id.as_local() {
+                        self.ctx.call_span_to_callee_id.insert(expr.span, def_id);
+                    }
+                }
                 let name = path.segments.last().unwrap().ident.name;
                 let name = api_list::normalize_api_name(name.as_str());
                 let i = match name {
@@ -1155,7 +1165,6 @@ fn find_field(field: Symbol, adt_def: AdtDef<'_>) -> Option<FieldIdx> {
 
 struct MirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    nulls: FxHashSet<Location>,
     destinations: Vec<(Span, mir::Local)>,
     used_locals: FxHashSet<mir::Local>,
 }
@@ -1164,7 +1173,6 @@ impl<'tcx> MirVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
-            nulls: FxHashSet::default(),
             destinations: vec![],
             used_locals: FxHashSet::default(),
         }
@@ -1172,19 +1180,6 @@ impl<'tcx> MirVisitor<'tcx> {
 }
 
 impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
-    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
-        self.super_rvalue(rvalue, location);
-
-        let Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, ty) = rvalue else { return };
-        let Operand::Constant(box constant) = op else { return };
-        let mir::Const::Val(value, _) = constant.const_ else { return };
-        let ConstValue::Scalar(scalar) = value else { return };
-        let Scalar::Int(i) = scalar else { return };
-        if i.to_uint(i.size()) == 0 && compile_util::contains_file_ty(*ty, self.tcx) {
-            self.nulls.insert(location);
-        }
-    }
-
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
         self.super_place(place, context, location);
 
@@ -1226,13 +1221,13 @@ struct TransformVisitor<'tcx, 'a> {
     loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// user-defined API functions' signatures' spans
     api_ident_spans: &'a FxHashSet<Span>,
-    /// null to file pointer cast expr spans
-    null_casts: &'a FxHashSet<Span>,
     /// spans of function calls whose return values are used
     retval_used_spans: &'a FxHashSet<Span>,
 
     /// unsupported expr spans
     unsupported: &'a FxHashSet<Span>,
+    /// unsupported return fn ids
+    unsupported_returns: &'a FxHashSet<LocalDefId>,
     /// is stdin unsupported
     is_stdin_unsupported: bool,
     /// is stdout unsupported
@@ -1246,6 +1241,7 @@ struct TransformVisitor<'tcx, 'a> {
     updated: bool,
     updated_field: bool,
     tmpfile: bool,
+    current_fn: Option<LocalDefId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1295,10 +1291,22 @@ impl<'a> TransformVisitor<'_, 'a> {
     }
 
     #[inline]
-    fn binding_ty(&self, span: Span) -> Option<Ty> {
+    fn binding_pot(&self, span: Span) -> Option<&'a Pot<'a>> {
         let loc = self.hir.binding_span_to_loc.get(&span)?;
-        let pot = self.loc_to_pot.get(loc)?;
-        Some(ty!("{}", pot.ty))
+        self.loc_to_pot.get(loc)
+    }
+
+    #[inline]
+    fn binding_ty(&self, span: Span) -> Option<Ty> {
+        Some(ty!("{}", self.binding_pot(span)?.ty))
+    }
+
+    #[inline]
+    fn return_pot(&self, func: LocalDefId) -> Option<&'a Pot<'a>> {
+        if self.unsupported_returns.contains(&func) {
+            return None;
+        }
+        self.loc_to_pot.get(&HirLoc::Return(func))
     }
 
     #[inline]
@@ -1361,6 +1369,61 @@ impl<'a> TransformVisitor<'_, 'a> {
         *old = new;
         old.span = span;
     }
+
+    fn convert_rhs(&mut self, rhs: &mut Expr, lhs_pot: Pot<'_>) {
+        let rhs_span = rhs.span;
+        if let Some(rhs_pot) = self.bound_pot(rhs.span) {
+            let rhs_str = pprust::expr_to_string(rhs);
+            let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, true);
+            let new_rhs = expr!("{}", new_rhs);
+            self.replace_expr(rhs, new_rhs);
+        } else if let Some(def_id) = self.hir.call_span_to_callee_id.get(&rhs_span) {
+            let name = compile_util::def_id_to_value_symbol(*def_id, self.tcx).unwrap();
+            let name = api_list::normalize_api_name(name.as_str());
+            let rhs_str = pprust::expr_to_string(rhs);
+            let rhs_ty = match name {
+                "fopen" | "tmpfile" => StreamType::Option(&FILE_TY),
+                "fdopen" => FILE_TY,
+                "popen" => {
+                    if rhs_str.contains("child.stdin") {
+                        StreamType::Option(&StreamType::ChildStdin)
+                    } else if rhs_str.contains("child.stdout") {
+                        StreamType::Option(&StreamType::ChildStdout)
+                    } else {
+                        panic!("{}", rhs_str)
+                    }
+                }
+                _ => *self.return_pot(*def_id).unwrap().ty,
+            };
+            let new_rhs = convert_expr(*lhs_pot.ty, rhs_ty, &rhs_str, true);
+            let new_rhs = expr!("{}", new_rhs);
+            self.replace_expr(rhs, new_rhs);
+        } else {
+            match &mut rhs.kind {
+                ExprKind::If(_, t, Some(f)) => {
+                    let StmtKind::Expr(t) = &mut t.stmts.last_mut().unwrap().kind else { panic!() };
+                    self.convert_rhs(t, lhs_pot);
+
+                    let ExprKind::Block(f, _) = &mut f.kind else { panic!() };
+                    let StmtKind::Expr(f) = &mut f.stmts.last_mut().unwrap().kind else { panic!() };
+                    self.convert_rhs(f, lhs_pot);
+                }
+                ExprKind::Cast(_, _) => {
+                    assert!(matches!(remove_cast(rhs).kind, ExprKind::Lit(_)));
+                    match lhs_pot.ty {
+                        StreamType::Option(_) => {
+                            self.replace_expr(rhs, expr!("None"));
+                        }
+                        StreamType::Ptr(_) => {
+                            self.replace_expr(rhs, expr!("std::ptr::null_mut()"));
+                        }
+                        _ => panic!(),
+                    }
+                }
+                _ => panic!("{:?}", rhs),
+            }
+        }
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
@@ -1369,18 +1432,23 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             return;
         }
 
+        if let Some(HirLoc::Global(def_id)) = self.hir.binding_span_to_loc.get(&item.ident.span) {
+            self.current_fn = Some(*def_id);
+        }
+
         mut_visit::walk_item(self, item);
 
         let ident_span = item.ident.span;
         match &mut item.kind {
             ItemKind::Static(box item) => {
-                let body = some_or!(&item.expr, return);
+                let body = some_or!(&mut item.expr, return);
                 if self.unsupported.contains(&body.span) {
                     return;
                 }
                 let loc = self.hir.binding_span_to_loc[&ident_span];
                 let pot = some_or!(self.loc_to_pot.get(&loc), return);
                 self.replace_ty(&mut item.ty, ty!("{}", pot.ty));
+                self.convert_rhs(body, *pot);
             }
             ItemKind::Fn(box item) => {
                 let HirLoc::Global(def_id) = self.hir.binding_span_to_loc[&ident_span] else {
@@ -1408,7 +1476,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     };
                     item.generics.params.push(tparam);
                 }
-                if let Some(pot) = self.loc_to_pot.get(&HirLoc::Return(def_id)) {
+                if let Some(pot) = self.return_pot(def_id) {
                     let FnRetTy::Ty(ty) = &mut item.sig.decl.output else { panic!() };
                     self.replace_ty(ty, ty!("{}", pot.ty));
                 }
@@ -1452,42 +1520,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn visit_local(&mut self, local: &mut P<Local>) {
-        // walk_local is private
-        let Local {
-            id,
-            pat,
-            ty,
-            kind,
-            span,
-            colon_sp,
-            attrs,
-            tokens,
-        } = local.deref_mut();
-        self.visit_id(id);
-        visit_attrs(self, attrs);
-        self.visit_pat(pat);
-        visit_opt(ty, |ty| self.visit_ty(ty));
-        match kind {
-            LocalKind::Decl => {}
-            LocalKind::Init(init) => {
-                self.visit_expr(init);
-            }
-            LocalKind::InitElse(init, els) => {
-                self.visit_expr(init);
-                self.visit_block(els);
-            }
-        }
-        visit_lazy_tts(self, tokens);
-        visit_opt(colon_sp, |sp| self.visit_span(sp));
-        self.visit_span(span);
+        walk_local(self, local);
 
         if self.unsupported.contains(&local.pat.span) {
             return;
         }
 
-        if let Some(ty) = self.binding_ty(local.pat.span) {
-            self.replace_ty(local.ty.as_mut().unwrap(), ty);
-        }
+        let pot = some_or!(self.binding_pot(local.pat.span), return);
+        let ty = ty!("{}", pot.ty);
+        self.replace_ty(local.ty.as_mut().unwrap(), ty);
+
+        let LocalKind::Init(rhs) = &mut local.kind else { return };
+        self.convert_rhs(rhs, *pot);
     }
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
@@ -1506,28 +1550,20 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 let name = api_list::normalize_api_name(name.as_str());
                 match name {
                     "fopen" => {
-                        let lhs = self.hir.rhs_to_lhs[&expr_span];
-                        let pot = self.bound_pot(lhs).unwrap();
-                        let new_expr = transform_fopen(&args[0], &args[1], pot);
+                        let new_expr = transform_fopen(&args[0], &args[1]);
                         self.replace_expr(expr, new_expr);
                     }
                     "fdopen" => {
-                        let lhs = self.hir.rhs_to_lhs[&expr_span];
-                        let pot = self.bound_pot(lhs).unwrap();
-                        let new_expr = transform_fdopen(&args[0], pot);
+                        let new_expr = transform_fdopen(&args[0]);
                         self.replace_expr(expr, new_expr);
                     }
                     "tmpfile" => {
-                        let lhs = self.hir.rhs_to_lhs[&expr_span];
-                        let pot = self.bound_pot(lhs).unwrap();
-                        let new_expr = transform_tmpfile(pot);
+                        let new_expr = transform_tmpfile();
                         self.replace_expr(expr, new_expr);
                         self.tmpfile = true;
                     }
                     "popen" => {
-                        let lhs = self.hir.rhs_to_lhs[&expr_span];
-                        let pot = self.bound_pot(lhs).unwrap();
-                        let new_expr = transform_popen(&args[0], &args[1], pot);
+                        let new_expr = transform_popen(&args[0], &args[1]);
                         self.replace_expr(expr, new_expr);
                     }
                     "fclose" | "pclose" => {
@@ -1787,7 +1823,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let param_pot = some_or!(self.param_pot(p), continue);
                             let permissions = param_pot.permissions;
                             assert!(!permissions.contains(Permission::Close));
-                            if self.null_casts.contains(&arg.span) {
+                            if matches!(remove_cast(arg).kind, ExprKind::Lit(_)) {
                                 self.replace_expr(arg, expr!("None"));
                                 let targ = if permissions.contains(Permission::BufRead) {
                                     "std::io::BufReader<std::fs::File>"
@@ -1819,20 +1855,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             ExprKind::Path(None, path) => {
                 if let [seg] = &path.segments[..] {
                     let name = seg.ident.name.as_str();
-                    let ty = match name {
-                        "stdin" => STDIN_TY,
-                        "stdout" => STDOUT_TY,
-                        "stderr" => STDERR_TY,
-                        _ => return,
-                    };
-                    let new_expr = if let Some(lhs) = self.hir.rhs_to_lhs.get(&expr_span) {
-                        let new_expr = format!("std::io::{}()", name);
-                        let pot = self.bound_pot(*lhs).unwrap();
-                        expr!("{}", convert_expr(*pot.ty, ty, &new_expr, true))
-                    } else {
-                        expr!("std::io::{}()", name)
-                    };
-                    self.replace_expr(expr, new_expr);
+                    if (name == "stdin" && !self.is_stdin_unsupported)
+                        || name == "stdout"
+                        || name == "stderr"
+                    {
+                        let new_expr = expr!("std::io::{}()", name);
+                        self.replace_expr(expr, new_expr);
+                    }
                 }
             }
             ExprKind::MethodCall(box MethodCall { receiver, seg, .. }) => {
@@ -1848,70 +1877,53 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     _ => panic!(),
                 }
             }
-            ExprKind::Cast(_, _) => {
-                let lhs = some_or!(self.hir.rhs_to_lhs.get(&expr_span), return);
-                if self.unsupported.contains(lhs) {
-                    return;
-                }
-                let pot = some_or!(self.bound_pot(*lhs), return);
-                match pot.ty {
-                    StreamType::Option(_) => {
-                        self.replace_expr(expr, expr!("None"));
-                    }
-                    StreamType::Ptr(_) => {
-                        self.replace_expr(expr, expr!("std::ptr::null_mut()"));
-                    }
-                    _ => panic!(),
-                }
-            }
             ExprKind::Assign(lhs, rhs, _) => {
                 let lhs_pot = some_or!(self.bound_pot(lhs.span), return);
-                let rhs_loc = some_or!(self.hir.bound_span_to_loc.get(&rhs.span), return);
-                if let HirLoc::Global(def_id) = rhs_loc {
-                    let name = compile_util::def_id_to_value_symbol(*def_id, self.tcx).unwrap();
-                    let name = name.as_str();
-                    if name == "stdin" || name == "stdout" || name == "stderr" {
-                        return;
-                    }
-                }
-                let rhs_pot = some_or!(self.loc_to_pot.get(rhs_loc), return);
-                let rhs_str = pprust::expr_to_string(rhs);
-                let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, true);
-                let new_rhs = expr!("{}", new_rhs);
-                self.replace_expr(rhs, new_rhs);
+                self.convert_rhs(rhs, *lhs_pot);
             }
             ExprKind::Struct(se) => {
                 for f in se.fields.iter_mut() {
-                    let lhs_pot = some_or!(self.bound_pot(f.ident.span), return);
-                    let rhs_pot = some_or!(self.bound_pot(f.expr.span), return);
-                    let rhs_str = pprust::expr_to_string(&f.expr);
-                    let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, true);
-                    let new_rhs = expr!("{}", new_rhs);
-                    self.replace_expr(&mut f.expr, new_rhs);
+                    let lhs_pot = some_or!(self.bound_pot(f.ident.span), continue);
+                    self.convert_rhs(&mut f.expr, *lhs_pot);
                 }
             }
-            ExprKind::If(_, t, Some(f)) => {
-                let lhs = some_or!(self.hir.rhs_to_lhs.get(&expr_span), return);
-                let lhs_pot = some_or!(self.bound_pot(*lhs), return);
-                let StmtKind::Expr(t) = &mut t.stmts.last_mut().unwrap().kind else { panic!() };
-                if let Some(t_pot) = self.bound_pot(t.span) {
-                    let t_str = pprust::expr_to_string(t);
-                    let new_t = convert_expr(*lhs_pot.ty, *t_pot.ty, &t_str, true);
-                    let new_t = expr!("{}", new_t);
-                    self.replace_expr(t, new_t);
-                }
-                let ExprKind::Block(f, _) = &mut f.kind else { panic!() };
-                let StmtKind::Expr(f) = &mut f.stmts.last_mut().unwrap().kind else { panic!() };
-                if let Some(f_pot) = self.bound_pot(f.span) {
-                    let f_str = pprust::expr_to_string(f);
-                    let new_f = convert_expr(*lhs_pot.ty, *f_pot.ty, &f_str, true);
-                    let new_f = expr!("{}", new_f);
-                    self.replace_expr(f, new_f);
-                }
+            ExprKind::Ret(Some(e)) => {
+                let Some(pot) = self.return_pot(self.current_fn.unwrap()) else { return };
+                self.convert_rhs(e, *pot);
             }
             _ => {}
         }
     }
+}
+
+fn walk_local<T: MutVisitor>(vis: &mut T, local: &mut P<Local>) {
+    let Local {
+        id,
+        pat,
+        ty,
+        kind,
+        span,
+        colon_sp,
+        attrs,
+        tokens,
+    } = local.deref_mut();
+    vis.visit_id(id);
+    visit_attrs(vis, attrs);
+    vis.visit_pat(pat);
+    visit_opt(ty, |ty| vis.visit_ty(ty));
+    match kind {
+        LocalKind::Decl => {}
+        LocalKind::Init(init) => {
+            vis.visit_expr(init);
+        }
+        LocalKind::InitElse(init, els) => {
+            vis.visit_expr(init);
+            vis.visit_block(els);
+        }
+    }
+    visit_lazy_tts(vis, tokens);
+    visit_opt(colon_sp, |sp| vis.visit_span(sp));
+    vis.visit_span(span);
 }
 
 #[inline]
@@ -1992,10 +2004,10 @@ fn walk_variant_data<T: MutVisitor>(vis: &mut T, vdata: &mut VariantData) {
     }
 }
 
-fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
+fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
     let path = pprust::expr_to_string(path);
     let mode = LikelyLit::from_expr(mode);
-    let expr = match mode {
+    match mode {
         LikelyLit::Lit(mode) => {
             let path = format!(
                 "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
@@ -2006,7 +2018,7 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
             match prefix {
                 "r" => {
                     if plus {
-                        format!(
+                        expr!(
                             "std::fs::OpenOptions::new()
                                 .read(true)
                                 .write(true)
@@ -2015,12 +2027,12 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
                             path,
                         )
                     } else {
-                        format!("std::fs::File::open({}).ok()", path)
+                        expr!("std::fs::File::open({}).ok()", path)
                     }
                 }
                 "w" => {
                     if plus {
-                        format!(
+                        expr!(
                             "std::fs::OpenOptions::new()
                                 .write(true)
                                 .create(true)
@@ -2031,12 +2043,12 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
                             path,
                         )
                     } else {
-                        format!("std::fs::File::create({}).ok()", path)
+                        expr!("std::fs::File::create({}).ok()", path)
                     }
                 }
                 "a" => {
                     if plus {
-                        format!(
+                        expr!(
                             "std::fs::OpenOptions::new()
                                 .append(true)
                                 .create(true)
@@ -2046,7 +2058,7 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
                             path,
                         )
                     } else {
-                        format!(
+                        expr!(
                             "std::fs::OpenOptions::new()
                                 .append(true)
                                 .create(true)
@@ -2061,7 +2073,7 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
         }
         LikelyLit::If(_, _, _) => todo!(),
         LikelyLit::Path(symbol, _) => {
-            format!(
+            expr!(
                 r#"{{
     let pathname = std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap();
     let mode = std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap();
@@ -2105,40 +2117,35 @@ fn transform_fopen(path: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
             )
         }
         LikelyLit::Other(_) => todo!(),
-    };
-    let new_expr = convert_expr(*pot.ty, StreamType::Option(&FILE_TY), &expr, true);
-    expr!("{}", new_expr)
+    }
 }
 
-fn transform_fdopen(fd: &Expr, pot: &Pot<'_>) -> Expr {
+#[inline]
+fn transform_fdopen(fd: &Expr) -> Expr {
     let fd = pprust::expr_to_string(fd);
-    let expr = format!("std::os::fd::FromRawFd::from_raw_fd({})", fd);
-    let new_expr = convert_expr(*pot.ty, FILE_TY, &expr, true);
-    expr!("{}", new_expr)
+    expr!("std::os::fd::FromRawFd::from_raw_fd({})", fd)
 }
 
-fn transform_tmpfile(pot: &Pot<'_>) -> Expr {
-    let expr = "tempfile::tempfile().ok()";
-    let ty = StreamType::Option(&FILE_TY);
-    let new_expr = convert_expr(*pot.ty, ty, expr, true);
-    expr!("{}", new_expr)
+#[inline]
+fn transform_tmpfile() -> Expr {
+    expr!("tempfile::tempfile().ok()")
 }
 
-fn transform_popen(command: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
+fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
     let command = pprust::expr_to_string(command);
     let command = format!(
         "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
         command
     );
     let mode = LikelyLit::from_expr(mode);
-    let (expr, ty) = match mode {
+    match mode {
         LikelyLit::Lit(mode) => {
-            let (field, ty) = match &mode.as_str()[..1] {
-                "r" => ("stdout", &CHILD_STDOUT_TY),
-                "w" => ("stdin", &CHILD_STDIN_TY),
+            let field = match &mode.as_str()[..1] {
+                "r" => "stdout",
+                "w" => "stdin",
                 _ => panic!("{:?}", mode),
             };
-            let expr = format!(
+            expr!(
                 r#"std::process::Command::new("sh")
                 .arg("-c")
                 .arg("--")
@@ -2147,16 +2154,14 @@ fn transform_popen(command: &Expr, mode: &Expr, pot: &Pot<'_>) -> Expr {
                 .spawn()
                 .ok()
                 .and_then(|child| child.{1})"#,
-                command, field
-            );
-            (expr, StreamType::Option(ty))
+                command,
+                field
+            )
         }
         LikelyLit::If(_, _, _) => todo!(),
         LikelyLit::Path(_, _) => todo!(),
         LikelyLit::Other(_) => todo!(),
-    };
-    let new_expr = convert_expr(*pot.ty, ty, &expr, true);
-    expr!("{}", new_expr)
+    }
 }
 
 fn transform_fclose(stream: &Expr, is_option: bool) -> Expr {
