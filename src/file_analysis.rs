@@ -919,7 +919,7 @@ impl<'a> UnsupportedTracker<'a> {
 
 #[derive(Default)]
 struct AstVisitor<'ast> {
-    /// static variable definition body span to its literal
+    /// static ident span to its literal
     static_span_to_lit: FxHashMap<Span, Symbol>,
 
     fprintf_args: Vec<(Span, LikelyLit<'ast>)>,
@@ -937,7 +937,7 @@ impl<'ast> rustc_ast::visit::Visitor<'ast> for AstVisitor<'ast> {
             return;
         };
         if let LikelyLit::Lit(lit) = LikelyLit::from_expr(expr) {
-            self.static_span_to_lit.insert(expr.span, lit);
+            self.static_span_to_lit.insert(item.ident.span, lit);
         }
     }
 
@@ -1003,10 +1003,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     self.defined_apis.push(def_id);
                 }
             }
-            ItemKind::Static(_, _, body_id) => {
+            ItemKind::Static(_, _, _) => {
                 let loc = item.owner_id.def_id;
-                let body = self.tcx.hir_body(body_id);
-                self.def_id_to_binding_span.insert(loc, body.value.span);
+                self.def_id_to_binding_span.insert(loc, item.ident.span);
             }
             _ => {}
         }

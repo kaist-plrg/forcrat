@@ -81,6 +81,17 @@ impl Pass for Transformation {
         };
         tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
         let hir_ctx = hir_visitor.ctx;
+        let return_locals: FxHashMap<_, _> = hir_ctx
+            .return_locals
+            .iter()
+            .filter_map(|(f, locals)| {
+                if locals.len() == 1 {
+                    locals.iter().next().unwrap().map(|l| (*f, l))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let is_stdin_unsupported = analysis_res
             .unsupported
@@ -98,23 +109,7 @@ impl Pass for Transformation {
             let loc = analysis_res.locs[*loc_id];
             match loc {
                 Loc::Var(def_id, local) => {
-                    let node = tcx.hir_node_by_def_id(def_id);
-                    let hir::Node::Item(item) = node else { panic!() };
-                    let body = match item.kind {
-                        hir::ItemKind::Fn { .. } => tcx.optimized_mir(def_id),
-                        hir::ItemKind::Static(_, _, body_id) => {
-                            if local.as_usize() == 0 {
-                                let body = tcx.hir_body(body_id);
-                                unsupported.insert(body.value.span);
-                                unsupported.insert(item.ident.span);
-                                continue;
-                            }
-                            tcx.mir_for_ctfe(def_id)
-                        }
-                        _ => panic!(),
-                    };
-                    let local_decl = &body.local_decls[local];
-                    let span = local_decl.source_info.span;
+                    let span = mir_local_span(def_id, local, &return_locals, &hir_ctx, tcx);
                     unsupported.insert(span);
                 }
                 Loc::Field(def_id, field_idx) => {
@@ -163,9 +158,8 @@ impl Pass for Transformation {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     match item.kind {
                         hir::ItemKind::Fn { sig, .. } => {
-                            let body = tcx.optimized_mir(*def_id);
-                            let local_decl = &body.local_decls[*local];
-                            let span = local_decl.source_info.span;
+                            let span =
+                                mir_local_span(*def_id, *local, &return_locals, &hir_ctx, tcx);
                             let loc = *some_or!(hir_ctx.binding_span_to_loc.get(&span), continue);
                             let arity = sig.decl.inputs.len();
                             let is_param = (1..=arity).contains(&local.as_usize());
@@ -179,7 +173,7 @@ impl Pass for Transformation {
                             (loc, is_param)
                         }
                         hir::ItemKind::Static(_, _, _) => {
-                            if local.as_u32() != 0 {
+                            if *local != mir::Local::ZERO {
                                 continue;
                             }
                             (HirLoc::Global(*def_id), false)
@@ -223,19 +217,19 @@ impl Pass for Transformation {
             assert!(old.is_none());
         }
 
-        let mut api_sig_spans = FxHashSet::default();
+        let mut api_ident_spans = FxHashSet::default();
         let mut null_casts = FxHashSet::default();
         let mut retval_used_spans = FxHashSet::default();
 
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
             let local_def_id = item.owner_id.def_id;
-            if let hir::ItemKind::Fn { sig, .. } = item.kind {
+            if let hir::ItemKind::Fn { .. } = item.kind {
                 if item.ident.name.as_str() == "main" {
                     continue;
                 }
                 if analysis_res.defined_apis.contains(&local_def_id) {
-                    api_sig_spans.insert(sig.span);
+                    api_ident_spans.insert(item.ident.span);
                     continue;
                 }
 
@@ -281,7 +275,7 @@ impl Pass for Transformation {
                 hir: &hir_ctx,
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
-                api_sig_spans: &api_sig_spans,
+                api_ident_spans: &api_ident_spans,
                 null_casts: &null_casts,
                 retval_used_spans: &retval_used_spans,
 
@@ -304,6 +298,37 @@ impl Pass for Transformation {
 
         TransformationResult { files, tmpfile }
     }
+}
+
+fn mir_local_span(
+    def_id: LocalDefId,
+    local: mir::Local,
+    return_locals: &FxHashMap<LocalDefId, HirId>,
+    hir_ctx: &HirCtx,
+    tcx: TyCtxt<'_>,
+) -> Span {
+    let node = tcx.hir_node_by_def_id(def_id);
+    let hir::Node::Item(item) = node else { panic!() };
+    let body = match item.kind {
+        hir::ItemKind::Fn { .. } => {
+            if local == mir::Local::ZERO {
+                if let Some(hir_id) = return_locals.get(&def_id) {
+                    let loc = HirLoc::Local(*hir_id);
+                    return hir_ctx.loc_to_binding_span[&loc];
+                }
+            }
+            tcx.optimized_mir(def_id)
+        }
+        hir::ItemKind::Static(_, _, _) => {
+            if local == mir::Local::ZERO {
+                return item.ident.span;
+            }
+            tcx.mir_for_ctfe(def_id)
+        }
+        _ => panic!(),
+    };
+    let local_decl = &body.local_decls[local];
+    local_decl.source_info.span
 }
 
 fn remove_cast(expr: &Expr) -> &Expr {
@@ -896,8 +921,8 @@ impl HirLoc {
 #[derive(Debug, Default)]
 struct HirCtx {
     /// location to binding occurrence span
-    /// * global (var): body span
-    /// * global (fn): sig span
+    /// * global (var): ident span
+    /// * global (fn): ident span
     /// * local: pat span
     /// * field: field span
     loc_to_binding_span: FxHashMap<HirLoc, Span>,
@@ -923,6 +948,9 @@ struct HirCtx {
 
     /// callee span to expr hir_id
     callee_span_to_hir_id: FxHashMap<Span, HirId>,
+
+    /// function def_id to returned local hir_ids
+    return_locals: FxHashMap<LocalDefId, FxHashSet<Option<HirId>>>,
 }
 
 struct HirVisitor<'tcx> {
@@ -965,13 +993,14 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             hir::ItemKind::Static(_, _, body_id) => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
                 let body = self.tcx.hir_body(body_id);
-                self.add_binding(loc, body.value.span);
+                self.add_binding(loc, item.ident.span);
+                self.add_bound(loc, item.ident.span);
                 self.add_bound(loc, body.value.span);
-                self.add_assignment(body.value.span, body.value.span);
+                self.add_assignment(item.ident.span, body.value.span);
             }
-            hir::ItemKind::Fn { sig, .. } => {
+            hir::ItemKind::Fn { .. } => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
-                self.add_binding(loc, sig.span);
+                self.add_binding(loc, item.ident.span);
             }
             hir::ItemKind::Struct(vd, _) | hir::ItemKind::Union(vd, _) => {
                 let hir::VariantData::Struct { fields, .. } = vd else { return };
@@ -1061,6 +1090,23 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 };
                 let curr_func = expr.hir_id.owner.def_id;
                 funcs.entry(curr_func).or_default().insert(arg_name);
+            }
+            hir::ExprKind::Ret(Some(e)) => {
+                let curr_func = expr.hir_id.owner.def_id;
+                let local = if let hir::ExprKind::Path(QPath::Resolved(_, path)) = e.kind {
+                    if let Res::Local(hir_id) = path.res {
+                        Some(hir_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                self.ctx
+                    .return_locals
+                    .entry(curr_func)
+                    .or_default()
+                    .insert(local);
             }
             _ => {}
         }
@@ -1167,7 +1213,7 @@ struct TransformVisitor<'tcx, 'a> {
     /// HIR location to permissions and origins
     loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// user-defined API functions' signatures' spans
-    api_sig_spans: &'a FxHashSet<Span>,
+    api_ident_spans: &'a FxHashSet<Span>,
     /// null to file pointer cast expr spans
     null_casts: &'a FxHashSet<Span>,
     /// spans of function calls whose return values are used
@@ -1307,26 +1353,25 @@ impl<'a> TransformVisitor<'_, 'a> {
 
 impl MutVisitor for TransformVisitor<'_, '_> {
     fn visit_item(&mut self, item: &mut P<Item>) {
-        if let ItemKind::Fn(f) = &item.kind {
-            if self.api_sig_spans.contains(&f.sig.span) {
-                return;
-            }
+        if self.api_ident_spans.contains(&item.ident.span) {
+            return;
         }
 
         mut_visit::walk_item(self, item);
 
+        let ident_span = item.ident.span;
         match &mut item.kind {
             ItemKind::Static(box item) => {
                 let body = some_or!(&item.expr, return);
                 if self.unsupported.contains(&body.span) {
                     return;
                 }
-                let loc = self.hir.binding_span_to_loc[&body.span];
+                let loc = self.hir.binding_span_to_loc[&ident_span];
                 let pot = some_or!(self.loc_to_pot.get(&loc), return);
                 self.replace_ty(&mut item.ty, ty!("{}", pot.ty));
             }
             ItemKind::Fn(box item) => {
-                let HirLoc::Global(def_id) = self.hir.binding_span_to_loc[&item.sig.span] else {
+                let HirLoc::Global(def_id) = self.hir.binding_span_to_loc[&ident_span] else {
                     panic!()
                 };
                 let mut tparams = vec![];
