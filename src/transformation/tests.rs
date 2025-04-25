@@ -1201,6 +1201,37 @@ unsafe fn f(mut x: libc::c_int) {
 }
 
 #[test]
+fn test_buf_read_box() {
+    run_test(
+        r#"
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    if x != 0 {
+        stream = stdin;
+    } else {
+        stream = fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        );
+    }
+    fscanf(
+        stream,
+        b"%d\0" as *const u8 as *const libc::c_char,
+        &mut x as *mut libc::c_int,
+    );
+    fscanf(
+        stream,
+        b"%d\0" as *const u8 as *const libc::c_char,
+        &mut x as *mut libc::c_int,
+    );
+    fclose(stream);
+}"#,
+        &["Box", "BufRead", "drop"],
+        &["FILE", "fopen", "fscanf", "fclose"],
+    );
+}
+
+#[test]
 fn test_read_fd_box() {
     run_test(
         r#"

@@ -79,6 +79,7 @@ impl TransformationResult {
 trait AsRawFd { fn as_raw_fd(&self) -> i32; }
 impl AsRawFd for std::fs::File { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
 impl AsRawFd for std::io::Stdin { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
+impl AsRawFd for std::io::StdinLock<'_> { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
 impl AsRawFd for std::io::Stdout { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
 impl AsRawFd for std::io::Stderr { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
 impl AsRawFd for std::process::ChildStdin { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
@@ -678,10 +679,35 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             }
         }
         (
-            BoxDyn(_),
+            BoxDyn(traits),
             File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
         ) => {
             assert!(consume);
+            match from {
+                File => {
+                    if traits.contains(StreamTrait::Read) || traits.contains(StreamTrait::BufRead) {
+                        return format!(
+                            "{{ let stream: {} = Box::new(std::io::BufReader::new({})); stream }}",
+                            to, expr
+                        );
+                    }
+                    if traits.contains(StreamTrait::Write) {
+                        return format!(
+                            "{{ let stream: {} = Box::new(std::io::BufWriter::new({})); stream }}",
+                            to, expr
+                        );
+                    }
+                }
+                Stdin => {
+                    if traits.contains(StreamTrait::BufRead) {
+                        return format!(
+                            "{{ let stream: {} = Box::new(({}).lock()); stream }}",
+                            to, expr
+                        );
+                    }
+                }
+                _ => {}
+            }
             format!("{{ let stream: {} = Box::new({}); stream }}", to, expr)
         }
         (BufWriter(to), from) if *to == from => {
