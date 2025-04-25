@@ -60,12 +60,10 @@ pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
             fs::write(path, doc.to_string()).unwrap();
         }
     }
-    if let Some(defs) = res.trait_defs() {
-        let path = dir.join("c2rust-lib.rs");
-        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
-        use std::io::Write;
-        writeln!(file, "\n{}", defs).unwrap();
-    }
+    let path = dir.join("c2rust-lib.rs");
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    use std::io::Write;
+    writeln!(file, "{}", res.trait_defs()).unwrap();
 }
 
 #[derive(Debug)]
@@ -76,11 +74,21 @@ pub struct TransformationResult {
 }
 
 impl TransformationResult {
-    fn trait_defs(&self) -> Option<String> {
-        if self.bounds.is_empty() {
-            return None;
-        }
-        let mut defs = String::new();
+    fn trait_defs(&self) -> String {
+        let mut defs = "
+trait AsRawFd { fn as_raw_fd(&self) -> i32; }
+impl AsRawFd for std::fs::File { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
+impl AsRawFd for std::io::Stdin { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
+impl AsRawFd for std::io::Stdout { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
+impl AsRawFd for std::io::Stderr { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
+impl AsRawFd for std::process::ChildStdin { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
+impl AsRawFd for std::process::ChildStdout { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
+impl<T: AsRawFd> AsRawFd for &T { fn as_raw_fd(&self) -> i32 { (*self).as_raw_fd() } }
+impl<T: AsRawFd> AsRawFd for &mut T { fn as_raw_fd(&self) -> i32 { (**self).as_raw_fd() } }
+impl<T: AsRawFd> AsRawFd for Box<T> { fn as_raw_fd(&self) -> i32 { (**self).as_raw_fd() } }
+impl<T: AsRawFd> AsRawFd for std::io::BufReader<T> { fn as_raw_fd(&self) -> i32 { self.get_ref().as_raw_fd() } }
+impl<T: AsRawFd + std::io::Write> AsRawFd for std::io::BufWriter<T> { fn as_raw_fd(&self) -> i32 { self.get_ref().as_raw_fd() } }
+".to_string();
         for bound in &self.bounds {
             writeln!(
                 defs,
@@ -90,7 +98,7 @@ impl TransformationResult {
             )
             .unwrap();
         }
-        Some(defs)
+        defs
     }
 }
 
@@ -626,57 +634,28 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             let converted = convert_expr(*to, from, expr, consume);
             format!("Some({})", converted)
         }
-        (Impl(traits), File | Stdout | Stderr | ChildStdin | ChildStdout) => {
+        (
+            Impl(_),
+            File | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+        ) => {
             if consume {
                 expr.to_string()
-            } else if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
-                format!("std::os::fd::AsFd::as_fd(&({}))", expr)
             } else {
                 format!("&mut ({})", expr)
             }
         }
         (
-            Impl(traits),
-            Ref(File) | Ref(Stdout) | Ref(Stderr) | Ref(ChildStdin) | Ref(ChildStdout),
-        ) => {
-            if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
-                format!("std::os::fd::AsFd::as_fd({})", expr)
-            } else {
-                expr.to_string()
-            }
-        }
+            Impl(_),
+            Ref(File) | Ref(Stdout) | Ref(Stderr) | Ref(ChildStdin) | Ref(ChildStdout)
+            | Ref(BufWriter(_)) | Ref(BufReader(_)),
+        ) => expr.to_string(),
         (Impl(traits), Stdin) => {
             if traits.contains(StreamTrait::BufRead) {
                 format!("({}).lock()", expr)
             } else if consume {
                 expr.to_string()
-            } else if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
-                format!("std::os::fd::AsFd::as_fd(&({}))", expr)
             } else {
                 format!("&mut ({})", expr)
-            }
-        }
-        (Impl(traits), BufWriter(from) | BufReader(from)) => {
-            if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
-                if consume {
-                    let inner = format!("({}).into_inner().unwrap()", expr);
-                    convert_expr(to, *from, &inner, true)
-                } else {
-                    let inner = format!("({}).get_mut()", expr);
-                    convert_expr(to, Ref(from), &inner, true)
-                }
-            } else if consume {
-                expr.to_string()
-            } else {
-                format!("&mut ({})", expr)
-            }
-        }
-        (Impl(traits), Ref(BufWriter(from)) | Ref(BufReader(from))) => {
-            if traits.deref() == &BitSet8::new([StreamTrait::AsRawFd]) {
-                let inner = format!("({}).get_mut()", expr);
-                convert_expr(to, Ref(from), &inner, true)
-            } else {
-                expr.to_string()
             }
         }
         (Impl(_), Ptr(from)) => {
@@ -888,7 +867,7 @@ impl std::fmt::Display for StreamTrait {
             Self::BufRead => write!(f, "std::io::BufRead"),
             Self::Write => write!(f, "std::io::Write"),
             Self::Seek => write!(f, "std::io::Seek"),
-            Self::AsRawFd => write!(f, "std::os::fd::AsRawFd"),
+            Self::AsRawFd => write!(f, "crate::AsRawFd"),
         }
     }
 }
@@ -2848,7 +2827,7 @@ fn transform_fileno<S: StreamExpr>(stream: &S) -> Expr {
     let stream = stream.borrow_for(StreamTrait::AsRawFd);
     expr!(
         "{{
-    use std::os::fd::AsRawFd;
+    use crate::AsRawFd;
     ({}).as_raw_fd()
 }}",
         stream

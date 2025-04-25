@@ -8,9 +8,7 @@ fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut res = super::Transformation.run_on_str(&code);
     let defs = res.trait_defs();
     let [(_, s)] = &mut res.files[..] else { panic!() };
-    if let Some(defs) = defs {
-        s.push_str(&defs);
-    }
+    s.push_str(&defs);
     let stripped = s.strip_prefix(FORMATTED_PREAMBLE.as_str()).unwrap();
     let res = ty_checker::TyChecker.try_on_str(&s).expect(&stripped);
     assert!(res, "{}", stripped);
@@ -713,15 +711,60 @@ unsafe fn g(mut stream: *mut FILE) {
     fileno(stream);
 }
 unsafe fn f() {
-    let mut stream: *mut FILE = fopen(
+    g(stdin);
+    g(stdout);
+    g(stderr);
+    let mut stream0: *mut FILE = fopen(
         b"a\0" as *const u8 as *const libc::c_char,
         b"r\0" as *const u8 as *const libc::c_char,
     );
-    g(stream);
-    fclose(stream);
+    g(stream0);
+    fclose(stream0);
+    let mut stream1: *mut FILE = popen(
+        b"ls\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream1);
+    pclose(stream1);
+    let mut stream2: *mut FILE = popen(
+        b"cat\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream2);
+    pclose(stream2);
 }"#,
         &["AsRawFd", "as_raw_fd"],
         &["FILE", "fileno"],
+    );
+}
+
+#[test]
+fn test_fileno_read_call() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    fileno(stream);
+    fgetc(stream);
+}
+unsafe fn f() {
+    g(stdin);
+    let mut stream1: *mut FILE = popen(
+        b"ls\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream1);
+    g(stream1);
+    pclose(stream1);
+    let mut stream2: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream2);
+    g(stream2);
+    fclose(stream2);
+}"#,
+        &["AsRawFd", "as_raw_fd", "Read", "read_exact"],
+        &["FILE", "fileno", "fgetc"],
     );
 }
 
