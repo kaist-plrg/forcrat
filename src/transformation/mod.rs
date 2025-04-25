@@ -431,6 +431,11 @@ impl<'a> TypeArena<'a> {
     fn ptr(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
         self.arena.alloc(StreamType::Ptr(ty))
     }
+
+    #[inline]
+    fn box_(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(StreamType::Box(ty))
+    }
 }
 
 impl<'a> TypeArena<'a> {
@@ -499,7 +504,12 @@ impl<'a> TypeArena<'a> {
             if traits.contains(StreamTrait::BufRead) {
                 traits.remove(StreamTrait::Read);
             }
-            let ty = self.alloc(StreamType::BoxDyn(TraitBound(traits)));
+            let ty = self.alloc(StreamType::Dyn(TraitBound(traits)));
+            let ty = if permissions.contains(Permission::Close) {
+                self.box_(ty)
+            } else {
+                self.ptr(ty)
+            };
             self.option(ty)
         }
     }
@@ -518,7 +528,8 @@ enum StreamType<'a> {
     BufReader(&'a StreamType<'a>),
     Ptr(&'a StreamType<'a>),
     Ref(&'a StreamType<'a>),
-    BoxDyn(TraitBound),
+    Box(&'a StreamType<'a>),
+    Dyn(TraitBound),
     Impl(TraitBound),
 }
 
@@ -543,11 +554,12 @@ impl std::fmt::Display for StreamType<'_> {
             Self::BufReader(t) => write!(f, "std::io::BufReader<{}>", t),
             Self::Ptr(t) => write!(f, "*mut {}", t),
             Self::Ref(t) => write!(f, "&mut {}", t),
-            Self::BoxDyn(traits) => {
+            Self::Box(t) => write!(f, "Box<{}>", t),
+            Self::Dyn(traits) => {
                 if traits.count() == 1 {
-                    write!(f, "Box<dyn {}>", traits)
+                    write!(f, "dyn {}", traits)
                 } else {
-                    write!(f, "Box<dyn crate::{}>", traits.trait_name())
+                    write!(f, "dyn crate::{}", traits.trait_name())
                 }
             }
             Self::Impl(traits) => write!(f, "impl {}", traits),
@@ -566,7 +578,8 @@ impl StreamType<'_> {
             | Self::ChildStdout
             | Self::BufWriter(_)
             | Self::BufReader(_)
-            | Self::BoxDyn(_)
+            | Self::Box(_)
+            | Self::Dyn(_)
             | Self::Impl(_) => false,
             Self::Ref(_) => false,
             Self::Ptr(_) => true,
@@ -587,8 +600,9 @@ impl StreamType<'_> {
             | Self::BufWriter(t)
             | Self::BufReader(t)
             | Self::Ptr(t)
-            | Self::Ref(t) => t.get_dyn_bound(),
-            Self::BoxDyn(traits) => Some(traits),
+            | Self::Ref(t)
+            | Self::Box(t) => t.get_dyn_bound(),
+            Self::Dyn(traits) => Some(traits),
         }
     }
 }
@@ -601,7 +615,7 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
     use StreamType::*;
     match (to, from) {
         (Option(to), Option(from)) => {
-            if consume {
+            if consume || from.is_copyable() {
                 let body = convert_expr(*to, *from, "x", true);
                 format!("({}).map(|x| {})", expr, body)
             } else {
@@ -616,14 +630,14 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             )
         }
         (to, Option(from)) if to == *from => {
-            if consume {
+            if consume || from.is_copyable() {
                 format!("({}).unwrap()", expr)
             } else {
                 format!("({}).as_mut().unwrap()", expr)
             }
         }
         (to, Option(from)) => {
-            if consume {
+            if consume || from.is_copyable() {
                 let unwrapped = format!("({}).unwrap()", expr);
                 convert_expr(to, *from, &unwrapped, true)
             } else {
@@ -659,11 +673,6 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
                 format!("&mut ({})", expr)
             }
         }
-        (Impl(_), Ptr(from)) => {
-            let r = format!("({}).as_mut()", expr);
-            let from = Ref(from);
-            convert_expr(to, Option(&from), &r, true)
-        }
         (Impl(_), Ref(Impl(_))) => {
             if consume {
                 expr.to_string()
@@ -671,15 +680,21 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
                 format!("&mut *({})", expr)
             }
         }
-        (Impl(_), Ref(BoxDyn(_))) => {
+        (Impl(_), Ref(Box(Dyn(_)))) => {
             if consume {
                 expr.to_string()
             } else {
                 format!("&mut *({})", expr)
             }
         }
+        (Impl(_), Ptr(Dyn(_))) => format!("&mut *({})", expr),
+        (Impl(_), Ptr(from)) => {
+            let r = format!("({}).as_mut()", expr);
+            let from = Ref(from);
+            convert_expr(to, Option(&from), &r, true)
+        }
         (
-            BoxDyn(traits),
+            Box(Dyn(traits)),
             File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
         ) => {
             assert!(consume);
@@ -709,6 +724,17 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
                 _ => {}
             }
             format!("{{ let stream: {} = Box::new({}); stream }}", to, expr)
+        }
+        (
+            Ptr(Dyn(traits)),
+            File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+        ) => {
+            if consume {
+                let expr = convert_expr(Box(&Dyn(*traits)), from, expr, true);
+                format!("Box::leak({}) as *mut _", expr)
+            } else {
+                todo!()
+            }
         }
         (BufWriter(to), from) if *to == from => {
             assert!(consume);
@@ -1910,7 +1936,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let p = Param::new(*def_id, i);
                             let param_pot = some_or!(self.param_pot(p), continue);
                             let permissions = param_pot.permissions;
-                            assert!(!permissions.contains(Permission::Close));
+                            assert!(!permissions.contains(Permission::Close), "{:?}", def_id);
                             if matches!(remove_cast(arg).kind, ExprKind::Lit(_)) {
                                 self.replace_expr(arg, expr!("None"));
                                 let targ = if permissions.contains(Permission::BufRead) {
