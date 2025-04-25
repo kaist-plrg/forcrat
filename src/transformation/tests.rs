@@ -5,8 +5,12 @@ use crate::{compile_util::Pass, formatter, ty_checker};
 fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
     let mut code = PREAMBLE.to_string();
     code.push_str(s);
-    let res = super::Transformation.run_on_str(&code);
-    let [(_, s)] = &res.files[..] else { panic!() };
+    let mut res = super::Transformation.run_on_str(&code);
+    let defs = res.trait_defs();
+    let [(_, s)] = &mut res.files[..] else { panic!() };
+    if let Some(defs) = defs {
+        s.push_str(&defs);
+    }
     let stripped = s.strip_prefix(FORMATTED_PREAMBLE.as_str()).unwrap();
     let res = ty_checker::TyChecker.try_on_str(&s).expect(&stripped);
     assert!(res, "{}", stripped);
@@ -1154,6 +1158,34 @@ unsafe fn f(mut x: libc::c_int) {
 }
 
 #[test]
+fn test_read_fd_box() {
+    run_test(
+        r#"
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    if x != 0 {
+        stream = fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        );
+    } else {
+        stream = popen(
+            b"ls\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        );
+    }
+    fgetc(stream);
+    fgetc(stream);
+    fileno(stream);
+    fileno(stream);
+    fclose(stream);
+}"#,
+        &["Box", "Read", "read_exact", "drop"],
+        &["FILE", "fopen", "popen", "fgetc", "fileno", "fclose"],
+    );
+}
+
+#[test]
 fn test_stdout_stderr() {
     run_test(
         r#"
@@ -1304,6 +1336,27 @@ unsafe fn f(mut x: libc::c_int) {
 }"#,
         &["Read", "read_exact", "drop"],
         &["FILE", "fopen", "fgetc", "fclose"],
+    );
+}
+
+#[test]
+fn test_return_not_close() {
+    run_test(
+        r#"
+unsafe fn f(mut x: libc::c_int) -> *mut FILE {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    if x != 0 {
+        stream = stdin;
+    } else {
+        stream = fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        );
+    }
+    return stream;
+}"#,
+        &["File", "std::io::stdin"],
+        &["FILE", "fopen"],
     );
 }
 

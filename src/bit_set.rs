@@ -1,7 +1,7 @@
 use rustc_index::{bit_set::BitRelations, Idx};
 
 /// Bit set that can hold up to 8 elements.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BitSet8<T> {
     word: u8,
     _marker: std::marker::PhantomData<T>,
@@ -52,6 +52,14 @@ impl<T: Idx> BitSet8<T> {
         let mask = word_mask(elem);
         let old_word = self.word;
         self.word |= mask;
+        old_word != self.word
+    }
+
+    #[inline]
+    pub fn remove(&mut self, elem: T) -> bool {
+        let mask = word_mask(elem);
+        let old_word = self.word;
+        self.word &= !mask;
         old_word != self.word
     }
 

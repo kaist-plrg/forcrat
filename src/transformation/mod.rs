@@ -60,12 +60,38 @@ pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
             fs::write(path, doc.to_string()).unwrap();
         }
     }
+    if let Some(defs) = res.trait_defs() {
+        let path = dir.join("c2rust-lib.rs");
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        use std::io::Write;
+        writeln!(file, "\n{}", defs).unwrap();
+    }
 }
 
 #[derive(Debug)]
 pub struct TransformationResult {
     files: Vec<(FileName, String)>,
     tmpfile: bool,
+    bounds: FxHashSet<TraitBound>,
+}
+
+impl TransformationResult {
+    fn trait_defs(&self) -> Option<String> {
+        if self.bounds.is_empty() {
+            return None;
+        }
+        let mut defs = String::new();
+        for bound in &self.bounds {
+            writeln!(
+                defs,
+                "trait {0} : {1} {{}}\nimpl<T: {1}> {0} for T {{}}",
+                bound.trait_name(),
+                bound
+            )
+            .unwrap();
+        }
+        Some(defs)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -267,6 +293,7 @@ impl Pass for Transformation {
         let parse_sess = new_parse_sess();
         let mut files = vec![];
         let mut tmpfile = false;
+        let mut bounds = FxHashSet::default();
 
         for file in source_map.files().iter() {
             if !matches!(
@@ -303,16 +330,22 @@ impl Pass for Transformation {
                 updated_field: false,
                 tmpfile: false,
                 current_fn: None,
+                bounds: vec![],
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
                 let s = pprust::crate_to_string_for_macros(&krate);
                 files.push((file.name.clone(), s));
                 tmpfile |= visitor.tmpfile;
+                bounds.extend(visitor.bounds);
             }
         }
 
-        TransformationResult { files, tmpfile }
+        TransformationResult {
+            files,
+            tmpfile,
+            bounds,
+        }
     }
 }
 
@@ -451,6 +484,12 @@ impl<'a> TypeArena<'a> {
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
             }
+            if traits.is_empty() {
+                traits.insert(StreamTrait::AsRawFd);
+            }
+            if traits.contains(StreamTrait::BufRead) {
+                traits.remove(StreamTrait::Read);
+            }
             let ty = self.alloc(StreamType::BoxDyn(TraitBound(traits)));
             self.option(ty)
         }
@@ -495,8 +534,52 @@ impl std::fmt::Display for StreamType<'_> {
             Self::BufReader(t) => write!(f, "std::io::BufReader<{}>", t),
             Self::Ptr(t) => write!(f, "*mut {}", t),
             Self::Ref(t) => write!(f, "&mut {}", t),
-            Self::BoxDyn(traits) => write!(f, "Box<dyn {}>", traits),
+            Self::BoxDyn(traits) => {
+                if traits.count() == 1 {
+                    write!(f, "Box<dyn {}>", traits)
+                } else {
+                    write!(f, "Box<dyn crate::{}>", traits.trait_name())
+                }
+            }
             Self::Impl(traits) => write!(f, "impl {}", traits),
+        }
+    }
+}
+
+impl StreamType<'_> {
+    fn is_copyable(self) -> bool {
+        match self {
+            Self::File
+            | Self::Stdin
+            | Self::Stdout
+            | Self::Stderr
+            | Self::ChildStdin
+            | Self::ChildStdout
+            | Self::BufWriter(_)
+            | Self::BufReader(_)
+            | Self::BoxDyn(_)
+            | Self::Impl(_) => false,
+            Self::Ref(_) => false,
+            Self::Ptr(_) => true,
+            Self::Option(t) => t.is_copyable(),
+        }
+    }
+
+    fn get_dyn_bound(self) -> Option<TraitBound> {
+        match self {
+            Self::File
+            | Self::Stdin
+            | Self::Stdout
+            | Self::Stderr
+            | Self::ChildStdin
+            | Self::ChildStdout
+            | Self::Impl(_) => None,
+            Self::Option(t)
+            | Self::BufWriter(t)
+            | Self::BufReader(t)
+            | Self::Ptr(t)
+            | Self::Ref(t) => t.get_dyn_bound(),
+            Self::BoxDyn(traits) => Some(traits),
         }
     }
 }
@@ -616,14 +699,11 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             }
         }
         (
-            BoxDyn(traits),
-            File | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+            BoxDyn(_),
+            File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
         ) => {
             assert!(consume);
-            format!(
-                "{{ let stream: Box<dyn {}> = Box::new({}); stream }}",
-                traits, expr
-            )
+            format!("{{ let stream: {} = Box::new({}); stream }}", to, expr)
         }
         (BufWriter(to), from) if *to == from => {
             assert!(consume);
@@ -634,26 +714,6 @@ fn convert_expr(to: StreamType<'_>, from: StreamType<'_>, expr: &str, consume: b
             format!("std::io::BufReader::new({})", expr)
         }
         _ => panic!("{} := {} // {}", to, from, consume),
-    }
-}
-
-impl StreamType<'_> {
-    fn is_copyable(self) -> bool {
-        match self {
-            Self::File
-            | Self::Stdin
-            | Self::Stdout
-            | Self::Stderr
-            | Self::ChildStdin
-            | Self::ChildStdout
-            | Self::BufWriter(_)
-            | Self::BufReader(_)
-            | Self::BoxDyn(_)
-            | Self::Impl(_) => false,
-            Self::Ref(_) => false,
-            Self::Ptr(_) => true,
-            Self::Option(t) => t.is_copyable(),
-        }
     }
 }
 
@@ -846,6 +906,16 @@ impl StreamTrait {
             Permission::Lock | Permission::Close => None,
         }
     }
+
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::Read => "Read",
+            Self::BufRead => "BufRead",
+            Self::Write => "Write",
+            Self::Seek => "Seek",
+            Self::AsRawFd => "AsRawFd",
+        }
+    }
 }
 
 impl Idx for StreamTrait {
@@ -863,7 +933,7 @@ impl Idx for StreamTrait {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TraitBound(BitSet8<StreamTrait>);
 
 impl std::fmt::Display for TraitBound {
@@ -898,6 +968,14 @@ impl TraitBound {
     #[inline]
     fn new<I: IntoIterator<Item = StreamTrait>>(traits: I) -> Self {
         Self(BitSet8::new(traits))
+    }
+
+    fn trait_name(self) -> String {
+        let mut name = String::new();
+        for t in self.iter() {
+            name.push_str(t.short_name());
+        }
+        name
     }
 }
 
@@ -1242,6 +1320,7 @@ struct TransformVisitor<'tcx, 'a> {
     updated_field: bool,
     tmpfile: bool,
     current_fn: Option<LocalDefId>,
+    bounds: Vec<TraitBound>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1279,34 +1358,29 @@ impl<'a> TransformVisitor<'_, 'a> {
     }
 
     #[inline]
-    fn param_pot(&self, param: Param) -> Option<&'a Pot<'a>> {
+    fn param_pot(&self, param: Param) -> Option<Pot<'a>> {
         let loc = self.param_to_loc.get(&param)?;
-        self.loc_to_pot.get(loc)
+        self.loc_to_pot.get(loc).copied()
     }
 
     #[inline]
-    fn bound_pot(&self, span: Span) -> Option<&'a Pot<'a>> {
+    fn bound_pot(&self, span: Span) -> Option<Pot<'a>> {
         let loc = self.hir.bound_span_to_loc.get(&span)?;
-        self.loc_to_pot.get(loc)
+        self.loc_to_pot.get(loc).copied()
     }
 
     #[inline]
-    fn binding_pot(&self, span: Span) -> Option<&'a Pot<'a>> {
+    fn binding_pot(&self, span: Span) -> Option<Pot<'a>> {
         let loc = self.hir.binding_span_to_loc.get(&span)?;
-        self.loc_to_pot.get(loc)
+        self.loc_to_pot.get(loc).copied()
     }
 
     #[inline]
-    fn binding_ty(&self, span: Span) -> Option<Ty> {
-        Some(ty!("{}", self.binding_pot(span)?.ty))
-    }
-
-    #[inline]
-    fn return_pot(&self, func: LocalDefId) -> Option<&'a Pot<'a>> {
+    fn return_pot(&self, func: LocalDefId) -> Option<Pot<'a>> {
         if self.unsupported_returns.contains(&func) {
             return None;
         }
-        self.loc_to_pot.get(&HirLoc::Return(func))
+        self.loc_to_pot.get(&HirLoc::Return(func)).copied()
     }
 
     #[inline]
@@ -1352,6 +1426,16 @@ impl<'a> TransformVisitor<'_, 'a> {
         let span = old.span;
         *old = new;
         old.span = span;
+    }
+
+    #[inline]
+    fn replace_ty_with_pot(&mut self, old: &mut Ty, pot: Pot<'_>) {
+        if let Some(bound) = pot.ty.get_dyn_bound() {
+            if bound.count() > 1 {
+                self.bounds.push(bound);
+            }
+        }
+        self.replace_ty(old, ty!("{}", pot.ty));
     }
 
     #[inline]
@@ -1447,7 +1531,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
                 let loc = self.hir.binding_span_to_loc[&ident_span];
                 let pot = some_or!(self.loc_to_pot.get(&loc), return);
-                self.replace_ty(&mut item.ty, ty!("{}", pot.ty));
+                self.replace_ty_with_pot(&mut item.ty, *pot);
                 self.convert_rhs(body, *pot);
             }
             ItemKind::Fn(box item) => {
@@ -1478,7 +1562,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
                 if let Some(pot) = self.return_pot(def_id) {
                     let FnRetTy::Ty(ty) = &mut item.sig.decl.output else { panic!() };
-                    self.replace_ty(ty, ty!("{}", pot.ty));
+                    self.replace_ty_with_pot(ty, pot);
                 }
                 if let Some(eofs) = self.hir.feof_functions.get(&def_id) {
                     let stmts = &mut item.body.as_mut().unwrap().stmts;
@@ -1513,8 +1597,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             if self.unsupported.contains(&f.span) {
                 continue;
             }
-            let ty = some_or!(self.binding_ty(f.span), continue);
-            self.replace_ty(&mut f.ty, ty);
+            let pot = some_or!(self.binding_pot(f.span), continue);
+            self.replace_ty_with_pot(&mut f.ty, pot);
             self.updated_field = true;
         }
     }
@@ -1527,11 +1611,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         }
 
         let pot = some_or!(self.binding_pot(local.pat.span), return);
-        let ty = ty!("{}", pot.ty);
-        self.replace_ty(local.ty.as_mut().unwrap(), ty);
+        self.replace_ty_with_pot(local.ty.as_mut().unwrap(), pot);
 
         let LocalKind::Init(rhs) = &mut local.kind else { return };
-        self.convert_rhs(rhs, *pot);
+        self.convert_rhs(rhs, pot);
     }
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
@@ -1879,17 +1962,17 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ExprKind::Assign(lhs, rhs, _) => {
                 let lhs_pot = some_or!(self.bound_pot(lhs.span), return);
-                self.convert_rhs(rhs, *lhs_pot);
+                self.convert_rhs(rhs, lhs_pot);
             }
             ExprKind::Struct(se) => {
                 for f in se.fields.iter_mut() {
                     let lhs_pot = some_or!(self.bound_pot(f.ident.span), continue);
-                    self.convert_rhs(&mut f.expr, *lhs_pot);
+                    self.convert_rhs(&mut f.expr, lhs_pot);
                 }
             }
             ExprKind::Ret(Some(e)) => {
                 let Some(pot) = self.return_pot(self.current_fn.unwrap()) else { return };
-                self.convert_rhs(e, *pot);
+                self.convert_rhs(e, pot);
             }
             _ => {}
         }
