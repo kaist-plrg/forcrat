@@ -30,6 +30,11 @@ impl<'a> TypeArena<'a> {
     }
 
     #[inline]
+    fn alloc(&self, ty: StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(ty)
+    }
+
+    #[inline]
     fn buf_writer(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
         self.arena.alloc(StreamType::BufWriter(ty))
     }
@@ -52,12 +57,6 @@ impl<'a> TypeArena<'a> {
     #[inline]
     fn box_(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
         self.arena.alloc(StreamType::Box(ty))
-    }
-}
-
-impl<'a> TypeArena<'a> {
-    fn alloc(&self, ty: StreamType<'a>) -> &'a StreamType<'a> {
-        self.arena.alloc(ty)
     }
 
     pub(super) fn make_ty(
@@ -204,6 +203,25 @@ impl StreamType<'_> {
         }
     }
 
+    pub(super) fn contains_impl(self) -> bool {
+        match self {
+            Self::File
+            | Self::Stdin
+            | Self::Stdout
+            | Self::Stderr
+            | Self::ChildStdin
+            | Self::ChildStdout
+            | Self::Dyn(_) => false,
+            Self::Impl(_) => true,
+            Self::Option(t)
+            | Self::BufWriter(t)
+            | Self::BufReader(t)
+            | Self::Ptr(t)
+            | Self::Ref(t)
+            | Self::Box(t) => t.contains_impl(),
+        }
+    }
+
     pub(super) fn get_dyn_bound(self) -> Option<TraitBound> {
         match self {
             Self::File
@@ -239,10 +257,18 @@ pub(super) fn convert_expr(
         (Option(to), Option(from)) => {
             if consume || from.is_copyable() {
                 let body = convert_expr(*to, *from, "x", true);
-                format!("({}).map(|x| {})", expr, body)
+                if to.contains_impl() {
+                    format!("({}).map(|x| {})", expr, body)
+                } else {
+                    format!("({}).map::<{}, _>(|x| {})", expr, to, body)
+                }
             } else {
                 let body = convert_expr(*to, Ref(from), "x", true);
-                format!("({}).as_mut().map(|x| {})", expr, body)
+                if to.contains_impl() {
+                    format!("({}).as_mut().map(|x| {})", expr, body)
+                } else {
+                    format!("({}).as_mut().map::<{}, _>(|x| {})", expr, to, body)
+                }
             }
         }
         (Ptr(to), Option(from)) if to == from => {
@@ -250,6 +276,9 @@ pub(super) fn convert_expr(
                 "({}).as_mut().map_or(std::ptr::null_mut(), |r| r as *mut _)",
                 expr
             )
+        }
+        (Ptr(to), Ref(from)) if to == from => {
+            format!("&mut *({}) as *mut _", expr)
         }
         (to, Option(from)) if to == *from => {
             if consume || from.is_copyable() {
@@ -348,15 +377,40 @@ pub(super) fn convert_expr(
             format!("{{ let stream: {} = Box::new({}); stream }}", to, expr)
         }
         (
-            Ptr(Dyn(traits)),
+            Ref(Dyn(_)),
+            Ref(
+                File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_)
+                | BufReader(_),
+            ),
+        ) => {
+            format!("&mut *({})", expr)
+        }
+        (
+            Ptr(Dyn(_)),
+            Ref(
+                File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_)
+                | BufReader(_),
+            ),
+        ) => {
+            format!("&mut *({}) as *mut _", expr)
+        }
+        (
+            Ref(Dyn(traits)),
             File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
         ) => {
             if consume {
                 let expr = convert_expr(Box(&Dyn(*traits)), from, expr, true);
-                format!("Box::leak({}) as *mut _", expr)
+                format!("Box::leak({})", expr)
             } else {
-                todo!()
+                format!("&mut ({})", expr)
             }
+        }
+        (
+            Ptr(Dyn(traits)),
+            File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+        ) => {
+            let expr = convert_expr(Ref(&Dyn(*traits)), from, expr, consume);
+            format!("({}) as *mut _", expr)
         }
         (BufWriter(to), from) if *to == from => {
             assert!(consume);
@@ -439,13 +493,6 @@ pub(super) trait StreamExpr {
     #[inline]
     fn borrow_for(&self, tr: StreamTrait) -> String {
         let to = StreamType::Impl(TraitBound::new([tr]));
-        convert_expr(to, self.ty(), &self.expr(), false)
-    }
-
-    #[inline]
-    fn opt_borrow_for(&self, tr: StreamTrait) -> String {
-        let ty = StreamType::Impl(TraitBound::new([tr]));
-        let to = StreamType::Option(&ty);
         convert_expr(to, self.ty(), &self.expr(), false)
     }
 }

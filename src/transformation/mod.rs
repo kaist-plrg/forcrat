@@ -253,6 +253,22 @@ impl Pass for Transformation {
             let old = hir_loc_to_pot.insert(*hir_loc, pot);
             assert!(old.is_none());
         }
+        for param_loc in param_to_hir_loc.values() {
+            let bound = some_or!(hir_ctx.loc_to_bound_spans.get(param_loc), continue);
+            let mut tys = vec![];
+            for rhs in bound {
+                let lhs = some_or!(hir_ctx.rhs_to_lhs.get(rhs), continue);
+                let lhs_loc = some_or!(hir_ctx.bound_span_to_loc.get(lhs), continue);
+                let lhs_pot = some_or!(hir_loc_to_pot.get(lhs_loc), continue);
+                tys.push(lhs_pot.ty);
+            }
+            let ty = some_or!(tys.pop(), continue);
+            for t in tys {
+                assert_eq!(ty, t);
+            }
+            let pot = hir_loc_to_pot.get_mut(param_loc).unwrap();
+            pot.ty = ty;
+        }
 
         let mut api_ident_spans = FxHashSet::default();
         let mut retval_used_spans = FxHashSet::default();

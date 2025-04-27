@@ -1434,6 +1434,143 @@ unsafe fn f(mut x: libc::c_int) -> *mut FILE {
     );
 }
 
+#[test]
+fn test_param_static() {
+    run_test(
+        r#"
+static mut stream: *mut FILE = 0 as *const FILE as *mut FILE;
+unsafe fn g(mut s: *mut FILE) {
+    stream = s;
+}
+unsafe fn f() {
+    stream = stdout;
+    fputc('a' as i32, stream);
+}"#,
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
+fn test_param_field() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+unsafe fn g(mut stream: *mut FILE) -> *mut s {
+    let mut s: *mut s = malloc(::std::mem::size_of::<s>() as libc::c_ulong) as *mut s;
+    (*s).stream = stream;
+    return s;
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    let mut s: *mut s = g(stream);
+    fputc('a' as i32, (*s).stream);
+    fputc('b' as i32, (*s).stream);
+    fclose((*s).stream);
+}"#,
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
+fn test_param_ptr_field() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+unsafe fn g(mut stream: *mut FILE) -> *mut s {
+    let mut s: *mut s = malloc(::std::mem::size_of::<s>() as libc::c_ulong) as *mut s;
+    (*s).stream = stream;
+    return s;
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    let mut s: *mut s = g(stream);
+    fputc('a' as i32, (*s).stream);
+    fputc('b' as i32, (*s).stream);
+    fclose(stream);
+}"#,
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
+fn test_param_box_dyn_field() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+unsafe fn g(mut s: *mut s, mut stream: *mut FILE) {
+    (*s).stream = stream;
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    let mut s: s = s { stream: 0 as *mut FILE };
+    g(&mut s, stream);
+    fputc('a' as i32, s.stream);
+    fputc('b' as i32, s.stream);
+    fclose(s.stream);
+    g(&mut s, stdout);
+    fputc('a' as i32, s.stream);
+    fputc('b' as i32, s.stream);
+}"#,
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
+fn test_param_ptr_dyn_field() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+unsafe fn g(mut s: *mut s, mut stream: *mut FILE) {
+    (*s).stream = stream;
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    let mut s: s = s { stream: 0 as *mut FILE };
+    g(&mut s, stream);
+    fputc('a' as i32, s.stream);
+    fputc('b' as i32, s.stream);
+    fclose(stream);
+    g(&mut s, stdout);
+    fputc('a' as i32, s.stream);
+    fputc('b' as i32, s.stream);
+}"#,
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
