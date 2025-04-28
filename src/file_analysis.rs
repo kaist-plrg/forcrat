@@ -72,16 +72,22 @@ impl Pass for FileAnalysis {
                 LikelyLit::Other(_) => todo!(),
             })
             .collect();
-        let mut fprintf_path_spans: FxHashMap<_, _> = ast_visitor
-            .fprintf_args
-            .into_iter()
-            .filter_map(|(call_span, arg)| match arg {
-                LikelyLit::Lit(_) => None,
+        let mut fprintf_path_spans = FxHashMap::default();
+        let mut unsupported_printf_spans = FxHashSet::default();
+        for (call_span, arg) in ast_visitor.fprintf_args.into_iter() {
+            match arg {
+                LikelyLit::Lit(_) => {}
                 LikelyLit::If(_, _, _) => todo!(),
-                LikelyLit::Path(_, path_span) => Some((call_span, path_span)),
-                LikelyLit::Other(_) => todo!(),
-            })
-            .collect();
+                LikelyLit::Path(_, path_span) => {
+                    fprintf_path_spans.insert(call_span, path_span);
+                }
+                LikelyLit::Other(_) => {
+                    let call_str = tcx.sess.source_map().span_to_snippet(call_span).unwrap();
+                    println!("{}", call_str);
+                    unsupported_printf_spans.insert(call_span);
+                }
+            }
+        }
         let static_span_to_lit = ast_visitor.static_span_to_lit;
         drop(stolen);
 
@@ -95,7 +101,7 @@ impl Pass for FileAnalysis {
             let static_span = visitor.def_id_to_binding_span[def_id];
             !static_span_to_lit.contains_key(&static_span)
         });
-        let unsupported_printf_spans = fprintf_path_spans.keys().copied().collect();
+        unsupported_printf_spans.extend(fprintf_path_spans.keys().copied());
 
         let mut defined_apis = FxHashSet::default();
         let mut worklist = visitor.defined_apis;

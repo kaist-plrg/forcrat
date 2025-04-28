@@ -82,7 +82,10 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
                     }
                 }
                 Conversion::DoubleExp => fmt.push('e'),
-                Conversion::DoubleAuto => todo!(),
+                Conversion::DoubleAuto => {
+                    println!("DoubleAuto");
+                    // TODO
+                }
                 Conversion::DoubleError => todo!(),
                 Conversion::Pointer => fmt.push_str("#x"),
                 Conversion::Num | Conversion::C | Conversion::S => unimplemented!(),

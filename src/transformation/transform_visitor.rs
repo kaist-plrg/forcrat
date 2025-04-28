@@ -39,8 +39,6 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// user-defined API functions' signatures' spans
     pub(super) api_ident_spans: &'a FxHashSet<Span>,
-    /// spans of function calls whose return values are used
-    pub(super) retval_used_spans: &'a FxHashSet<Span>,
     /// uncopiable struct ident spans
     pub(super) uncopiable: &'a FxHashSet<Span>,
 
@@ -512,7 +510,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
-                        let retval_used = self.retval_used_spans.contains(&expr_span);
+                        let retval_used = self.hir.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check(callee.span);
                         let ctx = FprintfCtx {
                             wide: false,
@@ -534,7 +532,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             return;
                         }
                         let stream = StdExpr::stdout();
-                        let retval_used = self.retval_used_spans.contains(&expr_span);
+                        let retval_used = self.hir.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let ctx = FprintfCtx {
                             wide: false,
@@ -556,7 +554,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             return;
                         }
                         let stream = StdExpr::stdout();
-                        let retval_used = self.retval_used_spans.contains(&expr_span);
+                        let retval_used = self.hir.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check_std(callee.span, "stdout");
                         let ctx = FprintfCtx {
                             wide: true,

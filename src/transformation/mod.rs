@@ -6,14 +6,7 @@ use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, HirId};
-use rustc_middle::{
-    mir::{
-        self,
-        visit::{MutatingUseContext, PlaceContext},
-        Location, Place, Terminator, TerminatorKind,
-    },
-    ty::{self, TyCtxt},
-};
+use rustc_middle::{mir, ty::TyCtxt};
 use rustc_span::{def_id::LocalDefId, FileName, RealFileName, Span};
 use stream_ty::*;
 use toml_edit::DocumentMut;
@@ -21,10 +14,8 @@ use transform_visitor::*;
 use typed_arena::Arena;
 
 use crate::{
-    api_list,
     compile_util::{self, Pass},
     file_analysis::{self, Loc},
-    rustc_middle::mir::visit::Visitor as _,
 };
 
 pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
@@ -303,7 +294,6 @@ impl Pass for Transformation {
         }
 
         let mut api_ident_spans = FxHashSet::default();
-        let mut retval_used_spans = FxHashSet::default();
 
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
@@ -314,16 +304,6 @@ impl Pass for Transformation {
                 }
                 if analysis_res.defined_apis.contains(&local_def_id) {
                     api_ident_spans.insert(item.ident.span);
-                    continue;
-                }
-
-                let body = tcx.optimized_mir(local_def_id);
-                let mut visitor = MirVisitor::new(tcx);
-                visitor.visit_body(body);
-                for (span, local) in visitor.destinations {
-                    if visitor.used_locals.contains(&local) {
-                        retval_used_spans.insert(span);
-                    }
                 }
             }
         }
@@ -357,7 +337,6 @@ impl Pass for Transformation {
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
                 api_ident_spans: &api_ident_spans,
-                retval_used_spans: &retval_used_spans,
                 uncopiable: &uncopiable,
 
                 unsupported: &unsupported,
@@ -429,53 +408,6 @@ impl Parameter {
     #[inline]
     fn new(func: LocalDefId, index: usize) -> Self {
         Self { func, index }
-    }
-}
-
-struct MirVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    destinations: Vec<(Span, mir::Local)>,
-    used_locals: FxHashSet<mir::Local>,
-}
-
-impl<'tcx> MirVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self {
-            tcx,
-            destinations: vec![],
-            used_locals: FxHashSet::default(),
-        }
-    }
-}
-
-impl<'tcx> mir::visit::Visitor<'tcx> for MirVisitor<'tcx> {
-    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
-        self.super_place(place, context, location);
-
-        if !matches!(
-            context,
-            PlaceContext::MutatingUse(MutatingUseContext::Call | MutatingUseContext::Store)
-        ) {
-            self.used_locals.insert(place.local);
-        }
-    }
-
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
-        self.super_terminator(terminator, location);
-
-        let TerminatorKind::Call {
-            destination, func, ..
-        } = &terminator.kind
-        else {
-            return;
-        };
-        let constant = some_or!(func.constant(), return);
-        let mir::Const::Val(_, ty) = constant.const_ else { return };
-        let ty::TyKind::FnDef(def_id, _) = ty.kind() else { return };
-        if api_list::is_def_id_api(def_id, self.tcx) {
-            self.destinations
-                .push((terminator.source_info.span, destination.local));
-        }
     }
 }
 

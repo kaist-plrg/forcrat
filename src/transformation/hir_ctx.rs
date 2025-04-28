@@ -67,10 +67,13 @@ pub(super) struct HirCtx {
     pub(super) callee_span_to_hir_id: FxHashMap<Span, HirId>,
     /// call expr span to callee id
     pub(super) call_span_to_callee_id: FxHashMap<Span, LocalDefId>,
+
     /// function def_id to returned local hir_ids
     pub(super) return_locals: FxHashMap<LocalDefId, FxHashSet<Option<HirId>>>,
     /// function def_id to returned static def_ids
     pub(super) return_statics: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
+    /// spans of function calls whose return values are used
+    pub(super) retval_used_spans: FxHashSet<Span>,
 
     /// struct id to owning struct ids
     pub(super) struct_to_owning_structs: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
@@ -203,6 +206,28 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     }
                 }
                 let name = path.segments.last().unwrap().ident.name;
+                if api_list::is_symbol_api(name) {
+                    for (_, parent) in self.tcx.hir().parent_iter(expr.hir_id) {
+                        match parent {
+                            hir::Node::Expr(e) => {
+                                if !matches!(e.kind, hir::ExprKind::DropTemps(_)) {
+                                    self.ctx.retval_used_spans.insert(expr.span);
+                                    break;
+                                }
+                            }
+                            hir::Node::ExprField(_)
+                            | hir::Node::LetStmt(_)
+                            | hir::Node::Block(_) => {
+                                self.ctx.retval_used_spans.insert(expr.span);
+                                break;
+                            }
+                            hir::Node::Stmt(_) => {
+                                break;
+                            }
+                            _ => panic!("{:?}", parent),
+                        }
+                    }
+                }
                 let name = api_list::normalize_api_name(name.as_str());
                 let i = match name {
                     "fscanf" | "fgetc" | "getc" | "fprintf" | "fflush" | "feof" | "ferror"
