@@ -21,18 +21,18 @@ pub(super) struct Pot<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LocCtx {
-    pub is_param: bool,
+    pub is_generic: bool,
     pub is_union: bool,
-    pub is_static_return: bool,
+    pub non_local_assign: bool,
 }
 
 impl LocCtx {
     #[inline]
-    pub(super) fn new(is_param: bool, is_union: bool, is_static_return: bool) -> Self {
+    pub(super) fn new(is_generic: bool, is_union: bool, non_local_assign: bool) -> Self {
         Self {
-            is_param,
+            is_generic,
             is_union,
-            is_static_return,
+            non_local_assign,
         }
     }
 }
@@ -88,7 +88,7 @@ impl<'a> TypeArena<'a> {
         origins: BitSet8<Origin>,
         ctx: LocCtx,
     ) -> &'a StreamType<'a> {
-        let ty = if ctx.is_param {
+        let ty = if ctx.is_generic {
             let mut traits = BitSet8::new_empty();
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
@@ -127,7 +127,7 @@ impl<'a> TypeArena<'a> {
                 || ((origins.contains(Origin::Stdin)
                     || origins.contains(Origin::Stdout)
                     || origins.contains(Origin::Stderr))
-                    && !ctx.is_static_return)
+                    && !ctx.non_local_assign)
             {
                 self.option(ty)
             } else {
@@ -367,6 +367,15 @@ pub(super) fn convert_expr(
                 format!("&mut ({})", expr)
             }
         }
+        (Impl(traits), Ref(Stdin)) => {
+            if traits.contains(StreamTrait::BufRead) {
+                format!("({}).lock()", expr)
+            } else if consume {
+                expr.to_string()
+            } else {
+                format!("&mut *({})", expr)
+            }
+        }
         (Impl(_), Ref(Impl(_))) => {
             if consume {
                 expr.to_string()
@@ -465,6 +474,15 @@ pub(super) fn convert_expr(
         (BufReader(to), from) if *to == from => {
             assert!(consume);
             format!("std::io::BufReader::new({})", expr)
+        }
+        (Ptr(to), from) => {
+            if consume {
+                let converted = convert_expr(*to, from, expr, true);
+                format!("Box::leak(Box::new({})) as *mut _", converted)
+            } else {
+                let borrowed = format!("&mut ({})", expr);
+                convert_expr(Ptr(to), Ref(&from), &borrowed, true)
+            }
         }
         _ => panic!("{} := {} // {}", to, from, consume),
     }

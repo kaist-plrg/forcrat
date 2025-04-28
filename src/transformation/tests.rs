@@ -221,7 +221,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
         &mut h as *mut libc::c_double,
     );
 }"#,
-        &["BufRead", "fill_buf", "available", "consume", "parse"],
+        &["BufRead", "fill_buf", "available", "consume", "parse", "TT"],
         &["FILE", "fscanf"],
     );
 }
@@ -246,6 +246,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
             "available",
             "consume",
             "copy_from_slice",
+            "TT",
         ],
         &["FILE", "fscanf"],
     );
@@ -259,7 +260,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fgetc(stream);
     return fgetc(stream);
 }",
-        &["Read", "read_exact"],
+        &["Read", "read_exact", "TT"],
         &["FILE", "fgetc"],
     );
 }
@@ -272,7 +273,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     getc(stream);
     return getc(stream);
 }",
-        &["Read", "read_exact"],
+        &["Read", "read_exact", "TT"],
         &["FILE", "getc"],
     );
 }
@@ -308,7 +309,7 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }",
-        &["BufRead", "fill_buf", "available", "consume"],
+        &["BufRead", "fill_buf", "available", "consume", "TT"],
         &["FILE", "fgets"],
     );
 }
@@ -356,7 +357,7 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }",
-        &["Read", "read_exact"],
+        &["Read", "read_exact", "TT"],
         &["FILE", "fread"],
     );
 }
@@ -393,7 +394,7 @@ fn test_fprintf() {
 unsafe fn f(mut stream: *mut FILE) {
     fprintf(stream, b"%d\0" as *const u8 as *const libc::c_char, 0 as libc::c_int);
 }"#,
-        &["write!", "i32"],
+        &["write!", "i32", "TT"],
         &["fprintf", "%d"],
     );
 }
@@ -535,7 +536,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fputc('a' as i32, stream);
     return fputc('b' as i32, stream);
 }",
-        &["Write", "write_all"],
+        &["Write", "write_all", "TT"],
         &["FILE", "fputc"],
     );
 }
@@ -548,7 +549,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     putc('a' as i32, stream);
     return putc('b' as i32, stream);
 }",
-        &["Write", "write_all"],
+        &["Write", "write_all", "TT"],
         &["FILE", "putc"],
     );
 }
@@ -561,7 +562,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     putchar('a' as i32);
     return putchar('b' as i32);
 }",
-        &["write_all"],
+        &["write_all", "TT"],
         &["putchar"],
     );
 }
@@ -574,7 +575,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fputs(b"a\0" as *const u8 as *const libc::c_char, stream);
     return fputs(b"b\0" as *const u8 as *const libc::c_char, stream);
 }"#,
-        &["Write", "write_all"],
+        &["Write", "write_all", "TT"],
         &["FILE", "fputs"],
     );
 }
@@ -610,7 +611,7 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }"#,
-        &["Write", "write_all"],
+        &["Write", "write_all", "TT"],
         &["FILE", "fwrite"],
     );
 }
@@ -646,7 +647,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fflush(stream);
     return fflush(stream);
 }",
-        &["Write", "flush"],
+        &["Write", "flush", "TT"],
         &["FILE", "fflush"],
     );
 }
@@ -659,7 +660,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_long {
     ftell(stream);
     return ftell(stream);
 }",
-        &["Seek", "stream_position"],
+        &["Seek", "stream_position", "TT"],
         &["FILE", "ftell"],
     );
 }
@@ -672,7 +673,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_long {
     ftello(stream);
     return ftello(stream);
 }",
-        &["Seek", "stream_position"],
+        &["Seek", "stream_position", "TT"],
         &["FILE", "ftello"],
     );
 }
@@ -685,7 +686,7 @@ unsafe fn f(mut stream: *mut FILE) {
     rewind(stream);
     rewind(stream);
 }",
-        &["Seek", "rewind"],
+        &["Seek", "rewind", "TT"],
         &["FILE"],
     );
 }
@@ -698,7 +699,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fileno(stream);
     return fileno(stream);
 }",
-        &["AsRawFd", "as_raw_fd"],
+        &["AsRawFd", "as_raw_fd", "TT"],
         &["FILE", "fileno"],
     );
 }
@@ -1771,6 +1772,93 @@ unsafe fn f(mut x: libc::c_int) {
     fgetc(u.stream);
     fgetc(u.stream);
     fclose(u.stream);
+}"#,
+        &["Read", "read_exact"],
+        &["FILE", "fgetc"],
+    );
+}
+
+#[test]
+fn test_file_not_closed() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream);
+    fgetc(stream);
+}"#,
+        &["Read", "read_exact"],
+        &["FILE", "fgetc"],
+    );
+}
+
+#[test]
+fn test_param_assign() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    if stream.is_null() {
+        stream = fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        );
+    }
+    fgetc(stream);
+    fgetc(stream);
+    fclose(stream);
+}
+unsafe fn f() {
+    g(0 as *mut FILE);
+    g(
+        fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        ),
+    );
+}"#,
+        &["Read", "read_exact"],
+        &["FILE", "fgetc"],
+    );
+}
+
+#[test]
+fn test_param_assign_std() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    if stream.is_null() {
+        stream = stdin;
+    }
+    fgetc(stream);
+    fgetc(stream);
+}
+unsafe fn f() {
+    g(0 as *mut FILE);
+    g(stdin);
+}"#,
+        &["Read", "read_exact"],
+        &["FILE", "fgetc"],
+    );
+}
+
+#[test]
+fn test_param_assign_static() {
+    run_test(
+        r#"
+static mut stream0: *mut FILE = 0 as *const FILE as *mut FILE;
+unsafe fn g(mut stream: *mut FILE) {
+    if stream.is_null() {
+        stream = stream0;
+    }
+    fgetc(stream);
+    fgetc(stream);
+}
+unsafe fn f() {
+    stream0 = stdin;
+    g(0 as *mut FILE);
 }"#,
         &["Read", "read_exact"],
         &["FILE", "fgetc"],

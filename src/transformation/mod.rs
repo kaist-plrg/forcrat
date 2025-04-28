@@ -169,7 +169,7 @@ impl Pass for Transformation {
             .zip(analysis_res.permissions.iter().copied())
             .zip(analysis_res.origins.iter().copied())
         {
-            let (hir_locs, ctx) = match loc {
+            let (hir_locs, mut ctx) = match loc {
                 Loc::Var(def_id, local) => {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     match item.kind {
@@ -191,14 +191,23 @@ impl Pass for Transformation {
                             }
                             let arity = sig.decl.inputs.len();
                             let is_param = (1..=arity).contains(&local.as_usize());
-                            if is_param {
+                            let is_generic = if is_param {
                                 let param = Parameter {
                                     func: *def_id,
                                     index: local.as_usize() - 1,
                                 };
-                                param_to_hir_loc.insert(param, locs[0]);
-                            }
-                            (locs, LocCtx::new(is_param, false, is_static_return))
+                                let loc = locs[0];
+                                param_to_hir_loc.insert(param, loc);
+                                let bounds = hir_ctx.loc_to_bound_spans.get(&loc);
+                                bounds.is_none_or(|bounds| {
+                                    bounds
+                                        .iter()
+                                        .all(|bound| !hir_ctx.lhs_to_rhs.contains_key(bound))
+                                })
+                            } else {
+                                false
+                            };
+                            (locs, LocCtx::new(is_generic, false, is_static_return))
                         }
                         hir::ItemKind::Static(_, _, _) => {
                             if *local != mir::Local::ZERO {
@@ -226,6 +235,15 @@ impl Pass for Transformation {
                 if unsupported_locs.contains(&hir_loc) {
                     continue;
                 }
+                let bounds = hir_ctx.loc_to_bound_spans.get(&hir_loc);
+                let non_local_assign = bounds.is_some_and(|bounds| {
+                    bounds.iter().any(|bound| {
+                        let rhs = some_or!(hir_ctx.lhs_to_rhs.get(bound), return false);
+                        let loc = some_or!(hir_ctx.bound_span_to_loc.get(rhs), return false);
+                        matches!(loc, HirLoc::Global(_) | HirLoc::Field(_, _))
+                    })
+                });
+                ctx.non_local_assign |= non_local_assign;
                 let ty = type_arena.make_ty(permissions, origins, ctx);
                 if !ty.is_copyable() {
                     if let HirLoc::Field(def_id, _) = hir_loc {
