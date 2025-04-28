@@ -1627,9 +1627,78 @@ unsafe fn f(mut x: libc::c_int) {
     );
 }
 
+#[test]
+fn test_copy() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct t {
+    stream: *mut FILE,
+}
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut s: s = s { stream: 0 as *mut FILE };
+    s.stream = stream;
+    fgetc(s.stream);
+    fgetc(s.stream);
+    let mut t: t = t { stream: 0 as *mut FILE };
+    t.stream = stream;
+    fgetc(t.stream);
+    fgetc(t.stream);
+    fclose(t.stream);
+}"#,
+        &["Read", "read_exact", "Copy", "Clone"],
+        &["FILE", "fgetc"],
+    );
+}
+
+#[test]
+fn test_bitfield() {
+    run_test(
+        r#"
+#[derive(Copy, Clone, BitfieldStruct)]
+#[repr(C)]
+struct s {
+    #[bitfield(name = "x", ty = "libc::c_int", bits = "0..=0")]
+    x: [u8; 1],
+    #[bitfield(padding)]
+    c2rust_padding: [u8; 7],
+    stream: *mut FILE,
+}
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut s: s = s {
+        x: [0; 1],
+        c2rust_padding: [0; 7],
+        stream: 0 as *mut FILE,
+    };
+    s.stream = stream;
+    fgetc(s.stream);
+    fgetc(s.stream);
+    fclose(s.stream);
+}"#,
+        &["Read", "read_exact", "BitfieldStruct"],
+        &["FILE", "fgetc", "Copy", "Clone"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
+#[macro_use]
+extern crate c2rust_bitfields;
 use ::libc;
 extern "C" {
     pub type _IO_wide_data;

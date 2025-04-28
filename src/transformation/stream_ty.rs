@@ -184,7 +184,7 @@ impl std::fmt::Display for StreamType<'_> {
 }
 
 impl StreamType<'_> {
-    fn is_copyable(self) -> bool {
+    pub(super) fn is_copyable(self) -> bool {
         match self {
             Self::File
             | Self::Stdin

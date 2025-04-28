@@ -8,7 +8,10 @@ use rustc_ast::{
     ast::*,
     mut_visit::{self, MutVisitor},
     ptr::P,
-    tokenstream::{AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream},
+    token::TokenKind,
+    tokenstream::{
+        AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream, TokenStream, TokenTree,
+    },
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -326,7 +329,34 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ItemKind::Struct(_, _) | ItemKind::Union(_, _) => {
                 if self.updated_field {
-                    item.attrs.clear();
+                    for attr in &mut item.attrs {
+                        let AttrKind::Normal(attr) = &mut attr.kind else { continue };
+                        let AttrArgs::Delimited(args) = &mut attr.item.args else { continue };
+                        let mut tokens = vec![];
+                        let mut remove_comma = false;
+                        for tree in args.tokens.iter() {
+                            if let TokenTree::Token(token, _) = tree {
+                                match token.kind {
+                                    TokenKind::Ident(symbol, _) => {
+                                        let name = symbol.as_str();
+                                        if name == "Copy" || name == "Clone" {
+                                            remove_comma = true;
+                                            continue;
+                                        }
+                                    }
+                                    TokenKind::Comma => {
+                                        if remove_comma {
+                                            remove_comma = false;
+                                            continue;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            tokens.push(tree.clone());
+                        }
+                        args.tokens = TokenStream::new(tokens);
+                    }
                     self.updated_field = false;
                 }
             }
@@ -344,7 +374,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             let pot = some_or!(self.binding_pot(f.span), continue);
             self.replace_ty_with_pot(&mut f.ty, pot);
-            self.updated_field = true;
+            if !pot.ty.is_copyable() {
+                self.updated_field = true;
+            }
         }
     }
 
