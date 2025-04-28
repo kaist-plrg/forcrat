@@ -69,6 +69,8 @@ pub(super) struct HirCtx {
     pub(super) call_span_to_callee_id: FxHashMap<Span, LocalDefId>,
     /// function def_id to returned local hir_ids
     pub(super) return_locals: FxHashMap<LocalDefId, FxHashSet<Option<HirId>>>,
+    /// function def_id to returned static def_ids
+    pub(super) return_statics: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
 
     /// struct id to owning struct ids
     pub(super) struct_to_owning_structs: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
@@ -231,10 +233,25 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             hir::ExprKind::Ret(Some(e)) => {
                 let curr_func = expr.hir_id.owner.def_id;
                 let local = if let hir::ExprKind::Path(QPath::Resolved(_, path)) = e.kind {
-                    if let Res::Local(hir_id) = path.res {
-                        Some(hir_id)
-                    } else {
-                        None
+                    match path.res {
+                        Res::Local(hir_id) => Some(hir_id),
+                        Res::Def(DefKind::Static { .. }, def_id) => {
+                            if let Some(def_id) = def_id.as_local() {
+                                let name =
+                                    crate::compile_util::def_id_to_value_symbol(def_id, self.tcx)
+                                        .unwrap();
+                                let name = name.as_str();
+                                if name != "stdin" && name != "stdout" && name != "stderr" {
+                                    self.ctx
+                                        .return_statics
+                                        .entry(curr_func)
+                                        .or_default()
+                                        .insert(def_id);
+                                }
+                            }
+                            None
+                        }
+                        _ => None,
                     }
                 } else {
                     None

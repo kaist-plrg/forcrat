@@ -178,15 +178,18 @@ impl Pass for Transformation {
             .zip(analysis_res.permissions.iter().copied())
             .zip(analysis_res.origins.iter().copied())
         {
-            let (hir_locs, is_param, is_union) = match loc {
+            let (hir_locs, ctx) = match loc {
                 Loc::Var(def_id, local) => {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     match item.kind {
                         hir::ItemKind::Fn { sig, .. } => {
                             let mut locs = vec![];
-                            if *local == mir::Local::ZERO {
+                            let is_static_return = if *local == mir::Local::ZERO {
                                 locs.push(HirLoc::Return(*def_id));
-                            }
+                                hir_ctx.return_statics.contains_key(def_id)
+                            } else {
+                                false
+                            };
                             let span =
                                 mir_local_span(*def_id, *local, &return_locals, &hir_ctx, tcx);
                             if let Some(loc) = hir_ctx.binding_span_to_loc.get(&span) {
@@ -204,13 +207,16 @@ impl Pass for Transformation {
                                 };
                                 param_to_hir_loc.insert(param, locs[0]);
                             }
-                            (locs, is_param, false)
+                            (locs, LocCtx::new(is_param, false, is_static_return))
                         }
                         hir::ItemKind::Static(_, _, _) => {
                             if *local != mir::Local::ZERO {
                                 continue;
                             }
-                            (vec![HirLoc::Global(*def_id)], false, false)
+                            (
+                                vec![HirLoc::Global(*def_id)],
+                                LocCtx::new(false, false, false),
+                            )
                         }
                         _ => panic!(),
                     }
@@ -218,7 +224,10 @@ impl Pass for Transformation {
                 Loc::Field(def_id, field) => {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     let is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _));
-                    (vec![HirLoc::Field(*def_id, *field)], false, is_union)
+                    (
+                        vec![HirLoc::Field(*def_id, *field)],
+                        LocCtx::new(false, is_union, false),
+                    )
                 }
                 _ => continue,
             };
@@ -226,7 +235,7 @@ impl Pass for Transformation {
                 if unsupported_locs.contains(&hir_loc) {
                     continue;
                 }
-                let ty = type_arena.make_ty(permissions, origins, is_param, is_union);
+                let ty = type_arena.make_ty(permissions, origins, ctx);
                 if !ty.is_copyable() {
                     if let HirLoc::Field(def_id, _) = hir_loc {
                         uncopiable.push(def_id);

@@ -19,6 +19,24 @@ pub(super) struct Pot<'a> {
     pub(super) ty: &'a StreamType<'a>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LocCtx {
+    pub is_param: bool,
+    pub is_union: bool,
+    pub is_static_return: bool,
+}
+
+impl LocCtx {
+    #[inline]
+    pub(super) fn new(is_param: bool, is_union: bool, is_static_return: bool) -> Self {
+        Self {
+            is_param,
+            is_union,
+            is_static_return,
+        }
+    }
+}
+
 pub(super) struct TypeArena<'a> {
     arena: &'a Arena<StreamType<'a>>,
 }
@@ -68,10 +86,9 @@ impl<'a> TypeArena<'a> {
         &self,
         permissions: BitSet8<Permission>,
         origins: BitSet8<Origin>,
-        is_param: bool,
-        is_union: bool,
+        ctx: LocCtx,
     ) -> &'a StreamType<'a> {
-        let ty = if is_param {
+        let ty = if ctx.is_param {
             let mut traits = BitSet8::new_empty();
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
@@ -107,9 +124,10 @@ impl<'a> TypeArena<'a> {
                 Origin::Buffer => todo!(),
             };
             if permissions.contains(Permission::Close)
-                || origins.contains(Origin::Stdin)
-                || origins.contains(Origin::Stdout)
-                || origins.contains(Origin::Stderr)
+                || ((origins.contains(Origin::Stdin)
+                    || origins.contains(Origin::Stdout)
+                    || origins.contains(Origin::Stderr))
+                    && !ctx.is_static_return)
             {
                 self.option(ty)
             } else {
@@ -134,7 +152,7 @@ impl<'a> TypeArena<'a> {
             };
             self.option(ty)
         };
-        if is_union && !ty.is_copyable() {
+        if ctx.is_union && !ty.is_copyable() {
             self.manually_drop(ty)
         } else {
             ty

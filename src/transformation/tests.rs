@@ -1435,6 +1435,24 @@ unsafe fn f(mut x: libc::c_int) -> *mut FILE {
 }
 
 #[test]
+fn test_return_static() {
+    run_test(
+        r#"
+static mut stream: *mut FILE = 0 as *const FILE as *mut FILE;
+unsafe fn g() -> *mut FILE {
+    return stream;
+}
+unsafe fn f() {
+    stream = stdout;
+    fputc('a' as i32, stream);
+    fputc('b' as i32, stream);
+}"#,
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
 fn test_param_static() {
     run_test(
         r#"
