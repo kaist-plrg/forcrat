@@ -651,7 +651,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let param_pot = some_or!(self.param_pot(p), continue);
                             let is_null = matches!(remove_cast(arg).kind, ExprKind::Lit(_));
                             let permissions = param_pot.permissions;
-                            let consume = permissions.contains(Permission::Close);
+                            let consume = permissions.contains(Permission::Close)
+                                || matches!(
+                                    arg.kind,
+                                    ExprKind::Call(_, _) | ExprKind::MethodCall(_)
+                                );
                             self.convert_rhs(arg, param_pot, consume);
                             if param_pot.ty.contains_impl() {
                                 if is_null {

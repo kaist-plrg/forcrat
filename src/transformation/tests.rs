@@ -997,7 +997,7 @@ fn test_field() {
 #[derive(Copy, Clone)]
 #[repr(C)]
 struct s {
-    pub f: *mut FILE,
+    f: *mut FILE,
 }
 unsafe fn f() {
     let mut s: s = s { f: 0 as *mut FILE };
@@ -1022,7 +1022,7 @@ fn test_field_borrowed() {
 #[derive(Copy, Clone)]
 #[repr(C)]
 struct s {
-    pub f: *mut FILE,
+    f: *mut FILE,
 }
 unsafe fn g(mut s: *mut s) {
     fgetc((*s).f);
@@ -1051,7 +1051,7 @@ fn test_field_borrowed_init() {
 #[derive(Copy, Clone)]
 #[repr(C)]
 struct s {
-    pub f: *mut FILE,
+    f: *mut FILE,
 }
 unsafe fn g(mut s: *mut s) {
     fgetc((*s).f);
@@ -1481,6 +1481,29 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_param_field_std() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+unsafe fn g(mut s: *mut s, mut stream: *mut FILE) {
+    (*s).stream = stream;
+}
+unsafe fn f() {
+    let mut s: s = s { stream: 0 as *mut FILE };
+    g(&mut s, stdout);
+    fputc('a' as i32, s.stream);
+    fputc('b' as i32, s.stream);
+}"#,
+        &["Write", "write_all"],
+        &["FILE", "fputc"],
+    );
+}
+
+#[test]
 fn test_param_ptr_field() {
     run_test(
         r#"
@@ -1568,6 +1591,39 @@ unsafe fn f() {
 }"#,
         &["Write", "write_all"],
         &["FILE", "fputc"],
+    );
+}
+
+#[test]
+fn test_param_ptr_dyn_field_box() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+unsafe fn g(mut s: *mut s, mut stream: *mut FILE) {
+    (*s).stream = stream;
+}
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    if x != 0 {
+        stream = fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        );
+    } else {
+        stream = stdin;
+    }
+    let mut s: s = s { stream: 0 as *mut FILE };
+    g(&mut s, stream);
+    fgetc(s.stream);
+    fgetc(s.stream);
+    fclose(stream);
+}"#,
+        &["Read", "read_exact"],
+        &["FILE", "fgetc"],
     );
 }
 

@@ -196,8 +196,8 @@ impl StreamType<'_> {
             | Self::BufReader(_)
             | Self::Box(_)
             | Self::Dyn(_)
-            | Self::Impl(_) => false,
-            Self::Ref(_) => false,
+            | Self::Impl(_)
+            | Self::Ref(_) => false,
             Self::Ptr(_) => true,
             Self::Option(t) => t.is_copyable(),
         }
@@ -392,6 +392,9 @@ pub(super) fn convert_expr(
                 | BufReader(_),
             ),
         ) => {
+            format!("&mut *({}) as *mut _", expr)
+        }
+        (Ptr(Dyn(to)), Ref(Box(Dyn(from)))) if to == from => {
             format!("&mut *({}) as *mut _", expr)
         }
         (
