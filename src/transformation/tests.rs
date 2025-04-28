@@ -1662,6 +1662,45 @@ unsafe fn f(mut x: libc::c_int) {
 }
 
 #[test]
+fn test_copy_dependency() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct t {
+    s: s,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct r {
+    t: *mut t,
+}
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut t: t = t {
+        s: s { stream: 0 as *mut FILE },
+    };
+    let mut r: r = r { t: 0 as *mut t };
+    r.t = &mut t;
+    (*r.t).s.stream = stream;
+    fgetc((*r.t).s.stream);
+    fgetc((*r.t).s.stream);
+    fclose((*r.t).s.stream);
+}"#,
+        &["Read", "read_exact", "Copy", "Clone"],
+        &["FILE", "fgetc"],
+    );
+}
+
+#[test]
 fn test_bitfield() {
     run_test(
         r#"

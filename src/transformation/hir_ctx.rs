@@ -69,6 +69,9 @@ pub(super) struct HirCtx {
     pub(super) call_span_to_callee_id: FxHashMap<Span, LocalDefId>,
     /// function def_id to returned local hir_ids
     pub(super) return_locals: FxHashMap<LocalDefId, FxHashSet<Option<HirId>>>,
+
+    /// struct id to owning struct ids
+    pub(super) struct_to_owning_structs: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
 }
 
 pub(super) struct HirVisitor<'tcx> {
@@ -125,6 +128,18 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 for (i, f) in fields.iter().enumerate() {
                     let loc = HirLoc::Field(def_id, FieldIdx::from_usize(i));
                     self.add_binding(loc, f.span);
+                }
+                let adt_def = self.tcx.adt_def(def_id);
+                for variant in adt_def.variants() {
+                    for field in &variant.fields {
+                        let ty = field.ty(self.tcx, rustc_middle::ty::List::empty());
+                        let owned_def_id = some_or!(owned_def_id(ty), continue);
+                        self.ctx
+                            .struct_to_owning_structs
+                            .entry(owned_def_id)
+                            .or_default()
+                            .insert(def_id);
+                    }
                 }
             }
             _ => {}
@@ -261,4 +276,12 @@ fn adt_of_expr<'tcx>(
     let ty = typeck.expr_ty(expr);
     let TyKind::Adt(adt_def, _) = ty.kind() else { return None };
     Some((*adt_def, adt_def.did().as_local()?))
+}
+
+fn owned_def_id(ty: rustc_middle::ty::Ty<'_>) -> Option<LocalDefId> {
+    match ty.kind() {
+        TyKind::Adt(adt_def, _) => adt_def.did().as_local(),
+        TyKind::Array(ty, _) => owned_def_id(*ty),
+        _ => None,
+    }
 }

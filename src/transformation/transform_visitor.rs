@@ -41,6 +41,8 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) api_ident_spans: &'a FxHashSet<Span>,
     /// spans of function calls whose return values are used
     pub(super) retval_used_spans: &'a FxHashSet<Span>,
+    /// uncopiable struct ident spans
+    pub(super) uncopiable: &'a FxHashSet<Span>,
 
     /// unsupported expr spans
     pub(super) unsupported: &'a FxHashSet<Span>,
@@ -57,7 +59,6 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
 
     /// is this file updated
     pub(super) updated: bool,
-    pub(super) updated_field: bool,
     pub(super) tmpfile: bool,
     pub(super) current_fn: Option<LocalDefId>,
     pub(super) bounds: Vec<TraitBound>,
@@ -328,7 +329,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ItemKind::Struct(_, _) | ItemKind::Union(_, _) => {
-                if self.updated_field {
+                if self.uncopiable.contains(&item.ident.span) {
                     for attr in &mut item.attrs {
                         let AttrKind::Normal(attr) = &mut attr.kind else { continue };
                         let AttrArgs::Delimited(args) = &mut attr.item.args else { continue };
@@ -357,7 +358,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         args.tokens = TokenStream::new(tokens);
                     }
-                    self.updated_field = false;
                 }
             }
             _ => {}
@@ -374,9 +374,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             let pot = some_or!(self.binding_pot(f.span), continue);
             self.replace_ty_with_pot(&mut f.ty, pot);
-            if !pot.ty.is_copyable() {
-                self.updated_field = true;
-            }
         }
     }
 
@@ -723,7 +720,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
                 let ty = some_or!(self.bound_pot(receiver.span), return).ty;
                 match ty {
-                    StreamType::Option(_) => {
+                    StreamType::ManuallyDrop(StreamType::Option(_)) | StreamType::Option(_) => {
                         self.replace_ident(&mut seg.ident, Ident::from_str("is_none"));
                     }
                     StreamType::Ptr(_) => {}
