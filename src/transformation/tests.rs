@@ -1694,6 +1694,32 @@ unsafe fn f(mut x: libc::c_int) {
     );
 }
 
+#[test]
+fn test_union() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+union u {
+    x: libc::c_int,
+    stream: *mut FILE,
+}
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut u: u = u { x: 0 };
+    u.stream = stream;
+    fgetc(u.stream);
+    fgetc(u.stream);
+    fclose(u.stream);
+}"#,
+        &["Read", "read_exact"],
+        &["FILE", "fgetc"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

@@ -177,7 +177,7 @@ impl Pass for Transformation {
             .zip(analysis_res.permissions.iter().copied())
             .zip(analysis_res.origins.iter().copied())
         {
-            let (hir_locs, is_param) = match loc {
+            let (hir_locs, is_param, is_union) = match loc {
                 Loc::Var(def_id, local) => {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     match item.kind {
@@ -203,25 +203,29 @@ impl Pass for Transformation {
                                 };
                                 param_to_hir_loc.insert(param, locs[0]);
                             }
-                            (locs, is_param)
+                            (locs, is_param, false)
                         }
                         hir::ItemKind::Static(_, _, _) => {
                             if *local != mir::Local::ZERO {
                                 continue;
                             }
-                            (vec![HirLoc::Global(*def_id)], false)
+                            (vec![HirLoc::Global(*def_id)], false, false)
                         }
                         _ => panic!(),
                     }
                 }
-                Loc::Field(def_id, field) => (vec![HirLoc::Field(*def_id, *field)], false),
+                Loc::Field(def_id, field) => {
+                    let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
+                    let is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _));
+                    (vec![HirLoc::Field(*def_id, *field)], false, is_union)
+                }
                 _ => continue,
             };
             for hir_loc in hir_locs {
                 if unsupported_locs.contains(&hir_loc) {
                     continue;
                 }
-                let ty = type_arena.make_ty(permissions, origins, is_param);
+                let ty = type_arena.make_ty(permissions, origins, is_param, is_union);
                 let pot = Pot {
                     permissions,
                     origins,

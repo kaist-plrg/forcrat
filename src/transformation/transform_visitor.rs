@@ -431,12 +431,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             return;
                         }
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
-                        let is_option = match ty {
-                            StreamType::Ref(_) | StreamType::Ptr(_) => panic!(),
-                            StreamType::Option(_) => true,
-                            _ => false,
-                        };
-                        let new_expr = transform_fclose(&args[0], is_option);
+                        let new_expr = transform_fclose(&args[0], *ty);
                         self.replace_expr(expr, new_expr);
                     }
                     "fscanf" => {
@@ -1022,10 +1017,23 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
     }
 }
 
-fn transform_fclose(stream: &Expr, is_option: bool) -> Expr {
+fn transform_fclose(stream: &Expr, ty: StreamType<'_>) -> Expr {
     let stream = pprust::expr_to_string(stream);
-    let take = if is_option { ".take().unwrap()" } else { "" };
-    expr!("{{ drop(({}){}); 0 }}", stream, take)
+    match ty {
+        StreamType::Ref(_) | StreamType::Ptr(_) => panic!(),
+        StreamType::Option(_) => expr!("{{ drop(({}).take().unwrap()); 0 }}", stream),
+        StreamType::ManuallyDrop(StreamType::Option(_)) => expr!(
+            "{{ drop(std::mem::ManuallyDrop::take(&mut ({})).take().unwrap()); 0 }}",
+            stream
+        ),
+        StreamType::ManuallyDrop(_) => {
+            expr!(
+                "{{ drop(std::mem::ManuallyDrop::take(&mut ({}))); 0 }}",
+                stream
+            )
+        }
+        _ => expr!("{{ drop({}); 0 }}", stream),
+    }
 }
 
 fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(

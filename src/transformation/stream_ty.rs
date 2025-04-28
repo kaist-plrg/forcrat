@@ -59,13 +59,19 @@ impl<'a> TypeArena<'a> {
         self.arena.alloc(StreamType::Box(ty))
     }
 
+    #[inline]
+    fn manually_drop(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(StreamType::ManuallyDrop(ty))
+    }
+
     pub(super) fn make_ty(
         &self,
         permissions: BitSet8<Permission>,
         origins: BitSet8<Origin>,
         is_param: bool,
+        is_union: bool,
     ) -> &'a StreamType<'a> {
-        if is_param {
+        let ty = if is_param {
             let mut traits = BitSet8::new_empty();
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
@@ -127,6 +133,11 @@ impl<'a> TypeArena<'a> {
                 self.ptr(ty)
             };
             self.option(ty)
+        };
+        if is_union && !ty.is_copyable() {
+            self.manually_drop(ty)
+        } else {
+            ty
         }
     }
 }
@@ -145,6 +156,7 @@ pub(super) enum StreamType<'a> {
     Ptr(&'a StreamType<'a>),
     Ref(&'a StreamType<'a>),
     Box(&'a StreamType<'a>),
+    ManuallyDrop(&'a StreamType<'a>),
     Dyn(TraitBound),
     Impl(TraitBound),
 }
@@ -171,6 +183,7 @@ impl std::fmt::Display for StreamType<'_> {
             Self::Ptr(t) => write!(f, "*mut {}", t),
             Self::Ref(t) => write!(f, "&mut {}", t),
             Self::Box(t) => write!(f, "Box<{}>", t),
+            Self::ManuallyDrop(t) => write!(f, "std::mem::ManuallyDrop<{}>", t),
             Self::Dyn(traits) => {
                 if traits.count() == 1 {
                     write!(f, "dyn {}", traits)
@@ -199,7 +212,7 @@ impl StreamType<'_> {
             | Self::Impl(_)
             | Self::Ref(_) => false,
             Self::Ptr(_) => true,
-            Self::Option(t) => t.is_copyable(),
+            Self::Option(t) | Self::ManuallyDrop(t) => t.is_copyable(),
         }
     }
 
@@ -218,7 +231,8 @@ impl StreamType<'_> {
             | Self::BufReader(t)
             | Self::Ptr(t)
             | Self::Ref(t)
-            | Self::Box(t) => t.contains_impl(),
+            | Self::Box(t)
+            | Self::ManuallyDrop(t) => t.contains_impl(),
         }
     }
 
@@ -236,7 +250,8 @@ impl StreamType<'_> {
             | Self::BufReader(t)
             | Self::Ptr(t)
             | Self::Ref(t)
-            | Self::Box(t) => t.get_dyn_bound(),
+            | Self::Box(t)
+            | Self::ManuallyDrop(t) => t.get_dyn_bound(),
             Self::Dyn(traits) => Some(traits),
         }
     }
@@ -280,13 +295,6 @@ pub(super) fn convert_expr(
         (Ptr(to), Ref(from)) if to == from => {
             format!("&mut *({}) as *mut _", expr)
         }
-        (to, Option(from)) if to == *from => {
-            if consume || from.is_copyable() {
-                format!("({}).unwrap()", expr)
-            } else {
-                format!("({}).as_mut().unwrap()", expr)
-            }
-        }
         (to, Option(from)) => {
             if consume || from.is_copyable() {
                 let unwrapped = format!("({}).unwrap()", expr);
@@ -296,9 +304,26 @@ pub(super) fn convert_expr(
                 convert_expr(to, Ref(from), &unwrapped, true)
             }
         }
+        (to, Ref(Option(from))) => {
+            let unwrapped = format!("({}).as_mut().unwrap()", expr);
+            convert_expr(to, Ref(from), &unwrapped, true)
+        }
+        (to, ManuallyDrop(from)) => {
+            if consume {
+                let unwrapped = format!("({}).take()", expr);
+                convert_expr(to, *from, &unwrapped, true)
+            } else {
+                let unwrapped = format!("std::ops::DerefMut::deref_mut(&mut ({}))", expr);
+                convert_expr(to, Ref(from), &unwrapped, true)
+            }
+        }
         (Option(to), from) => {
             let converted = convert_expr(*to, from, expr, consume);
             format!("Some({})", converted)
+        }
+        (ManuallyDrop(to), from) => {
+            let converted = convert_expr(*to, from, expr, consume);
+            format!("std::mem::ManuallyDrop::new({})", converted)
         }
         (
             Impl(_),
