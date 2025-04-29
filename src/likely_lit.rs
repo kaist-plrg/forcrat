@@ -37,6 +37,7 @@ impl<'a> LikelyLit<'a> {
             }
             ExprKind::Paren(e) => Self::from_expr(e),
             ExprKind::Unary(UnOp::Deref, e) => Self::from_expr(e),
+            ExprKind::AddrOf(_, _, e) => Self::from_expr(e),
             ExprKind::Path(_, path) => {
                 let symbol = path.segments.last().unwrap().ident.name;
                 LikelyLit::Path(symbol, path.span)

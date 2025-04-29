@@ -852,78 +852,106 @@ fn walk_variant_data<T: MutVisitor>(vis: &mut T, vdata: &mut VariantData) {
     }
 }
 
-fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
-    let path = pprust::expr_to_string(path);
-    let mode = LikelyLit::from_expr(mode);
-    match mode {
-        LikelyLit::Lit(mode) => {
-            let path = format!(
-                "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
-                path
-            );
-            let (prefix, suffix) = mode.as_str().split_at(1);
-            let plus = suffix.contains('+');
-            match prefix {
-                "r" => {
-                    if plus {
-                        expr!(
-                            "std::fs::OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .open({})
-                                .ok()",
-                            path,
-                        )
-                    } else {
-                        expr!("std::fs::File::open({}).ok()", path)
-                    }
-                }
-                "w" => {
-                    if plus {
-                        expr!(
-                            "std::fs::OpenOptions::new()
-                                .write(true)
-                                .create(true)
-                                .truncate(true)
-                                .read(true)
-                                .open({})
-                                .ok()",
-                            path,
-                        )
-                    } else {
-                        expr!("std::fs::File::create({}).ok()", path)
-                    }
-                }
-                "a" => {
-                    if plus {
-                        expr!(
-                            "std::fs::OpenOptions::new()
-                                .append(true)
-                                .create(true)
-                                .read(true)
-                                .open({})
-                                .ok()",
-                            path,
-                        )
-                    } else {
-                        expr!(
-                            "std::fs::OpenOptions::new()
-                                .append(true)
-                                .create(true)
-                                .open({})
-                                .ok()",
-                            path,
-                        )
-                    }
-                }
-                _ => panic!("{:?}", mode),
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    Read(bool),
+    Write(bool),
+    Append(bool),
+    Unknown,
+}
+
+impl OpenMode {
+    fn from_lit(mode: Symbol) -> Self {
+        let (prefix, suffix) = mode.as_str().split_at(1);
+        let plus = suffix.contains('+');
+        match prefix {
+            "r" => Self::Read(plus),
+            "w" => Self::Write(plus),
+            "a" => Self::Append(plus),
+            _ => panic!("{:?}", mode),
         }
-        LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Path(symbol, _) => {
-            expr!(
-                r#"{{
-    let pathname = std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap();
+    }
+
+    fn from_likely_lit(mode: &LikelyLit<'_>) -> Self {
+        match mode {
+            LikelyLit::Lit(mode) => Self::from_lit(*mode),
+            LikelyLit::If(_, t, f) => {
+                let t = Self::from_likely_lit(t);
+                let f = Self::from_likely_lit(f);
+                if t == f {
+                    t
+                } else {
+                    Self::Unknown
+                }
+            }
+            LikelyLit::Path(_, _) => Self::Unknown,
+            LikelyLit::Other(_) => todo!(),
+        }
+    }
+
+    fn make_expr(self, path: &Expr, mode: &Expr) -> Expr {
+        let path = pprust::expr_to_string(path);
+        let path = format!(
+            "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
+            path
+        );
+        match self {
+            Self::Read(plus) => {
+                if plus {
+                    expr!(
+                        "std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open({})
+                            .ok()",
+                        path,
+                    )
+                } else {
+                    expr!("std::fs::File::open({}).ok()", path)
+                }
+            }
+            Self::Write(plus) => {
+                if plus {
+                    expr!(
+                        "std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .read(true)
+                            .open({})
+                            .ok()",
+                        path,
+                    )
+                } else {
+                    expr!("std::fs::File::create({}).ok()", path)
+                }
+            }
+            Self::Append(plus) => {
+                if plus {
+                    expr!(
+                        "std::fs::OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .read(true)
+                            .open({})
+                            .ok()",
+                        path,
+                    )
+                } else {
+                    expr!(
+                        "std::fs::OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open({})
+                            .ok()",
+                        path,
+                    )
+                }
+            }
+            Self::Unknown => {
+                expr!(
+                    r#"{{
+    let pathname = {};
     let mode = std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap();
     let (prefix, suffix) = mode.split_at(1);
     match prefix {{
@@ -960,10 +988,36 @@ fn transform_fopen(path: &Expr, mode: &Expr) -> Expr {
         _ => panic!(),
     }}.ok()
 }}"#,
-                path,
-                symbol.as_str()
-            )
+                    path,
+                    pprust::expr_to_string(mode),
+                )
+            }
         }
+    }
+}
+
+fn transform_fopen(path: &Expr, mode_expr: &Expr) -> Expr {
+    let mode = LikelyLit::from_expr(mode_expr);
+    match mode {
+        LikelyLit::Lit(mode) => {
+            let mode = OpenMode::from_lit(mode);
+            mode.make_expr(path, mode_expr)
+        }
+        LikelyLit::If(c, t, f) => {
+            let t = OpenMode::from_likely_lit(&t);
+            let f = OpenMode::from_likely_lit(&f);
+            if t == f {
+                t.make_expr(path, mode_expr)
+            } else {
+                let t = t.make_expr(path, mode_expr);
+                let f = f.make_expr(path, mode_expr);
+                let c = pprust::expr_to_string(c);
+                let t = pprust::expr_to_string(&t);
+                let f = pprust::expr_to_string(&f);
+                expr!("if {} {{ {} }} else {{ {} }}", c, t, f)
+            }
+        }
+        LikelyLit::Path(_, _) => OpenMode::Unknown.make_expr(path, mode_expr),
         LikelyLit::Other(_) => todo!(),
     }
 }
@@ -986,13 +1040,9 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
         command
     );
     let mode = LikelyLit::from_expr(mode);
-    match mode {
-        LikelyLit::Lit(mode) => {
-            let field = match &mode.as_str()[..1] {
-                "r" => "stdout",
-                "w" => "stdin",
-                _ => panic!("{:?}", mode),
-            };
+    match file_analysis::is_popen_read(&mode) {
+        Some(read) => {
+            let field = if read { "stdout" } else { "stdin" };
             expr!(
                 r#"std::process::Command::new("sh")
                 .arg("-c")
@@ -1006,9 +1056,7 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
                 field
             )
         }
-        LikelyLit::If(_, _, _) => todo!(),
-        LikelyLit::Path(_, _) => todo!(),
-        LikelyLit::Other(_) => todo!(),
+        None => todo!("{:?}", mode),
     }
 }
 

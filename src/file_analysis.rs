@@ -61,16 +61,7 @@ impl Pass for FileAnalysis {
         let popen_read: FxHashMap<_, _> = ast_visitor
             .popen_args
             .into_iter()
-            .filter_map(|(span, arg)| match arg {
-                LikelyLit::Lit(lit) => match &lit.as_str()[..1] {
-                    "r" => Some((span, true)),
-                    "w" => Some((span, false)),
-                    _ => panic!("{:?}", lit),
-                },
-                LikelyLit::If(_, _, _) => todo!(),
-                LikelyLit::Path(_, _) => todo!(),
-                LikelyLit::Other(_) => todo!(),
-            })
+            .filter_map(|(span, arg)| is_popen_read(&arg).map(|r| (span, r)))
             .collect();
         let mut fprintf_path_spans = FxHashMap::default();
         let mut unsupported_printf_spans = FxHashSet::default();
@@ -82,8 +73,6 @@ impl Pass for FileAnalysis {
                     fprintf_path_spans.insert(call_span, path_span);
                 }
                 LikelyLit::Other(_) => {
-                    let call_str = tcx.sess.source_map().span_to_snippet(call_span).unwrap();
-                    println!("{}", call_str);
                     unsupported_printf_spans.insert(call_span);
                 }
             }
@@ -245,6 +234,15 @@ impl Pass for FileAnalysis {
             locs.iter_enumerated().zip(&permissions).zip(&origins)
         {
             tracing::info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
+
+            if permissions.contains(Permission::Seek)
+                && (origins.contains(Origin::Stdin)
+                    || origins.contains(Origin::Stdout)
+                    || origins.contains(Origin::Stderr))
+            {
+                println!("{:?}: {:?}, {:?}", loc, permissions, origins);
+                analyzer.unsupported.add(i);
+            }
         }
 
         let unsupported = analyzer.unsupported.compute_all();
@@ -267,6 +265,27 @@ impl Pass for FileAnalysis {
             defined_apis,
             unsupported_printf_spans,
         }
+    }
+}
+
+pub fn is_popen_read(arg: &LikelyLit<'_>) -> Option<bool> {
+    match arg {
+        LikelyLit::Lit(lit) => match &lit.as_str()[..1] {
+            "r" => Some(true),
+            "w" => Some(false),
+            _ => panic!("{:?}", lit),
+        },
+        LikelyLit::If(_, t, f) => {
+            let t = is_popen_read(t);
+            let f = is_popen_read(f);
+            if t == f {
+                t
+            } else {
+                todo!()
+            }
+        }
+        LikelyLit::Path(_, _) => todo!(),
+        LikelyLit::Other(_) => todo!(),
     }
 }
 
@@ -318,9 +337,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
             Rvalue::Cast(CastKind::PointerWithExposedProvenance, _, _) => {}
             Rvalue::Cast(_, _, _) => assert!(variance.is_none()),
-            Rvalue::BinaryOp(_, box (op1, op2)) => {
+            Rvalue::BinaryOp(op, box (op1, op2)) => {
                 let ty = op1.ty(ctx.local_decls, self.tcx);
                 if contains_file_ty(ty, self.tcx) {
+                    println!("{:?}", op);
                     let op1 = self.transfer_operand(op1, ctx);
                     self.unsupported.add(op1);
                     let op2 = self.transfer_operand(op2, ctx);
@@ -449,7 +469,13 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 if let Some(callees) = self.fn_ty_functions.get(&ty.fn_ty) {
                     for callee in callees.clone() {
                         assert!(!is_def_id_api(callee, self.tcx));
-                        self.transfer_non_api_call(callee, args, *destination, ctx);
+                        self.transfer_non_api_call(
+                            callee,
+                            args,
+                            *destination,
+                            term.source_info.span,
+                            ctx,
+                        );
                     }
                 }
             }
@@ -485,6 +511,14 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                     let x = self.transfer_operand(&arg.node, ctx);
                                     if unsupported {
                                         self.unsupported.add(x);
+                                        println!(
+                                            "{}",
+                                            self.tcx
+                                                .sess
+                                                .source_map()
+                                                .span_to_snippet(term.source_info.span)
+                                                .unwrap()
+                                        );
                                     } else {
                                         self.add_permission(x, permission);
                                     }
@@ -509,7 +543,13 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         | ApiKind::NotIO => {}
                     }
                 } else if let Some(callee) = def_id.as_local() {
-                    self.transfer_non_api_call(callee, args, *destination, ctx);
+                    self.transfer_non_api_call(
+                        callee,
+                        args,
+                        *destination,
+                        term.source_info.span,
+                        ctx,
+                    );
                 } else {
                     let name = compile_util::def_id_to_value_symbol(def_id, self.tcx).unwrap();
                     if name.as_str() == "arg" {
@@ -517,6 +557,14 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         if contains_file_ty(ty, self.tcx) {
                             let x = self.transfer_place(*destination, ctx);
                             self.unsupported.add(x);
+                            println!(
+                                "{}",
+                                self.tcx
+                                    .sess
+                                    .source_map()
+                                    .span_to_snippet(term.source_info.span)
+                                    .unwrap()
+                            );
                         }
                     }
                 }
@@ -529,6 +577,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         callee: LocalDefId,
         args: &[Spanned<Operand<'tcx>>],
         destination: Place<'tcx>,
+        span: Span,
         ctx: Ctx<'_, 'tcx>,
     ) {
         let sig = self.tcx.fn_sig(callee).skip_binder().skip_binder();
@@ -545,6 +594,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             if contains_file_ty(ty, self.tcx) {
                 let arg = self.transfer_operand(&arg.node, ctx);
                 self.unsupported.add(arg);
+                println!(
+                    "{}",
+                    self.tcx.sess.source_map().span_to_snippet(span).unwrap()
+                );
             }
         }
         if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
