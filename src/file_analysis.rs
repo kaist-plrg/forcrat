@@ -65,14 +65,13 @@ impl Pass for FileAnalysis {
             .collect();
         let mut fprintf_path_spans = FxHashMap::default();
         let mut unsupported_printf_spans = FxHashSet::default();
-        for (call_span, arg) in ast_visitor.fprintf_args.into_iter() {
+        for (call_span, arg) in ast_visitor.fprintf_args {
             match arg {
                 LikelyLit::Lit(_) => {}
-                LikelyLit::If(_, _, _) => todo!(),
                 LikelyLit::Path(_, path_span) => {
                     fprintf_path_spans.insert(call_span, path_span);
                 }
-                LikelyLit::Other(_) => {
+                LikelyLit::If(_, _, _) | LikelyLit::Other(_) => {
                     unsupported_printf_spans.insert(call_span);
                 }
             }
@@ -85,12 +84,16 @@ impl Pass for FileAnalysis {
 
         let mut visitor = HirVisitor::new(tcx);
         tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-        fprintf_path_spans.retain(|_, path_span| {
-            let def_id = some_or!(visitor.bound_span_to_def_id.get(path_span), return true);
+        for (call_span, path_span) in fprintf_path_spans {
+            let def_id = some_or!(visitor.bound_span_to_def_id.get(&path_span), {
+                unsupported_printf_spans.insert(call_span);
+                continue;
+            });
             let static_span = visitor.def_id_to_binding_span[def_id];
-            !static_span_to_lit.contains_key(&static_span)
-        });
-        unsupported_printf_spans.extend(fprintf_path_spans.keys().copied());
+            if !static_span_to_lit.contains_key(&static_span) {
+                unsupported_printf_spans.insert(call_span);
+            }
+        }
 
         let mut defined_apis = FxHashSet::default();
         let mut worklist = visitor.defined_apis;
@@ -191,7 +194,7 @@ impl Pass for FileAnalysis {
             popen_read,
             steensgaard: &steensgaard,
             fn_ty_functions,
-            fprintf_path_spans,
+            unsupported_printf_spans: &unsupported_printf_spans,
             // stdio_arg_locs,
             loc_ind_map: &loc_ind_map,
             permission_graph,
@@ -295,7 +298,7 @@ struct Analyzer<'a, 'tcx> {
     // stdio_arg_locs: FxHashSet<Loc>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
-    fprintf_path_spans: FxHashMap<Span, Span>,
+    unsupported_printf_spans: &'a FxHashSet<Span>,
     steensgaard: &'a steensgaard::AnalysisResult,
     permission_graph: Graph<LocId, Permission>,
     origin_graph: Graph<LocId, Origin>,
@@ -503,22 +506,18 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             }
                         }
                         ApiKind::Operation(Some(permission)) => {
-                            let unsupported =
-                                self.fprintf_path_spans.contains_key(&term.source_info.span);
+                            let unsupported = self
+                                .unsupported_printf_spans
+                                .contains(&term.source_info.span);
+                            if unsupported {
+                                self.print_code(term.source_info.span);
+                            }
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(&arg.node, ctx);
                                     if unsupported {
                                         self.unsupported.add(x);
-                                        println!(
-                                            "{}",
-                                            self.tcx
-                                                .sess
-                                                .source_map()
-                                                .span_to_snippet(term.source_info.span)
-                                                .unwrap()
-                                        );
                                     } else {
                                         self.add_permission(x, permission);
                                     }
@@ -557,14 +556,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         if contains_file_ty(ty, self.tcx) {
                             let x = self.transfer_place(*destination, ctx);
                             self.unsupported.add(x);
-                            println!(
-                                "{}",
-                                self.tcx
-                                    .sess
-                                    .source_map()
-                                    .span_to_snippet(term.source_info.span)
-                                    .unwrap()
-                            );
+                            self.print_code(term.source_info.span);
                         }
                     }
                 }
@@ -594,10 +586,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             if contains_file_ty(ty, self.tcx) {
                 let arg = self.transfer_operand(&arg.node, ctx);
                 self.unsupported.add(arg);
-                println!(
-                    "{}",
-                    self.tcx.sess.source_map().span_to_snippet(span).unwrap()
-                );
+                self.print_code(span);
             }
         }
         if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
@@ -640,6 +629,18 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         if lhs != stdout && rhs != stdout && lhs != stderr && rhs != stderr {
             self.unsupported.union(lhs, rhs);
         }
+    }
+
+    fn print_code(&self, span: Span) {
+        println!(
+            "{}",
+            self.tcx
+                .sess
+                .source_map()
+                .span_to_snippet(span)
+                .unwrap()
+                .replace('\n', " ")
+        );
     }
 }
 

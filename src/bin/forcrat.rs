@@ -24,6 +24,11 @@ enum Command {
     CountReturnValues,
     FindFileReturns,
     Steensgaard,
+    Format,
+    Preprocess {
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     Analyze,
     Transformation {
         #[arg(short, long)]
@@ -151,8 +156,25 @@ fn main() {
             copy_dir(&args.input, &output, true);
             let file = output.join("c2rust-lib.rs");
 
-            let updated = transformation::Transformation.run_on_path(&file);
-            transformation::write_to_files(&updated, &output);
+            let result = transformation::Transformation.run_on_path(&file);
+            transformation::write_to_files(&result, &output);
+        }
+        Command::Preprocess { mut output } => {
+            output.push(args.input.file_name().unwrap());
+            if output.exists() {
+                assert!(output.is_dir());
+                clear_dir(&output);
+            } else {
+                fs::create_dir(&output).unwrap();
+            }
+            copy_dir(&args.input, &output, true);
+            let file = output.join("c2rust-lib.rs");
+
+            let result = preprocessor::Preprocessor.run_on_path(&file);
+            preprocessor::write_to_files(&result);
+        }
+        Command::Format => {
+            format::Format.run_on_path(&file);
         }
     }
 }

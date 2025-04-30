@@ -90,7 +90,7 @@ impl<'a> TransformVisitor<'_, 'a> {
     ) -> Expr {
         match LikelyLit::from_expr(fmt) {
             LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, ctx),
-            LikelyLit::If(_, _, _) => todo!(),
+            LikelyLit::If(_, _, _) => todo!("{:?}", fmt.span),
             LikelyLit::Path(_, span) => {
                 let loc = self.hir.bound_span_to_loc[&span];
                 let static_span = self.hir.loc_to_binding_span[&loc];
@@ -391,6 +391,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
         mut_visit::walk_expr(self, expr);
+
         let expr_span = expr.span;
         if self.is_unsupported(expr) {
             return;
