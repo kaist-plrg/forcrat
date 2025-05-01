@@ -287,11 +287,10 @@ pub fn is_popen_read(arg: &LikelyLit<'_>) -> Option<bool> {
             if t == f {
                 t
             } else {
-                todo!()
+                None
             }
         }
-        LikelyLit::Path(_, _) => todo!(),
-        LikelyLit::Other(_) => todo!(),
+        LikelyLit::Path(_, _) | LikelyLit::Other(_) => None,
     }
 }
 
@@ -320,7 +319,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         let ty = l.ty(ctx.local_decls, self.tcx).ty;
         let variance = file_type_variance(ty, self.tcx);
         match r {
-            Rvalue::Cast(CastKind::PtrToPtr, op, _) => {
+            Rvalue::Cast(CastKind::PtrToPtr | CastKind::Transmute, op, _) => {
                 let rty = op.ty(ctx.local_decls, self.tcx);
                 match (variance, contains_file_ty(rty, self.tcx)) {
                     (Some(variance), true) => {
@@ -341,8 +340,39 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     (None, false) => {}
                 }
             }
-            Rvalue::Cast(CastKind::PointerWithExposedProvenance, _, _) => {}
-            Rvalue::Cast(_, _, _) => assert!(variance.is_none()),
+            Rvalue::Cast(CastKind::PointerWithExposedProvenance, op, _) => {
+                if variance.is_some() {
+                    let l = self.transfer_place(*l, ctx);
+                    if let Operand::Constant(box ConstOperand {
+                        const_: Const::Val(ConstValue::Scalar(Scalar::Int(i)), _),
+                        ..
+                    }) = op
+                    {
+                        if i.to_int(i.size()) != 0 {
+                            self.unsupported.add(l);
+                        }
+                    } else {
+                        self.unsupported.add(l);
+                    }
+                }
+            }
+            Rvalue::Cast(CastKind::PointerExposeProvenance, op, _) => {
+                let rty = op.ty(ctx.local_decls, self.tcx);
+                if contains_file_ty(rty, self.tcx) {
+                    let r = self.transfer_operand(op, ctx);
+                    self.unsupported.add(r);
+                }
+            }
+            Rvalue::Cast(kind, op, _) => {
+                assert!(variance.is_none(), "{:?} {:?}", kind, stmt.source_info.span);
+                let rty = op.ty(ctx.local_decls, self.tcx);
+                assert!(
+                    !contains_file_ty(rty, self.tcx),
+                    "{:?} {:?}",
+                    kind,
+                    stmt.source_info.span
+                );
+            }
             Rvalue::BinaryOp(op, box (op1, op2)) => {
                 let ty = op1.ty(ctx.local_decls, self.tcx);
                 if contains_file_ty(ty, self.tcx) {
@@ -510,7 +540,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 };
                                 self.add_origin(x, origin);
                             } else {
-                                todo!()
+                                self.print_code(term.source_info.span);
+                                self.unsupported.add(x);
                             }
                         }
                         ApiKind::Operation(Some(permission)) => {
@@ -581,17 +612,17 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         ctx: Ctx<'_, 'tcx>,
     ) {
         let sig = self.tcx.fn_sig(callee).skip_binder().skip_binder();
-        for (i, (t, arg)) in sig.inputs().iter().zip(args).enumerate() {
-            if let Some(variance) = file_type_variance(*t, self.tcx) {
-                let l = Loc::Var(callee, Local::new(i + 1));
-                let l = self.loc_ind_map[&l];
-                let r = self.transfer_operand(&arg.node, ctx);
-                self.assign(l, r, variance);
-            }
-        }
-        for arg in args.iter().skip(sig.inputs().len()) {
+        let arity = sig.inputs().len();
+        for (i, arg) in args.iter().enumerate() {
             let ty = arg.node.ty(ctx.local_decls, self.tcx);
-            if contains_file_ty(ty, self.tcx) {
+            if i < arity {
+                if let Some(variance) = file_type_variance(ty, self.tcx) {
+                    let l = Loc::Var(callee, Local::new(i + 1));
+                    let l = self.loc_ind_map[&l];
+                    let r = self.transfer_operand(&arg.node, ctx);
+                    self.assign(l, r, variance);
+                }
+            } else if contains_file_ty(ty, self.tcx) {
                 let arg = self.transfer_operand(&arg.node, ctx);
                 self.unsupported.add(arg);
                 self.print_code(span);
