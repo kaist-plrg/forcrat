@@ -489,8 +489,27 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         let new_expr = transform_fread(&stream, &args[0], &args[1], &args[2], ic);
                         self.replace_expr(expr, new_expr);
                     }
-                    "getdelim" => todo!(),
-                    "getline" => todo!(),
+                    "getdelim" => {
+                        if self.is_unsupported(&args[3]) {
+                            return;
+                        }
+                        let ty = self.bound_pot(args[3].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[3], ty);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr =
+                            transform_getdelim(&stream, &args[0], &args[1], &args[2], ic);
+                        self.replace_expr(expr, new_expr);
+                    }
+                    "getline" => {
+                        if self.is_unsupported(&args[2]) {
+                            return;
+                        }
+                        let ty = self.bound_pot(args[2].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[2], ty);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_getline(&stream, &args[0], &args[1], ic);
+                        self.replace_expr(expr, new_expr);
+                    }
                     "feof" => {
                         if self.is_unsupported(&args[0]) {
                             return;
@@ -1281,6 +1300,107 @@ fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr, ic: IndicatorC
 }}",
         stream_str,
         s,
+        n,
+        handling
+    )
+}
+
+#[inline]
+fn transform_getdelim<S: StreamExpr>(
+    stream: &S,
+    lineptr: &Expr,
+    n: &Expr,
+    delimiter: &Expr,
+    ic: IndicatorCheck<'_>,
+) -> Expr {
+    let stream_str = stream.borrow_for(StreamTrait::BufRead);
+    let lineptr = pprust::expr_to_string(lineptr);
+    let n = pprust::expr_to_string(n);
+    let delimiter = pprust::expr_to_string(delimiter);
+    let handling = ic.error_handling();
+    expr!(
+        "{{
+    use std::io::BufRead;
+    let mut stream = {};
+    let lineptr = {};
+    let n = {};
+    let mut buf = vec![];
+    match stream.read_until(({}) as _, &mut buf) {{
+        Ok(_) => {{
+            let len = buf.len();
+            if len == 0 {{
+                return -1;
+            }}
+            buf.push(0);
+            if (*lineptr).is_null() {{
+                *lineptr = libc::malloc(buf.len() as _) as _;
+                *n = buf.len() as _;
+            }} else if buf.len() > *n as _ {{
+                *lineptr = libc::realloc(*lineptr as _, buf.len() as _) as _;
+                *n = buf.len() as _;
+            }}
+            let ptr: &mut [u8] = std::slice::from_raw_parts_mut(*lineptr as _, buf.len());
+            ptr.copy_from_slice(&buf);
+            len as _
+        }}
+        Err(e) => {{
+            {}
+            -1
+        }}
+    }}
+}}",
+        stream_str,
+        lineptr,
+        n,
+        delimiter,
+        handling
+    )
+}
+
+#[inline]
+fn transform_getline<S: StreamExpr>(
+    stream: &S,
+    lineptr: &Expr,
+    n: &Expr,
+    ic: IndicatorCheck<'_>,
+) -> Expr {
+    let stream_str = stream.borrow_for(StreamTrait::BufRead);
+    let lineptr = pprust::expr_to_string(lineptr);
+    let n = pprust::expr_to_string(n);
+    let handling = ic.error_handling();
+    expr!(
+        "{{
+    use std::io::BufRead;
+    let mut stream = {};
+    let lineptr = {};
+    let n = {};
+    let mut buf = vec![];
+    match stream.read_until(b'\\n', &mut buf) {{
+        Ok(_) => {{
+            let len = buf.len();
+            if len == 0 {{
+                return -1;
+            }}
+            buf.push(0);
+            if (*lineptr).is_null() {{
+                *lineptr = libc::malloc(buf.len() as _) as _;
+                *n = buf.len() as _;
+            }} else if buf.len() > *n as _ {{
+                *lineptr = libc::realloc(*lineptr as _, buf.len() as _) as _;
+                *n = buf.len() as _;
+            }}
+            let ptr: &mut [u8] = std::slice::from_raw_parts_mut(*lineptr as _, buf.len());
+            ptr.copy_from_slice(&buf);
+            len as _
+        }}
+        Err(e) => {{
+            {}
+            -1
+        }}
+    }}
+}}",
+        stream_str,
+        lineptr,
         n,
         handling
     )

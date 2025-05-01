@@ -490,7 +490,12 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     match kind {
                         ApiKind::Open(origin) => {
                             let x = self.transfer_place(*destination, ctx);
-                            self.add_origin(x, origin);
+                            if let Some(origin) = origin {
+                                self.add_origin(x, origin);
+                            } else {
+                                println!("{:?}", def_id);
+                                self.unsupported.add(x);
+                            }
                         }
                         ApiKind::PipeOpen => {
                             let x = self.transfer_place(*destination, ctx);

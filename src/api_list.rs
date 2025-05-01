@@ -116,7 +116,7 @@ impl Idx for Origin {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ApiKind {
-    Open(Origin),
+    Open(Option<Origin>),
     PipeOpen,
     Operation(Option<Permission>),
     StdioOperation,
@@ -151,15 +151,15 @@ lazy_static! {
     pub static ref API_MAP: FxHashMap<&'static str, ApiKind> = API_LIST.iter().copied().collect();
 }
 
-pub static API_LIST: [(&str, ApiKind); 91] = [
+pub static API_LIST: [(&str, ApiKind); 95] = [
     // stdio.h
     // Open (6)
-    ("fopen", Open(File)),
-    ("fdopen", Open(File)),
-    ("tmpfile", Open(File)),
+    ("fopen", Open(Some(File))),
+    ("fdopen", Open(Some(File))),
+    ("tmpfile", Open(Some(File))),
     ("popen", PipeOpen),
-    ("fmemopen", Open(Buffer)),
-    ("open_memstream", Open(Buffer)),
+    ("fmemopen", Open(Some(Buffer))),
+    ("open_memstream", Open(Some(Buffer))),
     // Close (2)
     ("fclose", Operation(Some(Close))),
     ("pclose", Operation(Some(Close))),
@@ -232,14 +232,18 @@ pub static API_LIST: [(&str, ApiKind); 91] = [
     ("tmpnam", Unsupported),
     ("tempnam", Unsupported), // removed
     ("ctermid", Unsupported),
-    // GNU libc
+    // GNU libc / Linux
     ("__fpending", Unsupported),
     ("__freading", Unsupported),
     ("__fwriting", Unsupported),
     ("fpurge", Unsupported),
+    ("setmntent", Open(None)),
+    ("getmntent", Unsupported),
+    ("addmntent", Unsupported),
+    ("endmntent", Unsupported),
     // wchar.h
     // Open (1)
-    ("open_wmemstream", Open(Buffer)),
+    ("open_wmemstream", Open(Some(Buffer))),
     // Read (6)
     ("fwscanf", Operation(Some(BufRead))),
     ("vfwscanf", Unsupported),
