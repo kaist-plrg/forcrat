@@ -253,6 +253,18 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
 }
 
 #[test]
+fn test_fscanf_scan_set() {
+    run_test(
+        r#"
+unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
+    return fscanf(stream, b"%*[^\n]\0" as *const u8 as *const libc::c_char);
+}"#,
+        &["BufRead", "fill_buf", "available", "consume", "TT"],
+        &["FILE", "fscanf"],
+    );
+}
+
+#[test]
 fn test_fgetc() {
     run_test(
         "

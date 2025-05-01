@@ -349,9 +349,11 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     }) = op
                     {
                         if i.to_int(i.size()) != 0 {
+                            self.print_code(stmt.source_info.span);
                             self.unsupported.add(l);
                         }
                     } else {
+                        self.print_code(stmt.source_info.span);
                         self.unsupported.add(l);
                     }
                 }
@@ -361,6 +363,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 if contains_file_ty(rty, self.tcx) {
                     let r = self.transfer_operand(op, ctx);
                     self.unsupported.add(r);
+                    self.print_code(stmt.source_info.span);
                 }
             }
             Rvalue::Cast(kind, op, _) => {

@@ -1144,13 +1144,18 @@ fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
     args: &[E],
     ic: IndicatorCheck<'_>,
 ) -> Expr {
-    assert!(!ic.has_check());
     let stream = stream.borrow_for(StreamTrait::BufRead);
+    let handling = ic.error_handling();
     let fmt = LikelyLit::from_expr(fmt);
     match fmt {
         LikelyLit::Lit(fmt) => {
-            let fmt = fmt.to_string().into_bytes();
-            let specs = scanf::parse_specs(&fmt);
+            // from rustc_ast/src/util/literal.rs
+            let s = fmt.as_str();
+            let mut buf = Vec::with_capacity(s.len());
+            unescape::unescape_unicode(fmt.as_str(), unescape::Mode::ByteStr, &mut |_, c| {
+                buf.push(unescape::byte_from_char(c.unwrap()))
+            });
+            let specs = scanf::parse_specs(&buf);
             let mut i = 0;
             let mut code = String::new();
             for spec in specs {
@@ -1165,59 +1170,81 @@ fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
                 } else {
                     "".to_string()
                 };
-                if let Some(_scan_set) = spec.scan_set() {
-                    todo!();
+                let check_char = if let Some(scan_set) = spec.scan_set() {
+                    let mut cond = String::new();
+                    if scan_set.negative {
+                        cond.push('!');
+                    }
+                    cond.push('(');
+                    for (i, c) in scan_set.chars.iter().enumerate() {
+                        if i > 0 {
+                            cond.push_str(" || ");
+                        }
+                        if let Some(s) = scanf::escape(*c) {
+                            write!(cond, "c == b'{}'", s).unwrap();
+                        } else {
+                            write!(cond, "c == b'{}'", *c as char).unwrap();
+                        }
+                    }
+                    cond.push(')');
+                    format!("if {} {{ chars.push(c); }} else {{ break; }}", cond)
                 } else {
-                    let assign = if let Some(arg) = arg {
-                        let ty = spec.ty();
-                        if ty == "&str" {
-                            format!(
-                                "
+                    "
+if !c.is_ascii_whitespace() {
+    chars.push(c);
+} else if !chars.is_empty() {
+    break;
+}"
+                    .to_string()
+                };
+                let assign = if let Some(arg) = arg {
+                    let ty = spec.ty();
+                    if ty == "&str" {
+                        format!(
+                            "
     let bytes = s.as_bytes();
     let buf: &mut [u8] = std::slice::from_raw_parts_mut(({}) as _, bytes.len() + 1);
     buf.copy_from_slice(bytes);
     buf[bytes.len()] = 0;",
-                                arg
-                            )
-                        } else {
-                            format!(
-                                "
+                            arg
+                        )
+                    } else {
+                        format!(
+                            "
     *(({}) as *mut {}) = s.parse().unwrap();
     count += 1;",
-                                arg, ty
-                            )
-                        }
-                    } else {
-                        "".to_string()
-                    };
-                    write!(
-                        code,
-                        "{{
+                            arg, ty
+                        )
+                    }
+                } else {
+                    "".to_string()
+                };
+                write!(
+                    code,
+                    "{{
     let mut chars = vec![];
     loop {{
         {}
         let available = match stream.fill_buf() {{
             Ok(buf) => buf,
-            Err(_) => break,
+            Err(e) => {{
+                {}
+                break;
+            }}
         }};
         if available.is_empty() {{
             break;
         }}
         let c = available[0];
-        if !c.is_ascii_whitespace() {{
-            chars.push(c);
-        }} else if !chars.is_empty() {{
-            break;
-        }}
+        {}
         stream.consume(1);
     }}
     let s = String::from_utf8(chars).unwrap();
     {}
 }}",
-                        check_width, assign
-                    )
-                    .unwrap();
-                }
+                    check_width, handling, check_char, assign
+                )
+                .unwrap();
             }
             expr!(
                 "{{

@@ -362,7 +362,7 @@ impl ConversionSpec {
     }
 }
 
-fn escape(c: u8) -> Option<&'static str> {
+pub(super) fn escape(c: u8) -> Option<&'static str> {
     match c {
         b'\n' => Some("\\n"),
         b'\r' => Some("\\r"),
