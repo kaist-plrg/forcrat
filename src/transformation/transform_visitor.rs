@@ -198,11 +198,20 @@ impl<'a> TransformVisitor<'_, 'a> {
         old.span = span;
     }
 
+    #[inline]
+    fn is_non_local(&self, span: Span) -> bool {
+        matches!(
+            self.hir.bound_span_to_loc.get(&span),
+            Some(HirLoc::Global(_) | HirLoc::Field(_, _))
+        )
+    }
+
     fn convert_rhs(&mut self, rhs: &mut Expr, lhs_pot: Pot<'_>, consume: bool) {
         let rhs_span = rhs.span;
+        let is_non_local = self.is_non_local(rhs_span);
         if let Some(rhs_pot) = self.bound_pot(rhs.span) {
             let rhs_str = pprust::expr_to_string(rhs);
-            let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, consume);
+            let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, consume, is_non_local);
             let new_rhs = expr!("{}", new_rhs);
             self.replace_expr(rhs, new_rhs);
         } else if let Some(def_id) = self.hir.call_span_to_callee_id.get(&rhs_span) {
@@ -223,7 +232,7 @@ impl<'a> TransformVisitor<'_, 'a> {
                 }
                 _ => *self.return_pot(*def_id).unwrap().ty,
             };
-            let new_rhs = convert_expr(*lhs_pot.ty, rhs_ty, &rhs_str, consume);
+            let new_rhs = convert_expr(*lhs_pot.ty, rhs_ty, &rhs_str, consume, is_non_local);
             let new_rhs = expr!("{}", new_rhs);
             self.replace_expr(rhs, new_rhs);
         } else {
@@ -427,7 +436,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             return;
                         }
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
-                        let new_expr = transform_fclose(&args[0], *ty);
+                        let is_non_local = self.is_non_local(args[0].span);
+                        let new_expr = transform_fclose(&args[0], *ty, is_non_local);
                         self.replace_expr(expr, new_expr);
                     }
                     "fscanf" => {
@@ -1061,11 +1071,17 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
     }
 }
 
-fn transform_fclose(stream: &Expr, ty: StreamType<'_>) -> Expr {
+fn transform_fclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Expr {
     let stream = pprust::expr_to_string(stream);
     match ty {
         StreamType::Ref(_) | StreamType::Ptr(_) => panic!(),
-        StreamType::Option(_) => expr!("{{ drop(({}).take().unwrap()); 0 }}", stream),
+        StreamType::Option(_) => {
+            if is_non_local {
+                expr!("{{ drop(({}).take().unwrap()); 0 }}", stream)
+            } else {
+                expr!("{{ drop(({}).unwrap()); 0 }}", stream)
+            }
+        }
         StreamType::ManuallyDrop(StreamType::Option(_)) => expr!(
             "{{ drop(std::mem::ManuallyDrop::take(&mut ({})).take().unwrap()); 0 }}",
             stream

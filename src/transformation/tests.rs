@@ -1865,6 +1865,28 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_static_consume() {
+    run_test(
+        r#"
+static mut stream0: *mut FILE = 0 as *const FILE as *mut FILE;
+unsafe fn g(mut stream: *mut FILE) {
+    fclose(stream);
+}
+unsafe fn f() {
+    stream0 = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream0);
+    fgetc(stream0);
+    g(stream0);
+}"#,
+        &["Read", "read_exact", "drop"],
+        &["FILE", "fgetc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
