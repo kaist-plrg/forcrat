@@ -708,6 +708,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let new_expr = expr!("{}::<{}>", c, targs.join(", "));
                             self.replace_expr(callee, new_expr);
                         }
+                        if let Some(nested_args) = self.hir.call_span_to_nested_args.get(&expr_span)
+                        {
+                            println!("Nested");
+                            let mut new_expr = "{".to_string();
+                            for i in nested_args {
+                                let a = pprust::expr_to_string(&args[*i]);
+                                write!(new_expr, "let __arg_{} = {};", i, a).unwrap();
+                                self.replace_expr(&mut args[*i], expr!("__arg_{}", i));
+                            }
+                            new_expr.push_str(&pprust::expr_to_string(expr));
+                            new_expr.push('}');
+                            self.replace_expr(expr, expr!("{}", new_expr));
+                        }
                     }
                 }
             }
