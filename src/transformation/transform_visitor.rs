@@ -392,7 +392,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         }
 
         let pot = some_or!(self.binding_pot(local.pat.span), return);
-        self.replace_ty_with_pot(local.ty.as_mut().unwrap(), pot);
+        if let Some(ty) = local.ty.as_mut() {
+            self.replace_ty_with_pot(ty, pot);
+        }
 
         let LocalKind::Init(rhs) = &mut local.kind else { return };
         self.convert_rhs(rhs, pot, true);
@@ -1366,19 +1368,20 @@ fn transform_getdelim<S: StreamExpr>(
         Ok(_) => {{
             let len = buf.len();
             if len == 0 {{
-                return -1;
+                -1
+            }} else {{
+                buf.push(0);
+                if (*lineptr).is_null() {{
+                    *lineptr = libc::malloc(buf.len() as _) as _;
+                    *n = buf.len() as _;
+                }} else if buf.len() > *n as _ {{
+                    *lineptr = libc::realloc(*lineptr as _, buf.len() as _) as _;
+                    *n = buf.len() as _;
+                }}
+                let ptr: &mut [u8] = std::slice::from_raw_parts_mut(*lineptr as _, buf.len());
+                ptr.copy_from_slice(&buf);
+                len as _
             }}
-            buf.push(0);
-            if (*lineptr).is_null() {{
-                *lineptr = libc::malloc(buf.len() as _) as _;
-                *n = buf.len() as _;
-            }} else if buf.len() > *n as _ {{
-                *lineptr = libc::realloc(*lineptr as _, buf.len() as _) as _;
-                *n = buf.len() as _;
-            }}
-            let ptr: &mut [u8] = std::slice::from_raw_parts_mut(*lineptr as _, buf.len());
-            ptr.copy_from_slice(&buf);
-            len as _
         }}
         Err(e) => {{
             {}
@@ -1416,19 +1419,20 @@ fn transform_getline<S: StreamExpr>(
         Ok(_) => {{
             let len = buf.len();
             if len == 0 {{
-                return -1;
+                -1
+            }} else {{
+                buf.push(0);
+                if (*lineptr).is_null() {{
+                    *lineptr = libc::malloc(buf.len() as _) as _;
+                    *n = buf.len() as _;
+                }} else if buf.len() > *n as _ {{
+                    *lineptr = libc::realloc(*lineptr as _, buf.len() as _) as _;
+                    *n = buf.len() as _;
+                }}
+                let ptr: &mut [u8] = std::slice::from_raw_parts_mut(*lineptr as _, buf.len());
+                ptr.copy_from_slice(&buf);
+                len as _
             }}
-            buf.push(0);
-            if (*lineptr).is_null() {{
-                *lineptr = libc::malloc(buf.len() as _) as _;
-                *n = buf.len() as _;
-            }} else if buf.len() > *n as _ {{
-                *lineptr = libc::realloc(*lineptr as _, buf.len() as _) as _;
-                *n = buf.len() as _;
-            }}
-            let ptr: &mut [u8] = std::slice::from_raw_parts_mut(*lineptr as _, buf.len());
-            ptr.copy_from_slice(&buf);
-            len as _
         }}
         Err(e) => {{
             {}
@@ -1502,7 +1506,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
         buf = new_buf;
     }
     let rsfmt = printf::to_rust_format(&buf);
-    assert!(args.len() == rsfmt.casts.len());
+    assert!(args.len() >= rsfmt.casts.len());
     let mut new_args = String::new();
     let mut width_args = String::new();
     for (i, (arg, cast)) in args.iter().zip(rsfmt.casts).enumerate() {
