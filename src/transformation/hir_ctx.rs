@@ -265,9 +265,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 let i = match name {
                     "fscanf" | "fgetc" | "getc" | "fprintf" | "fflush" | "feof" | "ferror"
                     | "clearerr" => 0,
-                    "fputc" | "putc" | "fputs" => 1,
-                    "fgets" => 2,
-                    "fread" | "fwrite" => 3,
+                    "fputc" | "putc" | "fputwc" | "putwc" | "fputs" => 1,
+                    "fgets" | "getline" => 2,
+                    "fread" | "getdelim" | "fwrite" => 3,
                     _ => return,
                 };
                 let arg_name = match &args[i].kind {

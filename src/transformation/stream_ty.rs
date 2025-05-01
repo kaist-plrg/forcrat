@@ -104,7 +104,8 @@ impl<'a> TypeArena<'a> {
                 Origin::Stdout => &STDOUT_TY,
                 Origin::Stderr => &STDERR_TY,
                 Origin::File => {
-                    if permissions.contains(Permission::Read)
+                    if (permissions.contains(Permission::Read)
+                        || permissions.contains(Permission::BufRead))
                         && permissions.contains(Permission::Write)
                     {
                         &FILE_TY

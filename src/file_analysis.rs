@@ -242,6 +242,9 @@ impl Pass for FileAnalysis {
                 && (origins.contains(Origin::Stdin)
                     || origins.contains(Origin::Stdout)
                     || origins.contains(Origin::Stderr))
+                || permissions.contains(Permission::Write) && origins.contains(Origin::Stdin)
+                || permissions.contains(Permission::Read)
+                    && (origins.contains(Origin::Stdout) || origins.contains(Origin::Stderr))
             {
                 println!("{:?}: {:?}, {:?}", loc, permissions, origins);
                 analyzer.unsupported.add(i);

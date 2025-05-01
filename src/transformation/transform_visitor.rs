@@ -613,6 +613,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         let new_expr = transform_fputc(&stream, &args[0], ic);
                         self.replace_expr(expr, new_expr);
                     }
+                    "fputwc" | "putwc" => {
+                        if self.is_unsupported(&args[1]) {
+                            return;
+                        }
+                        let ty = self.bound_pot(args[1].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[1], ty);
+                        let ic = self.indicator_check(callee.span);
+                        let new_expr = transform_fputwc(&stream, &args[0], ic);
+                        self.replace_expr(expr, new_expr);
+                    }
                     "fputs" => {
                         if self.is_unsupported(&args[1]) {
                             return;
@@ -1271,30 +1281,30 @@ fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr, ic: IndicatorC
     let s = {};
     let n = ({}) as usize;
     let ___buf: &mut [u8] = std::slice::from_raw_parts_mut(s as _, n);
-    let mut pos = 0;
-    while pos < n - 1 {{
+    let mut ___pos = 0;
+    while ___pos < n - 1 {{
         let available = match stream.fill_buf() {{
             Ok(___buf) => ___buf,
             Err(e) => {{
                 {}
-                pos = 0;
+                ___pos = 0;
                 break
             }}
         }};
         if available.is_empty() {{
             break;
         }}
-        ___buf[pos] = available[0];
+        ___buf[___pos] = available[0];
         stream.consume(1);
-        pos += 1;
-        if ___buf[pos - 1] == b'\\n' {{
+        ___pos += 1;
+        if ___buf[___pos - 1] == b'\\n' {{
             break;
         }}
     }}
-    if pos == 0 {{
+    if ___pos == 0 {{
         std::ptr::null_mut()
     }} else {{
-        ___buf[pos] = 0;
+        ___buf[___pos] = 0;
         s
     }}
 }}",
@@ -1609,6 +1619,40 @@ fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) 
     use std::io::Write;
     let c = {};
     ({}).write_all(&[c as u8]).map_or(libc::EOF, |_| c)
+}}",
+            c,
+            stream_str
+        )
+    }
+}
+
+#[inline]
+fn transform_fputwc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) -> Expr {
+    let stream_str = stream.borrow_for(StreamTrait::Write);
+    let c = pprust::expr_to_string(c);
+    if ic.has_check() {
+        expr!(
+            "{{
+    use std::io::Write;
+    let c = {};
+    match write!({}, \"{{}}\", std::char::from_u32(c as _).unwrap()) {{
+        Ok(_) => c,
+        Err(e) => {{
+            {}
+            libc::EOF
+        }}
+    }}
+}}",
+            c,
+            stream_str,
+            ic.error_handling_no_eof(),
+        )
+    } else {
+        expr!(
+            "{{
+    use std::io::Write;
+    let c = {};
+    write!({}, \"{{}}\", std::char::from_u32(c as _).unwrap()).map_or(libc::EOF, |_| c)
 }}",
             c,
             stream_str

@@ -1907,6 +1907,39 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_buf_read_write() {
+    run_test(
+        r#"
+unsafe fn g(mut mode: *const libc::c_char) -> *mut FILE {
+    return fopen(b"a\0" as *const u8 as *const libc::c_char, mode);
+}
+unsafe fn f(mut x: libc::c_int) {
+    if x != 0 {
+        let mut stream0: *mut FILE = g(b"r\0" as *const u8 as *const libc::c_char);
+        fscanf(
+            stream0,
+            b"%d\0" as *const u8 as *const libc::c_char,
+            &mut x as *mut libc::c_int,
+        );
+        fscanf(
+            stream0,
+            b"%d\0" as *const u8 as *const libc::c_char,
+            &mut x as *mut libc::c_int,
+        );
+        fclose(stream0);
+    } else {
+        let mut stream1: *mut FILE = g(b"w\0" as *const u8 as *const libc::c_char);
+        fputc('a' as i32, stream1);
+        fputc('a' as i32, stream1);
+        fclose(stream1);
+    };
+}"#,
+        &["BufRead", "consume", "Write", "write_all"],
+        &["FILE", "fopen", "fgetc", "fputc", "fclose"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
