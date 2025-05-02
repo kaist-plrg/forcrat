@@ -36,6 +36,7 @@ impl Pass for Preprocessor {
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let mut visitor = HirVisitor {
             tcx,
+            call_span_to_if_args: FxHashMap::default(),
             call_span_to_args: FxHashMap::default(),
             call_span_to_nested_args: FxHashMap::default(),
         };
@@ -61,6 +62,7 @@ impl Pass for Preprocessor {
             .unwrap();
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = PreprocessVisitor {
+                call_span_to_if_args: &visitor.call_span_to_if_args,
                 call_span_to_nested_args: &visitor.call_span_to_nested_args,
                 updated: false,
             };
@@ -85,6 +87,7 @@ struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     call_span_to_args: FxHashMap<HirId, Vec<(Span, Vec<BoundOccurrence>)>>,
     call_span_to_nested_args: FxHashMap<Span, Vec<usize>>,
+    call_span_to_if_args: FxHashMap<Span, Vec<usize>>,
 }
 
 impl HirVisitor<'_> {
@@ -114,6 +117,20 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
         match &expr.kind {
             hir::ExprKind::Call(_, args) => {
+                let mut if_args = vec![];
+                for (i, arg) in args.iter().enumerate() {
+                    if !matches!(arg.kind, hir::ExprKind::If(_, _, _)) {
+                        continue;
+                    }
+                    let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
+                    let ty = typeck.expr_ty(arg);
+                    if compile_util::contains_file_ty(ty, self.tcx) {
+                        if_args.push(i);
+                    }
+                }
+                if !if_args.is_empty() {
+                    self.call_span_to_if_args.insert(expr.span, if_args);
+                }
                 let args = args.iter().map(|arg| (arg.span, vec![])).collect();
                 self.call_span_to_args.insert(expr.hir_id, args);
             }
@@ -174,6 +191,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 }
 
 struct PreprocessVisitor<'a> {
+    call_span_to_if_args: &'a FxHashMap<Span, Vec<usize>>,
     call_span_to_nested_args: &'a FxHashMap<Span, Vec<usize>>,
     updated: bool,
 }
@@ -202,13 +220,22 @@ impl MutVisitor for PreprocessVisitor<'_> {
         mut_visit::walk_expr(self, expr);
         let expr_span = expr.span;
         if let ExprKind::Call(_, args) = &mut expr.kind {
+            let mut indices: Vec<usize> = vec![];
+            if let Some(if_args) = self.call_span_to_if_args.get(&expr_span) {
+                indices.extend(if_args);
+            }
             if let Some(nested_args) = self.call_span_to_nested_args.get(&expr_span) {
+                indices.extend(nested_args);
+            }
+            if !indices.is_empty() {
                 self.updated = true;
+                indices.sort();
+                indices.dedup();
                 let mut new_expr = "{".to_string();
-                for i in nested_args {
-                    let a = pprust::expr_to_string(&args[*i]);
+                for i in indices {
+                    let a = pprust::expr_to_string(&args[i]);
                     write!(new_expr, "let __arg_{} = {};", i, a).unwrap();
-                    *args[*i] = expr!("__arg_{}", i);
+                    *args[i] = expr!("__arg_{}", i);
                 }
                 new_expr.push_str(&pprust::expr_to_string(expr));
                 new_expr.push('}');
