@@ -1900,26 +1900,6 @@ unsafe fn f() {
 }
 
 #[test]
-fn test_nested() {
-    run_test(
-        r#"
-unsafe fn g(mut stream: *mut FILE, mut x: libc::c_int) -> libc::c_int {
-    return fgetc(stream);
-}
-unsafe fn f() {
-    let mut stream: *mut FILE = fopen(
-        b"a\0" as *const u8 as *const libc::c_char,
-        b"r\0" as *const u8 as *const libc::c_char,
-    );
-    g(stream, g(stream, 0 as libc::c_int));
-    fclose(stream);
-}"#,
-        &["Read", "read_exact"],
-        &["FILE", "fgetc"],
-    );
-}
-
-#[test]
 fn test_buf_read_write() {
     run_test(
         r#"

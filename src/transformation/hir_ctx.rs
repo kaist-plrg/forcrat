@@ -77,11 +77,6 @@ pub(super) struct HirCtx {
 
     /// struct id to owning struct ids
     pub(super) struct_to_owning_structs: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
-
-    /// call expr span to stream arg hir_ids
-    call_span_to_stream_ids: FxHashMap<Span, Vec<HirId>>,
-    /// call expr span to nested stream arg indices
-    pub(super) call_span_to_nested_args: FxHashMap<Span, Vec<usize>>,
 }
 
 pub(super) struct HirVisitor<'tcx> {
@@ -205,34 +200,6 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 self.ctx
                     .callee_span_to_hir_id
                     .insert(path.span, expr.hir_id);
-                let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
-                let mut stream_args = vec![];
-                let mut nested_args = vec![];
-                for (i, arg) in args.iter().enumerate() {
-                    if let Some(stream_ids) = self.ctx.call_span_to_stream_ids.get(&arg.span) {
-                        if stream_args.iter().any(|id| stream_ids.contains(id)) {
-                            nested_args.push(i);
-                        }
-                        continue;
-                    }
-                    let hir::ExprKind::Path(QPath::Resolved(_, path)) = arg.kind else { continue };
-                    let ty = typeck.expr_ty(arg);
-                    if !compile_util::contains_file_ty(ty, self.tcx) {
-                        continue;
-                    }
-                    let Res::Local(hir_id) = path.res else { continue };
-                    stream_args.push(hir_id);
-                }
-                if !stream_args.is_empty() {
-                    self.ctx
-                        .call_span_to_stream_ids
-                        .insert(expr.span, stream_args);
-                }
-                if !nested_args.is_empty() {
-                    self.ctx
-                        .call_span_to_nested_args
-                        .insert(expr.span, nested_args);
-                }
                 if let Res::Def(DefKind::Fn, def_id) = path.res {
                     if let Some(def_id) = def_id.as_local() {
                         self.ctx.call_span_to_callee_id.insert(expr.span, def_id);

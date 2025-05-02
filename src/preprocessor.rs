@@ -1,10 +1,18 @@
+use std::fmt::Write as _;
+
 use etrace::some_or;
+use hir::{intravisit, HirId};
 use rustc_ast::{mut_visit::MutVisitor, ptr::P, *};
 use rustc_ast_pretty::pprust;
-use rustc_middle::ty::TyCtxt;
-use rustc_span::{FileName, RealFileName};
+use rustc_data_structures::fx::FxHashMap;
+use rustc_hir::{self as hir, def::Res, QPath};
+use rustc_middle::{hir::nested_filter, ty::TyCtxt};
+use rustc_span::{FileName, RealFileName, Span};
 
-use crate::{ast_maker::parse_expr, compile_util::Pass};
+use crate::{
+    ast_maker::parse_expr,
+    compile_util::{self, Pass},
+};
 
 pub fn write_to_files(res: &PreprocessResult) {
     for (f, s) in &res.files {
@@ -26,7 +34,12 @@ impl Pass for Preprocessor {
     type Out = PreprocessResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        tcx.resolver_for_lowering();
+        let mut visitor = HirVisitor {
+            tcx,
+            call_span_to_args: FxHashMap::default(),
+            call_span_to_nested_args: FxHashMap::default(),
+        };
+        tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
         let source_map = tcx.sess.source_map();
         let parse_sess = crate::ast_maker::new_parse_sess();
@@ -47,7 +60,10 @@ impl Pass for Preprocessor {
             )
             .unwrap();
             let mut krate = parser.parse_crate_mod().unwrap();
-            let mut visitor = PreprocessVisitor { updated: false };
+            let mut visitor = PreprocessVisitor {
+                call_span_to_nested_args: &visitor.call_span_to_nested_args,
+                updated: false,
+            };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
                 let s = pprust::crate_to_string_for_macros(&krate);
@@ -59,11 +75,110 @@ impl Pass for Preprocessor {
     }
 }
 
-struct PreprocessVisitor {
+#[derive(Debug, Clone, Copy)]
+struct BoundOccurrence {
+    var_id: HirId,
+    expr_id: HirId,
+}
+
+struct HirVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    call_span_to_args: FxHashMap<HirId, Vec<(Span, Vec<BoundOccurrence>)>>,
+    call_span_to_nested_args: FxHashMap<Span, Vec<usize>>,
+}
+
+impl HirVisitor<'_> {
+    fn find_call_parent(&self, hir_id: HirId) -> HirId {
+        for (hir_id, node) in self.tcx.hir().parent_iter(hir_id) {
+            if matches!(
+                node,
+                hir::Node::Expr(hir::Expr {
+                    kind: hir::ExprKind::Call(_, _),
+                    ..
+                })
+            ) {
+                return hir_id;
+            }
+        }
+        panic!()
+    }
+}
+
+impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
+        match &expr.kind {
+            hir::ExprKind::Call(_, args) => {
+                let args = args.iter().map(|arg| (arg.span, vec![])).collect();
+                self.call_span_to_args.insert(expr.hir_id, args);
+            }
+            hir::ExprKind::Path(QPath::Resolved(_, path)) => {
+                if let Res::Local(hir_id) = path.res {
+                    let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
+                    let ty = typeck.expr_ty(expr);
+                    if compile_util::contains_file_ty(ty, self.tcx) {
+                        for v in self.call_span_to_args.values_mut() {
+                            for (span, v) in v {
+                                if span.contains(expr.span) {
+                                    v.push(BoundOccurrence {
+                                        var_id: hir_id,
+                                        expr_id: expr.hir_id,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        intravisit::walk_expr(self, expr);
+
+        if let hir::ExprKind::Call(_, args) = expr.kind {
+            let arg_bound_ids = self.call_span_to_args.remove(&expr.hir_id).unwrap();
+            let nested_args: Vec<_> = arg_bound_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, ids))| {
+                    for boi in ids {
+                        if self.find_call_parent(boi.expr_id) == expr.hir_id {
+                            continue;
+                        }
+                        for ((_, ids), arg) in arg_bound_ids.iter().zip(args) {
+                            if !matches!(arg.kind, hir::ExprKind::Path(QPath::Resolved(_, _))) {
+                                continue;
+                            }
+                            if ids.is_empty() {
+                                continue;
+                            }
+                            let [boj] = &ids[..] else { panic!() };
+                            if boi.var_id == boj.var_id {
+                                return Some(i);
+                            }
+                        }
+                    }
+                    None
+                })
+                .collect();
+            if !nested_args.is_empty() {
+                self.call_span_to_nested_args.insert(expr.span, nested_args);
+            }
+        }
+    }
+}
+
+struct PreprocessVisitor<'a> {
+    call_span_to_nested_args: &'a FxHashMap<Span, Vec<usize>>,
     updated: bool,
 }
 
-impl MutVisitor for PreprocessVisitor {
+impl MutVisitor for PreprocessVisitor<'_> {
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
         if let ExprKind::If(c, t, f) = &mut expr.kind {
             if let Some(Value::Bool(b)) = eval_expr(c) {
@@ -85,6 +200,21 @@ impl MutVisitor for PreprocessVisitor {
             }
         }
         mut_visit::walk_expr(self, expr);
+        let expr_span = expr.span;
+        if let ExprKind::Call(_, args) = &mut expr.kind {
+            if let Some(nested_args) = self.call_span_to_nested_args.get(&expr_span) {
+                self.updated = true;
+                let mut new_expr = "{".to_string();
+                for i in nested_args {
+                    let a = pprust::expr_to_string(&args[*i]);
+                    write!(new_expr, "let __arg_{} = {};", i, a).unwrap();
+                    *args[*i] = expr!("__arg_{}", i);
+                }
+                new_expr.push_str(&pprust::expr_to_string(expr));
+                new_expr.push('}');
+                **expr = expr!("{}", new_expr);
+            }
+        }
     }
 
     fn visit_block(&mut self, b: &mut P<Block>) {
