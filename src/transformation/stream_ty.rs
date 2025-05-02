@@ -357,7 +357,8 @@ pub(super) fn convert_expr(
         }
         (
             Impl(_),
-            File | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+            File | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_)
+            | Box(Dyn(_)),
         ) => {
             if consume {
                 expr.to_string()

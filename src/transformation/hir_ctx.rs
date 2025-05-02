@@ -74,6 +74,8 @@ pub(super) struct HirCtx {
     pub(super) return_statics: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     /// spans of function calls whose return values are used
     pub(super) retval_used_spans: FxHashSet<Span>,
+    /// function def_id to returned expr spans
+    pub(super) return_spans: FxHashMap<LocalDefId, Vec<Span>>,
 
     /// struct id to owning struct ids
     pub(super) struct_to_owning_structs: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
@@ -257,6 +259,11 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
             }
             hir::ExprKind::Ret(Some(e)) => {
                 let curr_func = expr.hir_id.owner.def_id;
+                self.ctx
+                    .return_spans
+                    .entry(curr_func)
+                    .or_default()
+                    .push(e.span);
                 let local = if let hir::ExprKind::Path(QPath::Resolved(_, path)) = e.kind {
                     match path.res {
                         Res::Local(hir_id) => Some(hir_id),

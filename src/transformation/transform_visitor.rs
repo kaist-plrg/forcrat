@@ -394,6 +394,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         let pot = some_or!(self.binding_pot(local.pat.span), return);
         if let Some(ty) = local.ty.as_mut() {
             self.replace_ty_with_pot(ty, pot);
+        } else {
+            if let Some(bound) = pot.ty.get_dyn_bound() {
+                if bound.count() > 1 {
+                    self.bounds.push(bound);
+                }
+            }
+            self.updated = true;
+            local.ty = Some(P(ty!("{}", pot.ty)));
         }
 
         let LocalKind::Init(rhs) = &mut local.kind else { return };

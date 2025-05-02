@@ -125,6 +125,11 @@ impl Pass for Transformation {
                     unsupported.insert(span);
                     if local == mir::Local::ZERO {
                         unsupported_returns.insert(def_id);
+                        if let Some(spans) = hir_ctx.return_spans.get(&def_id) {
+                            for span in spans {
+                                unsupported.insert(*span);
+                            }
+                        }
                     }
                 }
                 Loc::Field(def_id, field_idx) => {
