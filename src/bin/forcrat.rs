@@ -23,7 +23,10 @@ enum Command {
     },
     CountReturnValues,
     FindFileReturns,
-    FindFileTypes,
+    FindFileTypes {
+        #[arg(long, default_value = "false")]
+        mir: bool,
+    },
     Steensgaard,
     Format,
     Preprocess {
@@ -136,8 +139,8 @@ fn main() {
         Command::FindFileReturns => {
             return_finder::ReturnFinder.run_on_path(&file);
         }
-        Command::FindFileTypes => {
-            ty_finder::TyFinder.run_on_path(&file);
+        Command::FindFileTypes { mir } => {
+            ty_finder::TyFinder { mir }.run_on_path(&file);
         }
         Command::Steensgaard => {
             let res = steensgaard::Steensgaard.run_on_path(&file);

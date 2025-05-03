@@ -12,12 +12,37 @@ use rustc_middle::{
 use crate::compile_util::{self, Pass};
 
 #[derive(Debug, Clone, Copy)]
-pub struct TyFinder;
+pub struct TyFinder {
+    pub mir: bool,
+}
 
 impl Pass for TyFinder {
     type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) {
+        if self.mir {
+            for item_id in tcx.hir_free_items() {
+                let item = tcx.hir_item(item_id);
+                let local_def_id = item.owner_id.def_id;
+                let body = match item.kind {
+                    ItemKind::Fn { .. } => {
+                        if item.ident.name.as_str() == "main" {
+                            continue;
+                        }
+                        tcx.optimized_mir(local_def_id)
+                    }
+                    ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
+                    _ => continue,
+                };
+                for local_decl in body.local_decls.iter() {
+                    if compile_util::contains_file_ty(local_decl.ty, tcx) {
+                        println!("{:?}", local_decl.ty);
+                    }
+                }
+            }
+            return;
+        }
+
         let mut visitor = Visitor::new(tcx);
         tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
