@@ -287,9 +287,12 @@ pub fn is_std_io_expr<'tcx>(expr: &Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
 
 #[inline]
 pub fn is_file_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    let key = tcx.def_key(id);
-    let DefPathData::TypeNs(name) = key.disambiguated_data.data else { return false };
-    name.as_str() == "_IO_FILE"
+    def_id_to_ty_symbol(id, tcx).is_some_and(|name| name.as_str() == "_IO_FILE")
+}
+
+#[inline]
+pub fn is_option_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
+    def_id_to_ty_symbol(id, tcx).is_some_and(|name| name.as_str() == "Option")
 }
 
 #[inline]

@@ -1,6 +1,7 @@
 use std::{collections::hash_map::Entry, ops::Deref as _};
 
 use etrace::some_or;
+use regex::Regex;
 use rustc_abi::{FieldIdx, FIRST_VARIANT};
 use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::{scc::Sccs, DirectedGraph, Successors};
@@ -19,7 +20,7 @@ use rustc_middle::{
         ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
     },
     query::IntoQueryParam,
-    ty::{List, Ty, TyCtxt, TyKind},
+    ty::{adjustment::PointerCoercion, List, Ty, TyCtxt, TyKind},
 };
 use rustc_span::{source_map::Spanned, Span, Symbol};
 use typed_arena::Arena;
@@ -27,12 +28,11 @@ use typed_arena::Arena;
 use crate::{
     api_list::{def_id_api_kind, is_def_id_api, ApiKind, Origin, Permission},
     bit_set::BitSet8,
-    compile_util::{self, contains_file_ty, is_file_ty, Pass},
+    compile_util::{self, Pass},
     disjoint_set::DisjointSet,
     likely_lit::LikelyLit,
     rustc_ast::visit::Visitor as _,
     rustc_index::bit_set::BitRelations,
-    steensgaard,
 };
 
 #[derive(Debug)]
@@ -79,9 +79,6 @@ impl Pass for FileAnalysis {
         let static_span_to_lit = ast_visitor.static_span_to_lit;
         drop(stolen);
 
-        let steensgaard = steensgaard::Steensgaard.run(tcx);
-        tracing::info!("\n{:?}", steensgaard);
-
         let mut visitor = HirVisitor::new(tcx);
         tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
         for (call_span, path_span) in fprintf_path_spans {
@@ -119,8 +116,6 @@ impl Pass for FileAnalysis {
         // }
         // let mut stdio_arg_locs: FxHashSet<Loc> = FxHashSet::default();
 
-        let mut fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>> =
-            FxHashMap::default();
         let mut locs: IndexVec<LocId, Loc> =
             IndexVec::from_raw(vec![Loc::Stdin, Loc::Stdout, Loc::Stderr]);
 
@@ -132,11 +127,6 @@ impl Pass for FileAnalysis {
                     if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
                         continue;
                     }
-                    let ty = steensgaard.var_ty(steensgaard.global(local_def_id));
-                    fn_ty_functions
-                        .entry(ty.fn_ty)
-                        .or_default()
-                        .push(local_def_id);
                     tcx.optimized_mir(local_def_id)
                 }
                 ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
@@ -146,7 +136,7 @@ impl Pass for FileAnalysis {
                     let adt_def = tcx.adt_def(item.owner_id);
                     for (i, fd) in adt_def.variant(FIRST_VARIANT).fields.iter_enumerated() {
                         let ty = fd.ty(tcx, List::empty());
-                        if contains_file_ty(ty, tcx) {
+                        if compile_util::contains_file_ty(ty, tcx) {
                             locs.push(Loc::Field(local_def_id, i));
                         }
                     }
@@ -164,7 +154,7 @@ impl Pass for FileAnalysis {
             //     }
             // }
             for (i, local_decl) in body.local_decls.iter_enumerated() {
-                if contains_file_ty(local_decl.ty, tcx) {
+                if compile_util::contains_file_ty(local_decl.ty, tcx) {
                     let loc = Loc::Var(local_def_id, i);
                     locs.push(loc);
                     // if !stdio_arg_locs.contains(&loc) {
@@ -174,9 +164,6 @@ impl Pass for FileAnalysis {
             }
         }
 
-        for (i, fs) in &fn_ty_functions {
-            tracing::info!("{:?}: {:?}", i, fs);
-        }
         for (i, loc) in locs.iter_enumerated() {
             tracing::info!("{:?}: {:?}", i, loc);
         }
@@ -192,8 +179,6 @@ impl Pass for FileAnalysis {
         let mut analyzer = Analyzer {
             tcx,
             popen_read,
-            steensgaard: &steensgaard,
-            fn_ty_functions,
             unsupported_printf_spans: &unsupported_printf_spans,
             // stdio_arg_locs,
             loc_ind_map: &loc_ind_map,
@@ -246,7 +231,10 @@ impl Pass for FileAnalysis {
                 || permissions.contains(Permission::Read)
                     && (origins.contains(Origin::Stdout) || origins.contains(Origin::Stderr))
             {
-                println!("{:?}: {:?}, {:?}", loc, permissions, origins);
+                println!(
+                    "Unsupported permission {:?}: {:?}, {:?}",
+                    loc, permissions, origins
+                );
                 analyzer.unsupported.add(i);
             }
         }
@@ -299,9 +287,7 @@ struct Analyzer<'a, 'tcx> {
     popen_read: FxHashMap<Span, bool>,
     // stdio_arg_locs: FxHashSet<Loc>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
-    fn_ty_functions: FxHashMap<steensgaard::FnId, Vec<LocalDefId>>,
     unsupported_printf_spans: &'a FxHashSet<Span>,
-    steensgaard: &'a steensgaard::AnalysisResult,
     permission_graph: Graph<LocId, Permission>,
     origin_graph: Graph<LocId, Origin>,
     unsupported: UnsupportedTracker<'a>,
@@ -321,19 +307,19 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         match r {
             Rvalue::Cast(CastKind::PtrToPtr | CastKind::Transmute, op, _) => {
                 let rty = op.ty(ctx.local_decls, self.tcx);
-                match (variance, contains_file_ty(rty, self.tcx)) {
+                match (variance, compile_util::contains_file_ty(rty, self.tcx)) {
                     (Some(variance), true) => {
                         let l = self.transfer_place(*l, ctx);
                         let r = self.transfer_operand(op, ctx);
                         self.assign(l, r, variance);
                     }
                     (Some(_), false) => {
-                        println!("{:?}", rty);
+                        println!("Unsupported ptr cast {:?}", rty);
                         let l = self.transfer_place(*l, ctx);
                         self.unsupported.add(l);
                     }
                     (None, true) => {
-                        println!("{:?}", ty);
+                        println!("Unsupported ptr cast {:?}", ty);
                         let r = self.transfer_operand(op, ctx);
                         self.unsupported.add(r);
                     }
@@ -349,28 +335,51 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     }) = op
                     {
                         if i.to_int(i.size()) != 0 {
-                            self.print_code(stmt.source_info.span);
+                            self.print_code("provenance cast", stmt.source_info.span);
                             self.unsupported.add(l);
                         }
                     } else {
-                        self.print_code(stmt.source_info.span);
+                        self.print_code("provenance cast", stmt.source_info.span);
                         self.unsupported.add(l);
                     }
                 }
             }
             Rvalue::Cast(CastKind::PointerExposeProvenance, op, _) => {
                 let rty = op.ty(ctx.local_decls, self.tcx);
-                if contains_file_ty(rty, self.tcx) {
+                if compile_util::contains_file_ty(rty, self.tcx) {
                     let r = self.transfer_operand(op, ctx);
                     self.unsupported.add(r);
-                    self.print_code(stmt.source_info.span);
+                    self.print_code("provenance cast", stmt.source_info.span);
+                }
+            }
+            Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer, _), op, _) => {
+                if let Some(variance) = variance {
+                    let Const::Val(value, ty) = op.constant().unwrap().const_ else { panic!() };
+                    assert_eq!(value, ConstValue::ZeroSized);
+                    let TyKind::FnDef(def_id, _) = ty.kind() else { panic!() };
+                    let def_id = def_id.expect_local();
+                    let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
+                    let l = self.transfer_place(*l, ctx);
+                    for (i, ty) in sig.inputs().iter().enumerate() {
+                        if compile_util::contains_file_ty(*ty, self.tcx) {
+                            let node = self.tcx.hir_node_by_def_id(def_id);
+                            if matches!(node, Node::ForeignItem(_)) {
+                                self.unsupported.add(l);
+                                self.print_code("api fn ptr", stmt.source_info.span);
+                            } else {
+                                let r = Loc::Var(def_id, Local::new(i + 1));
+                                let r = self.loc_ind_map[&r];
+                                self.assign(l, r, variance);
+                            }
+                        }
+                    }
                 }
             }
             Rvalue::Cast(kind, op, _) => {
                 assert!(variance.is_none(), "{:?} {:?}", kind, stmt.source_info.span);
                 let rty = op.ty(ctx.local_decls, self.tcx);
                 assert!(
-                    !contains_file_ty(rty, self.tcx),
+                    !compile_util::contains_file_ty(rty, self.tcx),
                     "{:?} {:?}",
                     kind,
                     stmt.source_info.span
@@ -378,8 +387,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
             Rvalue::BinaryOp(op, box (op1, op2)) => {
                 let ty = op1.ty(ctx.local_decls, self.tcx);
-                if contains_file_ty(ty, self.tcx) {
-                    println!("{:?}", op);
+                if compile_util::contains_file_ty(ty, self.tcx) {
+                    println!("Unsupported op {:?}", op);
                     let op1 = self.transfer_operand(op1, ctx);
                     self.unsupported.add(op1);
                     let op2 = self.transfer_operand(op2, ctx);
@@ -387,24 +396,35 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 }
             }
             Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, field_idx), fields) => {
-                assert!(variance.is_none());
-                if self.tcx.adt_def(def_id).is_union() {
-                    let f = &fields[FieldIdx::from_u32(0)];
-                    let ty = f.ty(ctx.local_decls, self.tcx);
-                    if let Some(variance) = file_type_variance(ty, self.tcx) {
-                        let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
-                        let l = self.loc_ind_map[&l];
-                        let r = self.transfer_operand(f, ctx);
-                        self.assign(l, r, variance);
+                if compile_util::is_option_ty(def_id, self.tcx) {
+                    if !fields.is_empty() {
+                        if let Some(variance) = variance {
+                            let l = self.transfer_place(*l, ctx);
+                            let [f] = &fields.as_slice().raw else { panic!() };
+                            let r = self.transfer_operand(f, ctx);
+                            self.assign(l, r, variance);
+                        }
                     }
                 } else {
-                    for (idx, f) in fields.iter_enumerated() {
+                    assert!(variance.is_none());
+                    if self.tcx.adt_def(def_id).is_union() {
+                        let f = &fields[FieldIdx::from_u32(0)];
                         let ty = f.ty(ctx.local_decls, self.tcx);
                         if let Some(variance) = file_type_variance(ty, self.tcx) {
-                            let l = Loc::Field(def_id.expect_local(), idx);
+                            let l = Loc::Field(def_id.expect_local(), field_idx.unwrap());
                             let l = self.loc_ind_map[&l];
                             let r = self.transfer_operand(f, ctx);
                             self.assign(l, r, variance);
+                        }
+                    } else {
+                        for (idx, f) in fields.iter_enumerated() {
+                            let ty = f.ty(ctx.local_decls, self.tcx);
+                            if let Some(variance) = file_type_variance(ty, self.tcx) {
+                                let l = Loc::Field(def_id.expect_local(), idx);
+                                let l = self.loc_ind_map[&l];
+                                let r = self.transfer_operand(f, ctx);
+                                self.assign(l, r, variance);
+                            }
                         }
                     }
                 }
@@ -502,19 +522,22 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         match func {
             Operand::Copy(callee) | Operand::Move(callee) => {
                 assert!(callee.projection.is_empty());
-                let ty = self
-                    .steensgaard
-                    .var_ty(self.steensgaard.local(ctx.function, callee.local));
-                if let Some(callees) = self.fn_ty_functions.get(&ty.fn_ty) {
-                    for callee in callees.clone() {
-                        assert!(!is_def_id_api(callee, self.tcx));
-                        self.transfer_non_api_call(
-                            callee,
-                            args,
-                            *destination,
-                            term.source_info.span,
-                            ctx,
-                        );
+                let ty = callee.ty(ctx.local_decls, self.tcx).ty;
+                let TyKind::FnPtr(binder, _) = ty.kind() else { panic!() };
+                let arity = binder.as_ref().skip_binder().inputs().len();
+                for (i, arg) in args.iter().enumerate() {
+                    let ty = arg.node.ty(ctx.local_decls, self.tcx);
+                    if i < arity {
+                        if let Some(variance) = file_type_variance(ty, self.tcx) {
+                            let l = Loc::Var(ctx.function, callee.local);
+                            let l = self.loc_ind_map[&l];
+                            let r = self.transfer_operand(&arg.node, ctx);
+                            self.assign(l, r, variance);
+                        }
+                    } else if compile_util::contains_file_ty(ty, self.tcx) {
+                        let arg = self.transfer_operand(&arg.node, ctx);
+                        self.unsupported.add(arg);
+                        self.print_code("var arg", term.source_info.span);
                     }
                 }
             }
@@ -529,7 +552,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             if let Some(origin) = origin {
                                 self.add_origin(x, origin);
                             } else {
-                                println!("{:?}", def_id);
+                                println!("Unsupported open {:?}", def_id);
                                 self.unsupported.add(x);
                             }
                         }
@@ -543,7 +566,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 };
                                 self.add_origin(x, origin);
                             } else {
-                                self.print_code(term.source_info.span);
+                                self.print_code("pipe", term.source_info.span);
                                 self.unsupported.add(x);
                             }
                         }
@@ -552,11 +575,11 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 .unsupported_printf_spans
                                 .contains(&term.source_info.span);
                             if unsupported {
-                                self.print_code(term.source_info.span);
+                                self.print_code("printf", term.source_info.span);
                             }
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
-                                if contains_file_ty(*t, self.tcx) {
+                                if compile_util::contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(&arg.node, ctx);
                                     if unsupported {
                                         self.unsupported.add(x);
@@ -568,10 +591,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             }
                         }
                         ApiKind::Unsupported => {
-                            println!("{:?}", def_id);
+                            println!("Unsupported api {:?}", def_id);
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
-                                if contains_file_ty(*t, self.tcx) {
+                                if compile_util::contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(&arg.node, ctx);
                                     self.unsupported.add(x);
                                     break;
@@ -593,13 +616,24 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     );
                 } else {
                     let name = compile_util::def_id_to_value_symbol(def_id, self.tcx).unwrap();
-                    if name.as_str() == "arg" {
-                        let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;
-                        if contains_file_ty(ty, self.tcx) {
-                            let x = self.transfer_place(*destination, ctx);
-                            self.unsupported.add(x);
-                            self.print_code(term.source_info.span);
+                    match name.as_str() {
+                        "arg" => {
+                            let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;
+                            if compile_util::contains_file_ty(ty, self.tcx) {
+                                let x = self.transfer_place(*destination, ctx);
+                                self.unsupported.add(x);
+                                self.print_code("var param", term.source_info.span);
+                            }
                         }
+                        "unwrap" => {
+                            let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;
+                            if let Some(variance) = file_type_variance(ty, self.tcx) {
+                                let l = self.transfer_place(*destination, ctx);
+                                let r = self.transfer_operand(&args[0].node, ctx);
+                                self.assign(l, r, variance);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -625,10 +659,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     let r = self.transfer_operand(&arg.node, ctx);
                     self.assign(l, r, variance);
                 }
-            } else if contains_file_ty(ty, self.tcx) {
+            } else if compile_util::contains_file_ty(ty, self.tcx) {
                 let arg = self.transfer_operand(&arg.node, ctx);
                 self.unsupported.add(arg);
-                self.print_code(span);
+                self.print_code("var arg", span);
             }
         }
         if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
@@ -659,6 +693,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 self.permission_graph.add_edge(lhs, rhs);
                 self.origin_graph.add_edge(rhs, lhs);
             }
+            Variance::Contravariant => {
+                self.permission_graph.add_edge(rhs, lhs);
+                self.origin_graph.add_edge(lhs, rhs);
+            }
             Variance::Invariant => {
                 self.permission_graph.add_edge(lhs, rhs);
                 self.permission_graph.add_edge(rhs, lhs);
@@ -673,16 +711,16 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         }
     }
 
-    fn print_code(&self, span: Span) {
-        println!(
-            "{}",
-            self.tcx
-                .sess
-                .source_map()
-                .span_to_snippet(span)
-                .unwrap()
-                .replace('\n', " ")
-        );
+    fn print_code(&self, msg: &str, span: Span) {
+        let code = self
+            .tcx
+            .sess
+            .source_map()
+            .span_to_snippet(span)
+            .unwrap()
+            .replace('\n', " ");
+        let re = Regex::new(r"\s+").unwrap();
+        println!("Unsupported {} {}", msg, re.replace_all(&code, " "));
     }
 }
 
@@ -690,29 +728,60 @@ impl<'tcx> Analyzer<'_, 'tcx> {
 enum Variance {
     Covariant,
     Invariant,
+    Contravariant,
+}
+
+impl std::ops::Not for Variance {
+    type Output = Self;
+
+    fn not(self) -> Self::Output {
+        match self {
+            Variance::Covariant => Variance::Contravariant,
+            Variance::Invariant => Variance::Invariant,
+            Variance::Contravariant => Variance::Covariant,
+        }
+    }
 }
 
 fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance> {
-    match ty.kind() {
+    let v = match ty.kind() {
         TyKind::RawPtr(ty, mutbl) | TyKind::Ref(_, ty, mutbl) => {
             if let TyKind::Adt(adt_def, _) = ty.kind() {
-                if is_file_ty(adt_def.did(), tcx) {
-                    Some(Variance::Covariant)
-                } else {
-                    None
+                if compile_util::is_file_ty(adt_def.did(), tcx) {
+                    return Some(Variance::Covariant);
                 }
+            }
+            let v = file_type_variance(*ty, tcx)?;
+            if mutbl.is_not() {
+                Some(v)
             } else {
-                let v = file_type_variance(*ty, tcx)?;
-                if mutbl.is_not() {
-                    Some(v)
-                } else {
-                    Some(Variance::Invariant)
-                }
+                Some(Variance::Invariant)
             }
         }
         TyKind::Array(ty, _) | TyKind::Slice(ty) => file_type_variance(*ty, tcx),
+        TyKind::Adt(adt_def, targs) => {
+            if compile_util::is_option_ty(adt_def.did(), tcx) {
+                let targs = targs.into_type_list(tcx);
+                file_type_variance(targs[0], tcx)
+            } else {
+                None
+            }
+        }
+        TyKind::FnPtr(binder, _) => binder
+            .as_ref()
+            .skip_binder()
+            .inputs()
+            .iter()
+            .find_map(|ty| file_type_variance(*ty, tcx).map(|v| !v)),
         _ => None,
-    }
+    };
+    assert_eq!(
+        v.is_some(),
+        compile_util::contains_file_ty(ty, tcx),
+        "{:?}",
+        ty
+    );
+    v
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

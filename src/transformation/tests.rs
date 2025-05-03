@@ -1932,6 +1932,46 @@ unsafe fn f(mut x: libc::c_int) {
     );
 }
 
+#[test]
+fn test_fn_ptr_void_arg() {
+    run_test(
+        r#"
+static mut h: Option::<unsafe fn(*mut FILE) -> ()> = None;
+unsafe fn g(mut stream: *mut FILE) {
+    fgetc(stream);
+    getchar();
+}
+unsafe fn f(mut p: *mut libc::c_void) {
+    h = Some(g as unsafe fn(*mut FILE) -> ());
+    let mut stream: *mut FILE = p as *mut FILE;
+    h.unwrap()(p as *mut FILE);
+}"#,
+        &["Read", "read_exact", "fgetc", "FILE"],
+        &["getchar"],
+    );
+}
+
+#[test]
+fn test_api_fn_ptr() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut g: Option::<unsafe extern "C" fn(*mut FILE) -> libc::c_int> = Some(
+        fgetc as unsafe extern "C" fn(*mut FILE) -> libc::c_int,
+    );
+    g.unwrap()(stream);
+    fclose(stream);
+    getchar();
+}"#,
+        &["Read", "read_exact", "fgetc", "fclose", "FILE"],
+        &["getchar"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

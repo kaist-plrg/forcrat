@@ -14,6 +14,7 @@ lazy_static = "1.5.0"
 typed-arena = "2.0.2"
 toml = "0.8.20"
 toml_edit = "0.22.24"
+regex = "1.11.1"
 
 [package.metadata.rust-analyzer]
 rustc_private = true
