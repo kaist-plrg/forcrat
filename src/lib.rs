@@ -65,3 +65,4 @@ pub mod retval_use_counter;
 pub mod steensgaard;
 pub mod transformation;
 pub mod ty_checker;
+pub mod ty_finder;

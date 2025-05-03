@@ -267,6 +267,13 @@ pub fn def_id_to_value_symbol(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -
     Some(name)
 }
 
+#[inline]
+pub fn def_id_to_ty_symbol(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> Option<Symbol> {
+    let key = tcx.def_key(id);
+    let DefPathData::TypeNs(name) = key.disambiguated_data.data else { return None };
+    Some(name)
+}
+
 pub fn is_std_io_expr<'tcx>(expr: &Expr<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind else { return false };
     let Res::Def(DefKind::Static { .. }, def_id) = path.res else { return false };
