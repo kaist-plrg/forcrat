@@ -108,14 +108,6 @@ impl Pass for FileAnalysis {
             tracing::info!("{:?}", def_id);
         }
 
-        // let mut visitor = StdioArgVisitor::new(tcx);
-        // hir.visit_all_item_likes_in_crate(&mut visitor);
-        // let stdio_args = visitor.stdio_args;
-        // for span in &stdio_args {
-        //     tracing::info!("{:?}", span);
-        // }
-        // let mut stdio_arg_locs: FxHashSet<Loc> = FxHashSet::default();
-
         let mut locs: IndexVec<LocId, Loc> =
             IndexVec::from_raw(vec![Loc::Stdin, Loc::Stdout, Loc::Stderr]);
 
@@ -144,22 +136,10 @@ impl Pass for FileAnalysis {
                 }
                 _ => continue,
             };
-            // for bbd in body.basic_blocks.iter() {
-            //     for stmt in &bbd.statements {
-            //         if stdio_args.contains(&stmt.source_info.span) {
-            //             let StatementKind::Assign(box (l, _)) = stmt.kind else { continue };
-            //             assert!(l.projection.is_empty());
-            //             stdio_arg_locs.insert(Loc::Var(local_def_id, l.local));
-            //         }
-            //     }
-            // }
             for (i, local_decl) in body.local_decls.iter_enumerated() {
                 if compile_util::contains_file_ty(local_decl.ty, tcx) {
                     let loc = Loc::Var(local_def_id, i);
                     locs.push(loc);
-                    // if !stdio_arg_locs.contains(&loc) {
-                    //     locs.push(loc);
-                    // }
                 }
             }
         }
@@ -180,7 +160,6 @@ impl Pass for FileAnalysis {
             tcx,
             popen_read,
             unsupported_printf_spans: &unsupported_printf_spans,
-            // stdio_arg_locs,
             loc_ind_map: &loc_ind_map,
             permission_graph,
             origin_graph,
@@ -285,7 +264,6 @@ pub fn is_popen_read(arg: &LikelyLit<'_>) -> Option<bool> {
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     popen_read: FxHashMap<Span, bool>,
-    // stdio_arg_locs: FxHashSet<Loc>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     unsupported_printf_spans: &'a FxHashSet<Span>,
     permission_graph: Graph<LocId, Permission>,
@@ -469,11 +447,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             || place.projection.len() == 1 && place.is_indirect_first_projection()
         {
             Loc::Var(ctx.function, place.local)
-            // let loc = Loc::Var(ctx.function, place.local);
-            // if self.stdio_arg_locs.contains(&loc) {
-            //     return None;
-            // }
-            // loc
         } else {
             let (last, init) = place.projection.split_last().unwrap();
             let ty = Place::ty_from(place.local, init, ctx.local_decls, self.tcx).ty;
@@ -1044,49 +1017,6 @@ impl<'a> UnsupportedTracker<'a> {
         unsupported
     }
 }
-
-// struct StdioArgVisitor<'tcx> {
-//     tcx: TyCtxt<'tcx>,
-//     stdio_args: FxHashSet<Span>,
-// }
-
-// impl<'tcx> StdioArgVisitor<'tcx> {
-//     #[inline]
-//     fn new(tcx: TyCtxt<'tcx>) -> Self {
-//         Self {
-//             tcx,
-//             stdio_args: FxHashSet::default(),
-//         }
-//     }
-
-//     #[inline]
-//     fn handle_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-//         let ExprKind::Call(callee, args) = expr.kind else { return };
-//         let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return };
-//         let Res::Def(DefKind::Fn, def_id) = path.res else { return };
-//         if !is_def_id_api(def_id, self.tcx) {
-//             return;
-//         }
-//         for arg in args {
-//             if is_std_io_expr(arg, self.tcx) {
-//                 self.stdio_args.insert(arg.span);
-//             }
-//         }
-//     }
-// }
-
-// impl<'tcx> intravisit::Visitor<'tcx> for StdioArgVisitor<'tcx> {
-//     type NestedFilter = nested_filter::OnlyBodies;
-
-//     fn nested_visit_map(&mut self) -> Self::Map {
-//         self.tcx.hir()
-//     }
-
-//     fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-//         self.handle_expr(expr);
-//         intravisit::walk_expr(self, expr);
-//     }
-// }
 
 #[derive(Default)]
 struct AstVisitor<'ast> {
