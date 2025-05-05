@@ -4,25 +4,25 @@ use etrace::some_or;
 use hir::{intravisit, HirId};
 use rustc_ast::{mut_visit::MutVisitor, ptr::P, *};
 use rustc_ast_pretty::pprust;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir,
     def::{DefKind, Res},
     QPath,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
-use rustc_span::{FileName, RealFileName, Span};
+use rustc_span::{FileName, RealFileName, Span, Symbol};
 
 use crate::{
     api_list,
-    ast_maker::parse_expr,
+    ast_maker::*,
     compile_util::{self, Pass},
 };
 
 pub fn write_to_files(res: &PreprocessResult) {
     for (f, s) in &res.files {
         let FileName::Real(RealFileName::LocalPath(p)) = f else { panic!() };
-        println!("{:?}", p);
+        tracing::info!("{:?}", p);
         std::fs::write(p, s).unwrap();
     }
 }
@@ -44,11 +44,34 @@ impl Pass for Preprocessor {
             call_span_to_if_args: FxHashMap::default(),
             call_span_to_args: FxHashMap::default(),
             call_span_to_nested_args: FxHashMap::default(),
+            params: FxHashMap::default(),
+            rhs_to_lhs: FxHashMap::default(),
+            used_vars: FxHashSet::default(),
+            bound_occurrences: FxHashMap::default(),
+            address_taken_vars: FxHashSet::default(),
         };
         tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
+        let mut lets_to_replace = FxHashSet::default();
+        let mut vars_to_replace = FxHashMap::default();
+        for (rhs, lhs) in visitor.rhs_to_lhs {
+            if lhs.len() > 1 || visitor.used_vars.contains(&rhs) {
+                continue;
+            }
+            let name = some_or!(visitor.params.get(&rhs), continue);
+            let (lhs, let_span) = lhs[0];
+            if visitor.address_taken_vars.contains(&lhs) {
+                continue;
+            }
+            lets_to_replace.insert(let_span);
+            let bounds = some_or!(visitor.bound_occurrences.get(&lhs), continue);
+            for span in bounds {
+                vars_to_replace.insert(*span, *name);
+            }
+        }
+
         let source_map = tcx.sess.source_map();
-        let parse_sess = crate::ast_maker::new_parse_sess();
+        let parse_sess = new_parse_sess();
         let mut files = vec![];
 
         for file in source_map.files().iter() {
@@ -69,6 +92,8 @@ impl Pass for Preprocessor {
             let mut visitor = PreprocessVisitor {
                 call_span_to_if_args: &visitor.call_span_to_if_args,
                 call_span_to_nested_args: &visitor.call_span_to_nested_args,
+                lets_to_replace: &lets_to_replace,
+                vars_to_replace: &vars_to_replace,
                 updated: false,
             };
             visitor.visit_crate(&mut krate);
@@ -90,9 +115,21 @@ struct BoundOccurrence {
 
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
+
     call_span_to_args: FxHashMap<HirId, Vec<(Span, Vec<BoundOccurrence>)>>,
     call_span_to_nested_args: FxHashMap<Span, Vec<usize>>,
     call_span_to_if_args: FxHashMap<Span, Vec<usize>>,
+
+    /// function param hir_id to ident symbol
+    params: FxHashMap<HirId, Symbol>,
+    /// let stmt rhs variable hir_id to lhs variable hir_id and let stmt span
+    rhs_to_lhs: FxHashMap<HirId, Vec<(HirId, Span)>>,
+    /// hir_ids of variables used, excluding let stmt rhs
+    used_vars: FxHashSet<HirId>,
+    /// variable hir_id to bound occurrence spans
+    bound_occurrences: FxHashMap<HirId, Vec<Span>>,
+    /// hir_ids of address-taken variables
+    address_taken_vars: FxHashSet<HirId>,
 }
 
 impl HirVisitor<'_> {
@@ -117,6 +154,30 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
         self.tcx
+    }
+
+    fn visit_local(&mut self, let_stmt: &'tcx hir::LetStmt<'tcx>) {
+        intravisit::walk_local(self, let_stmt);
+
+        let hir::PatKind::Binding(_, lhs_id, _, _) = let_stmt.pat.kind else { return };
+        let init = some_or!(let_stmt.init, return);
+        let hir::ExprKind::Path(QPath::Resolved(_, path)) = init.kind else { return };
+        let Res::Local(rhs_id) = path.res else { return };
+        let typeck = self.tcx.typeck(let_stmt.hir_id.owner.def_id);
+        let ty = typeck.expr_ty(init);
+        if compile_util::contains_file_ty(ty, self.tcx) {
+            self.rhs_to_lhs
+                .entry(rhs_id)
+                .or_default()
+                .push((lhs_id, let_stmt.span));
+        }
+    }
+
+    fn visit_param(&mut self, param: &'tcx hir::Param<'tcx>) {
+        intravisit::walk_param(self, param);
+
+        let hir::PatKind::Binding(_, id, ident, _) = param.pat.kind else { return };
+        self.params.insert(id, ident.name);
     }
 
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
@@ -160,6 +221,16 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                                 }
                             }
                         }
+
+                        self.bound_occurrences
+                            .entry(hir_id)
+                            .or_default()
+                            .push(expr.span);
+
+                        let (_, parent) = self.tcx.hir().parent_iter(expr.hir_id).next().unwrap();
+                        if !matches!(parent, hir::Node::LetStmt(_)) {
+                            self.used_vars.insert(hir_id);
+                        }
                     }
                 }
             }
@@ -168,35 +239,43 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
         intravisit::walk_expr(self, expr);
 
-        if let hir::ExprKind::Call(_, args) = expr.kind {
-            let arg_bound_ids = self.call_span_to_args.remove(&expr.hir_id).unwrap();
-            let nested_args: Vec<_> = arg_bound_ids
-                .iter()
-                .enumerate()
-                .filter_map(|(i, (_, ids))| {
-                    for boi in ids {
-                        if self.find_call_parent(boi.expr_id) == expr.hir_id {
-                            continue;
-                        }
-                        for ((_, ids), arg) in arg_bound_ids.iter().zip(args) {
-                            if !matches!(arg.kind, hir::ExprKind::Path(QPath::Resolved(_, _))) {
-                                continue;
-                            }
-                            if ids.is_empty() {
-                                continue;
-                            }
-                            let [boj] = &ids[..] else { panic!() };
-                            if boi.var_id == boj.var_id {
-                                return Some(i);
-                            }
-                        }
-                    }
-                    None
-                })
-                .collect();
-            if !nested_args.is_empty() {
-                self.call_span_to_nested_args.insert(expr.span, nested_args);
+        match expr.kind {
+            hir::ExprKind::AddrOf(_, _, e) => {
+                let hir::ExprKind::Path(QPath::Resolved(_, path)) = e.kind else { return };
+                let Res::Local(hir_id) = path.res else { return };
+                self.address_taken_vars.insert(hir_id);
             }
+            hir::ExprKind::Call(_, args) => {
+                let arg_bound_ids = self.call_span_to_args.remove(&expr.hir_id).unwrap();
+                let nested_args: Vec<_> = arg_bound_ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (_, ids))| {
+                        for boi in ids {
+                            if self.find_call_parent(boi.expr_id) == expr.hir_id {
+                                continue;
+                            }
+                            for ((_, ids), arg) in arg_bound_ids.iter().zip(args) {
+                                if !matches!(arg.kind, hir::ExprKind::Path(QPath::Resolved(_, _))) {
+                                    continue;
+                                }
+                                if ids.is_empty() {
+                                    continue;
+                                }
+                                let [boj] = &ids[..] else { panic!() };
+                                if boi.var_id == boj.var_id {
+                                    return Some(i);
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                if !nested_args.is_empty() {
+                    self.call_span_to_nested_args.insert(expr.span, nested_args);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -204,29 +283,63 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 struct PreprocessVisitor<'a> {
     call_span_to_if_args: &'a FxHashMap<Span, Vec<usize>>,
     call_span_to_nested_args: &'a FxHashMap<Span, Vec<usize>>,
+    lets_to_replace: &'a FxHashSet<Span>,
+    vars_to_replace: &'a FxHashMap<Span, Symbol>,
     updated: bool,
 }
 
 impl MutVisitor for PreprocessVisitor<'_> {
-    fn visit_expr(&mut self, expr: &mut P<Expr>) {
-        if let ExprKind::If(c, t, f) = &mut expr.kind {
-            if let Some(Value::Bool(b)) = eval_expr(c) {
-                self.updated = true;
-                if b {
-                    let e = Expr {
-                        id: DUMMY_NODE_ID,
-                        kind: ExprKind::Block(t.clone(), None),
-                        span: expr.span,
-                        attrs: expr.attrs.clone(),
-                        tokens: expr.tokens.clone(),
-                    };
-                    *expr = P(e);
-                } else if let Some(f) = f {
-                    *expr = f.clone();
-                } else {
-                    *expr = P(expr!("()"));
+    fn visit_block(&mut self, b: &mut P<Block>) {
+        let mut assert = false;
+        for stmt in &mut b.stmts {
+            if assert {
+                assert = false;
+                let StmtKind::Semi(e) = &mut stmt.kind else { continue };
+                let ExprKind::Block(b, Some(_)) = &mut e.kind else { continue };
+                let [stmt] = &b.stmts[..] else { continue };
+                if is_assert_stmt(stmt) {
+                    self.updated = true;
+                    b.stmts.clear();
+                }
+            } else {
+                assert = is_assert_stmt(stmt);
+                if self.lets_to_replace.contains(&stmt.span) {
+                    self.updated = true;
+                    *stmt = stmt!("{{}}");
                 }
             }
+        }
+        mut_visit::walk_block(self, b);
+    }
+
+    fn visit_expr(&mut self, expr: &mut P<Expr>) {
+        match &mut expr.kind {
+            ExprKind::Path(_, _) => {
+                if let Some(name) = self.vars_to_replace.get(&expr.span) {
+                    self.updated = true;
+                    **expr = expr!("{}", name);
+                }
+            }
+            ExprKind::If(c, t, f) => {
+                if let Some(Value::Bool(b)) = eval_expr(c) {
+                    self.updated = true;
+                    if b {
+                        let e = Expr {
+                            id: DUMMY_NODE_ID,
+                            kind: ExprKind::Block(t.clone(), None),
+                            span: expr.span,
+                            attrs: expr.attrs.clone(),
+                            tokens: expr.tokens.clone(),
+                        };
+                        *expr = P(e);
+                    } else if let Some(f) = f {
+                        *expr = f.clone();
+                    } else {
+                        *expr = P(expr!("()"));
+                    }
+                }
+            }
+            _ => {}
         }
         mut_visit::walk_expr(self, expr);
         let expr_span = expr.span;
@@ -253,25 +366,6 @@ impl MutVisitor for PreprocessVisitor<'_> {
                 **expr = expr!("{}", new_expr);
             }
         }
-    }
-
-    fn visit_block(&mut self, b: &mut P<Block>) {
-        let mut assert = false;
-        for stmt in &mut b.stmts {
-            if assert {
-                assert = false;
-                let StmtKind::Semi(e) = &mut stmt.kind else { continue };
-                let ExprKind::Block(b, Some(_)) = &mut e.kind else { continue };
-                let [stmt] = &b.stmts[..] else { continue };
-                if is_assert_stmt(stmt) {
-                    self.updated = true;
-                    b.stmts.clear();
-                }
-            } else {
-                assert = is_assert_stmt(stmt);
-            }
-        }
-        mut_visit::walk_block(self, b);
     }
 }
 
