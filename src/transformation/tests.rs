@@ -1972,6 +1972,21 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_flockfile() {
+    run_test(
+        r#"
+unsafe fn f() {
+    flockfile(stderr);
+    fputc('a' as i32, stderr);
+    fputc('b' as i32, stderr);
+    funlockfile(stderr);
+}"#,
+        &["Write", "write_all", "lock", "drop"],
+        &["flockfile", "fputc", "funlockfile"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

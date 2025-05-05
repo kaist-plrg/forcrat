@@ -233,7 +233,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 let name = api_list::normalize_api_name(name.as_str());
                 let i = match name {
                     "fscanf" | "fgetc" | "getc" | "fprintf" | "fflush" | "feof" | "ferror"
-                    | "clearerr" => 0,
+                    | "clearerr" | "flockfile" | "funlockfile" => 0,
                     "fputc" | "putc" | "fputwc" | "putwc" | "fputs" => 1,
                     "fgets" | "getline" => 2,
                     "fread" | "getdelim" | "fwrite" => 3,

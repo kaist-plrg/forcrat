@@ -372,6 +372,7 @@ impl Pass for Transformation {
                 tmpfile: false,
                 current_fn: None,
                 bounds: vec![],
+                guards: FxHashSet::default(),
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {

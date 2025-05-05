@@ -60,6 +60,7 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) tmpfile: bool,
     pub(super) current_fn: Option<LocalDefId>,
     pub(super) bounds: Vec<TraitBound>,
+    pub(super) guards: FxHashSet<Symbol>,
 }
 
 fn remove_cast(expr: &Expr) -> &Expr {
@@ -333,6 +334,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         let stmt = stmt!("let mut {}_error = 0;", error);
                         stmts.insert(0, stmt);
                     }
+                }
+                for name in self.guards.drain() {
+                    let stmts = &mut item.body.as_mut().unwrap().stmts;
+                    let stmt = stmt!("let mut {}_guard;", name);
+                    stmts.insert(0, stmt);
                 }
             }
             ItemKind::Struct(_, _) | ItemKind::Union(_, _) => {
@@ -707,6 +713,25 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         let ty = self.bound_pot(args[0].span).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let new_expr = transform_fileno(&stream);
+                        self.replace_expr(expr, new_expr);
+                    }
+                    "flockfile" => {
+                        if self.is_unsupported(&args[0]) {
+                            return;
+                        }
+                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
+                        let name = self.hir.callee_span_to_stream_name[&callee.span];
+                        let new_expr = transform_flockfile(&stream, name);
+                        self.replace_expr(expr, new_expr);
+                        self.guards.insert(name);
+                    }
+                    "funlockfile" => {
+                        if self.is_unsupported(&args[0]) {
+                            return;
+                        }
+                        let name = self.hir.callee_span_to_stream_name[&callee.span];
+                        let new_expr = transform_funlockfile(name);
                         self.replace_expr(expr, new_expr);
                     }
                     _ => {
@@ -1857,7 +1882,7 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
     }}).map_or(-1, |_| 0)
 }}",
                 stream,
-                path.as_str(),
+                path,
                 off
             )
         }
@@ -1899,4 +1924,14 @@ fn transform_fileno<S: StreamExpr>(stream: &S) -> Expr {
 }}",
         stream
     )
+}
+
+#[inline]
+fn transform_flockfile<S: StreamExpr>(stream: &S, name: Symbol) -> Expr {
+    expr!("{}_guard = ({}).lock()", name, stream.expr())
+}
+
+#[inline]
+fn transform_funlockfile(name: Symbol) -> Expr {
+    expr!("drop({}_guard)", name)
 }
