@@ -17,7 +17,7 @@ use rustc_middle::{
     hir::nested_filter,
     mir::{
         AggregateKind, CastKind, Const, ConstOperand, ConstValue, Local, LocalDecl, Operand, Place,
-        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
+        PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
     },
     query::IntoQueryParam,
     ty::{adjustment::PointerCoercion, List, Ty, TyCtxt, TyKind},
@@ -443,16 +443,12 @@ impl<'tcx> Analyzer<'_, 'tcx> {
     }
 
     fn transfer_place(&self, place: Place<'tcx>, ctx: Ctx<'_, 'tcx>) -> LocId {
-        let loc = if place.projection.is_empty()
-            || place.projection.len() == 1 && place.is_indirect_first_projection()
-        {
-            Loc::Var(ctx.function, place.local)
-        } else {
-            let (last, init) = place.projection.split_last().unwrap();
+        let loc = if let Some((init, f)) = strip_index_projection(place.projection) {
             let ty = Place::ty_from(place.local, init, ctx.local_decls, self.tcx).ty;
             let def_id = ty.ty_adt_def().unwrap().did().expect_local();
-            let ProjectionElem::Field(f, _) = last else { panic!() };
-            Loc::Field(def_id, *f)
+            Loc::Field(def_id, f)
+        } else {
+            Loc::Var(ctx.function, place.local)
         };
         self.loc_ind_map[&loc]
     }
@@ -694,6 +690,24 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             .replace('\n', " ");
         let re = Regex::new(r"\s+").unwrap();
         println!("Unsupported {} {}", msg, re.replace_all(&code, " "));
+    }
+}
+
+fn strip_index_projection<'a, 'tcx>(
+    projection: &'a [PlaceElem<'tcx>],
+) -> Option<(&'a [PlaceElem<'tcx>], FieldIdx)> {
+    if projection.is_empty() {
+        return None;
+    }
+    let (last, init) = projection.split_last().unwrap();
+    match last {
+        PlaceElem::Deref => {
+            assert!(init.is_empty());
+            None
+        }
+        PlaceElem::Field(f, _) => Some((init, *f)),
+        PlaceElem::Index(_) => strip_index_projection(init),
+        _ => panic!("{:?}", projection),
     }
 }
 

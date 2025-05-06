@@ -2021,6 +2021,21 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_unsupported_array() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut stream: [*mut FILE; 1] = [0 as *mut FILE; 1];
+    stream[0 as libc::c_int as usize] = stdin;
+    fflush(stream[0 as libc::c_int as usize]);
+    putchar('a' as i32);
+}"#,
+        &["Write", "write_all", "FILE", "fflush"],
+        &["putchar"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
