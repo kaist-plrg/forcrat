@@ -31,6 +31,7 @@ use crate::{
 
 pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) tcx: TyCtxt<'tcx>,
+    pub(super) type_arena: &'a TypeArena<'a>,
     pub(super) analysis_res: &'a file_analysis::AnalysisResult,
     pub(super) hir: &'a HirCtx,
 
@@ -115,6 +116,24 @@ impl<'a> TransformVisitor<'_, 'a> {
     fn bound_pot(&self, span: Span) -> Option<Pot<'a>> {
         let loc = self.hir.bound_span_to_loc.get(&span)?;
         self.loc_to_pot.get(loc).copied()
+    }
+
+    fn bound_expr_pot(&self, expr: &Expr) -> Option<Pot<'a>> {
+        match &expr.kind {
+            ExprKind::AddrOf(BorrowKind::Ref, Mutability::Mut, e) => {
+                let mut pot = self.bound_expr_pot(e)?;
+                pot.ty = self.type_arena.ref_(pot.ty);
+                Some(pot)
+            }
+            ExprKind::Unary(UnOp::Deref, e) => {
+                let mut pot = self.bound_expr_pot(e)?;
+                let (StreamType::Ref(ty) | StreamType::Ptr(ty)) = pot.ty else { panic!() };
+                pot.ty = ty;
+                Some(pot)
+            }
+            ExprKind::Paren(e) => self.bound_pot(expr.span).or_else(|| self.bound_expr_pot(e)),
+            _ => self.bound_pot(expr.span),
+        }
     }
 
     #[inline]
@@ -213,7 +232,7 @@ impl<'a> TransformVisitor<'_, 'a> {
     fn convert_rhs(&mut self, rhs: &mut Expr, lhs_pot: Pot<'_>, consume: bool) {
         let rhs_span = rhs.span;
         let is_non_local = self.is_non_local(rhs_span);
-        if let Some(rhs_pot) = self.bound_pot(rhs.span) {
+        if let Some(rhs_pot) = self.bound_expr_pot(rhs) {
             let rhs_str = pprust::expr_to_string(rhs);
             let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, consume, is_non_local);
             let new_rhs = expr!("{}", new_rhs);
@@ -466,7 +485,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let is_non_local = self.is_non_local(args[0].span);
                         let new_expr = transform_fclose(&args[0], *ty, is_non_local);
                         self.replace_expr(expr, new_expr);
@@ -475,7 +494,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fscanf(&stream, &args[1], &args[2..], ic);
@@ -485,7 +504,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fgetc(&stream, ic);
@@ -504,7 +523,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[2]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[2].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
                         let stream = TypedExpr::new(&args[2], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fgets(&stream, &args[0], &args[1], ic);
@@ -514,7 +533,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[3]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[3].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                         let stream = TypedExpr::new(&args[3], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fread(&stream, &args[0], &args[1], &args[2], ic);
@@ -524,7 +543,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[3]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[3].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                         let stream = TypedExpr::new(&args[3], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr =
@@ -535,7 +554,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[2]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[2].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
                         let stream = TypedExpr::new(&args[2], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_getline(&stream, &args[0], &args[1], ic);
@@ -569,7 +588,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let retval_used = self.hir.retval_used_spans.contains(&expr_span);
                         let ic = self.indicator_check(callee.span);
@@ -629,7 +648,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[1]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[1].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                         let stream = TypedExpr::new(&args[1], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fputc(&stream, &args[0], ic);
@@ -648,7 +667,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[1]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[1].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                         let stream = TypedExpr::new(&args[1], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fputwc(&stream, &args[0], ic);
@@ -658,7 +677,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[1]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[1].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                         let stream = TypedExpr::new(&args[1], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fputs(&stream, &args[0], ic);
@@ -676,7 +695,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[3]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[3].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                         let stream = TypedExpr::new(&args[3], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fwrite(&stream, &args[0], &args[1], &args[2], ic);
@@ -686,7 +705,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let ic = self.indicator_check(callee.span);
                         let new_expr = transform_fflush(&stream, ic);
@@ -696,7 +715,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let new_expr = transform_fseek(&stream, &args[1], &args[2]);
                         self.replace_expr(expr, new_expr);
@@ -705,7 +724,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let new_expr = transform_ftell(&stream);
                         self.replace_expr(expr, new_expr);
@@ -714,7 +733,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let new_expr = transform_rewind(&stream);
                         self.replace_expr(expr, new_expr);
@@ -725,7 +744,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let new_expr = transform_fileno(&stream);
                         self.replace_expr(expr, new_expr);
@@ -734,7 +753,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
-                        let ty = self.bound_pot(args[0].span).unwrap().ty;
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let name = self.hir.callee_span_to_stream_name[&callee.span];
                         let new_expr = transform_flockfile(&stream, name);
@@ -806,7 +825,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if self.is_unsupported(receiver) {
                     return;
                 }
-                let ty = some_or!(self.bound_pot(receiver.span), return).ty;
+                let ty = some_or!(self.bound_expr_pot(receiver), return).ty;
                 match ty {
                     StreamType::ManuallyDrop(StreamType::Option(_)) | StreamType::Option(_) => {
                         self.replace_ident(&mut seg.ident, Ident::from_str("is_none"));
@@ -816,7 +835,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ExprKind::Assign(lhs, rhs, _) => {
-                let lhs_pot = some_or!(self.bound_pot(lhs.span), return);
+                let lhs_pot = some_or!(self.bound_expr_pot(lhs), return);
                 self.convert_rhs(rhs, lhs_pot, true);
             }
             ExprKind::Struct(se) => {

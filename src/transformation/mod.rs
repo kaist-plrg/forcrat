@@ -2,11 +2,15 @@ use std::{fmt::Write as _, fs};
 
 use etrace::some_or;
 use hir_ctx::*;
+use rustc_abi::FIRST_VARIANT;
 use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, HirId};
-use rustc_middle::{mir, ty::TyCtxt};
+use rustc_middle::{
+    mir,
+    ty::{List, TyCtxt},
+};
 use rustc_span::{def_id::LocalDefId, FileName, RealFileName, Span};
 use stream_ty::*;
 use toml_edit::DocumentMut;
@@ -212,15 +216,19 @@ impl Pass for Transformation {
                             } else {
                                 false
                             };
-                            (locs, LocCtx::new(is_generic, false, is_static_return))
+                            let body = tcx.optimized_mir(*def_id);
+                            let ty = body.local_decls[*local].ty;
+                            (locs, LocCtx::new(is_generic, false, is_static_return, ty))
                         }
                         hir::ItemKind::Static(_, _, _) => {
                             if *local != mir::Local::ZERO {
                                 continue;
                             }
+                            let body = tcx.mir_for_ctfe(*def_id);
+                            let ty = body.local_decls[*local].ty;
                             (
                                 vec![HirLoc::Global(*def_id)],
-                                LocCtx::new(false, false, false),
+                                LocCtx::new(false, false, false, ty),
                             )
                         }
                         _ => panic!(),
@@ -228,10 +236,12 @@ impl Pass for Transformation {
                 }
                 Loc::Field(def_id, field) => {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
+                    let adt_def = tcx.adt_def(*def_id);
+                    let ty = adt_def.variant(FIRST_VARIANT).fields[*field].ty(tcx, List::empty());
                     let is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _));
                     (
                         vec![HirLoc::Field(*def_id, *field)],
-                        LocCtx::new(false, is_union, false),
+                        LocCtx::new(false, is_union, false, ty),
                     )
                 }
                 _ => continue,
@@ -249,7 +259,7 @@ impl Pass for Transformation {
                     })
                 });
                 ctx.non_local_assign |= non_local_assign;
-                let ty = type_arena.make_ty(permissions, origins, ctx);
+                let ty = type_arena.make_ty(permissions, origins, ctx, tcx);
                 if !ty.is_copyable() {
                     if let HirLoc::Field(def_id, field) = hir_loc {
                         uncopiable.push((def_id, field));
@@ -369,6 +379,7 @@ impl Pass for Transformation {
             let mut visitor = TransformVisitor {
                 tcx,
 
+                type_arena: &type_arena,
                 analysis_res: &analysis_res,
                 hir: &hir_ctx,
                 param_to_loc: &param_to_hir_loc,

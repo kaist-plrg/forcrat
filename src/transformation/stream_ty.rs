@@ -4,11 +4,13 @@ use etrace::some_or;
 use rustc_ast::*;
 use rustc_ast_pretty::pprust;
 use rustc_index::Idx;
+use rustc_middle::ty::TyCtxt;
 use typed_arena::Arena;
 
 use crate::{
     api_list::{Origin, Permission},
     bit_set::BitSet8,
+    compile_util,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,19 +22,26 @@ pub(super) struct Pot<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct LocCtx {
+pub(super) struct LocCtx<'tcx> {
     pub is_generic: bool,
     pub is_union: bool,
     pub non_local_assign: bool,
+    pub ty: rustc_middle::ty::Ty<'tcx>,
 }
 
-impl LocCtx {
+impl<'tcx> LocCtx<'tcx> {
     #[inline]
-    pub(super) fn new(is_generic: bool, is_union: bool, non_local_assign: bool) -> Self {
+    pub(super) fn new(
+        is_generic: bool,
+        is_union: bool,
+        non_local_assign: bool,
+        ty: rustc_middle::ty::Ty<'tcx>,
+    ) -> Self {
         Self {
             is_generic,
             is_union,
             non_local_assign,
+            ty,
         }
     }
 }
@@ -73,6 +82,11 @@ impl<'a> TypeArena<'a> {
     }
 
     #[inline]
+    pub(super) fn ref_(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
+        self.arena.alloc(StreamType::Ref(ty))
+    }
+
+    #[inline]
     fn box_(&self, ty: &'a StreamType<'a>) -> &'a StreamType<'a> {
         self.arena.alloc(StreamType::Box(ty))
     }
@@ -82,13 +96,15 @@ impl<'a> TypeArena<'a> {
         self.arena.alloc(StreamType::ManuallyDrop(ty))
     }
 
-    pub(super) fn make_ty(
+    pub(super) fn make_ty<'tcx>(
         &self,
         permissions: BitSet8<Permission>,
         origins: BitSet8<Origin>,
-        ctx: LocCtx,
+        ctx: LocCtx<'tcx>,
+        tcx: TyCtxt<'tcx>,
     ) -> &'a StreamType<'a> {
-        let ty = if ctx.is_generic {
+        let is_ptr_ptr = compile_util::is_file_ptr_ptr(ctx.ty, tcx);
+        let ty = if ctx.is_generic && !is_ptr_ptr {
             let mut traits = BitSet8::new_empty();
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
@@ -153,6 +169,7 @@ impl<'a> TypeArena<'a> {
             };
             self.option(ty)
         };
+        let ty = if is_ptr_ptr { self.ptr(ty) } else { ty };
         if ctx.is_union && !ty.is_copyable() {
             self.manually_drop(ty)
         } else {

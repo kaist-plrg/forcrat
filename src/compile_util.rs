@@ -296,6 +296,19 @@ pub fn is_option_ty(id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
 }
 
 #[inline]
+pub fn is_file_ptr<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    let (TyKind::RawPtr(ty, _) | TyKind::Ref(_, ty, _)) = ty.kind() else { return false };
+    let TyKind::Adt(adt_def, _) = ty.kind() else { return false };
+    is_file_ty(adt_def.did(), tcx)
+}
+
+#[inline]
+pub fn is_file_ptr_ptr<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    let (TyKind::RawPtr(ty, _) | TyKind::Ref(_, ty, _)) = ty.kind() else { return false };
+    is_file_ptr(*ty, tcx)
+}
+
+#[inline]
 pub fn contains_file_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
     let mut visitor = FileTypeVisitor { tcx };
     ty.visit_with(&mut visitor).is_break()
