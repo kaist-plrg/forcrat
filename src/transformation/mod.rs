@@ -388,7 +388,7 @@ impl Pass for Transformation {
                 uncopiable: &uncopiable,
                 manually_drop_projections: &manually_drop_projections,
 
-                unsupported: &unsupported,
+                unsupported,
                 unsupported_returns: &unsupported_returns,
                 is_stdin_unsupported,
                 is_stdout_unsupported,
@@ -407,6 +407,7 @@ impl Pass for Transformation {
                 tmpfile |= visitor.tmpfile;
                 bounds.extend(visitor.bounds);
             }
+            unsupported = visitor.unsupported;
         }
 
         TransformationResult {

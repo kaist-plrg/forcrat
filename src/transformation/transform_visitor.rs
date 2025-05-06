@@ -47,7 +47,7 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) manually_drop_projections: &'a FxHashSet<Span>,
 
     /// unsupported expr spans
-    pub(super) unsupported: &'a FxHashSet<Span>,
+    pub(super) unsupported: FxHashSet<Span>,
     /// unsupported return fn ids
     pub(super) unsupported_returns: &'a FxHashSet<LocalDefId>,
     /// is stdin unsupported
@@ -449,6 +449,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
+        if let ExprKind::If(_, t, Some(f)) = &expr.kind {
+            if self.is_unsupported(expr) {
+                let t = t.stmts.last().unwrap();
+                let StmtKind::Expr(t) = &t.kind else { panic!() };
+                self.unsupported.insert(t.span);
+                self.unsupported.insert(f.span);
+            }
+        }
+
         mut_visit::walk_expr(self, expr);
 
         let expr_span = expr.span;

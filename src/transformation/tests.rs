@@ -2084,6 +2084,32 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_unsupported_file_ptr_ptr() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut *mut FILE, mut x: libc::c_int) {
+    *stream = if x != 0 {
+        fopen(
+            b"a\0" as *const u8 as *const libc::c_char,
+            b"r\0" as *const u8 as *const libc::c_char,
+        )
+    } else {
+        0 as *mut FILE
+    };
+}
+unsafe fn f(mut fmt: *const libc::c_char) {
+    let mut stream: *mut FILE = 0 as *mut FILE;
+    g(&mut stream, 1 as libc::c_int);
+    fprintf(stream, fmt, 1 as libc::c_int);
+    fclose(stream);
+    putchar('a' as i32);
+}"#,
+        &["Write", "write_all", "fopen", "fprintf", "fclose", "FILE"],
+        &["putchar"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
