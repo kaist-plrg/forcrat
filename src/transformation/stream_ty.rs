@@ -104,7 +104,7 @@ impl<'a> TypeArena<'a> {
         tcx: TyCtxt<'tcx>,
     ) -> &'a StreamType<'a> {
         let is_ptr_ptr = compile_util::is_file_ptr_ptr(ctx.ty, tcx);
-        let ty = if ctx.is_generic && !is_ptr_ptr {
+        let ty = if ctx.is_generic && !permissions.contains(Permission::Lock) && !is_ptr_ptr {
             let mut traits = BitSet8::new_empty();
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));

@@ -1973,7 +1973,27 @@ unsafe fn f() {
 }
 
 #[test]
-fn test_flockfile() {
+fn test_flockfile_file() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    flockfile(stream);
+    fputc('a' as i32, stream);
+    fputc('b' as i32, stream);
+    funlockfile(stream);
+    fclose(stream);
+}"#,
+        &["Write", "write_all", "lock", "unlock"],
+        &["flockfile", "fputc", "funlockfile"],
+    );
+}
+
+#[test]
+fn test_flockfile_std() {
     run_test(
         r#"
 unsafe fn f() {

@@ -756,16 +756,20 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                         let stream = TypedExpr::new(&args[0], ty);
                         let name = self.hir.callee_span_to_stream_name[&callee.span];
-                        let new_expr = transform_flockfile(&stream, name);
+                        let (new_expr, guard) = transform_flockfile(&stream, name);
                         self.replace_expr(expr, new_expr);
-                        self.guards.insert(name);
+                        if guard {
+                            self.guards.insert(name);
+                        }
                     }
                     "funlockfile" => {
                         if self.is_unsupported(&args[0]) {
                             return;
                         }
+                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                        let stream = TypedExpr::new(&args[0], ty);
                         let name = self.hir.callee_span_to_stream_name[&callee.span];
-                        let new_expr = transform_funlockfile(name);
+                        let new_expr = transform_funlockfile(&stream, name);
                         self.replace_expr(expr, new_expr);
                     }
                     _ => {
@@ -1967,11 +1971,40 @@ fn transform_fileno<S: StreamExpr>(stream: &S) -> Expr {
 }
 
 #[inline]
-fn transform_flockfile<S: StreamExpr>(stream: &S, name: Symbol) -> Expr {
-    expr!("{}_guard = ({}).lock()", name, stream.expr())
+fn expr_to_lock<S: StreamExpr>(stream: &S) -> (String, bool) {
+    let ty = stream.ty();
+    let (ty, unwrap) = if let StreamType::Option(ty) = ty {
+        (*ty, ".as_ref().unwrap()")
+    } else {
+        (ty, "")
+    };
+    let (ty, get_ref) = if let StreamType::BufWriter(ty) | StreamType::BufReader(ty) = ty {
+        (*ty, ".get_ref()")
+    } else {
+        (ty, "")
+    };
+    (
+        format!("({}){}{}", stream.expr(), unwrap, get_ref),
+        ty == StreamType::File,
+    )
 }
 
 #[inline]
-fn transform_funlockfile(name: Symbol) -> Expr {
-    expr!("drop({}_guard)", name)
+fn transform_flockfile<S: StreamExpr>(stream: &S, name: Symbol) -> (Expr, bool) {
+    let (expr, is_file) = expr_to_lock(stream);
+    if is_file {
+        (expr!("{}.lock().unwrap()", expr), false)
+    } else {
+        (expr!("{}_guard = {}.lock()", name, expr), true)
+    }
+}
+
+#[inline]
+fn transform_funlockfile<S: StreamExpr>(stream: &S, name: Symbol) -> Expr {
+    let (expr, is_file) = expr_to_lock(stream);
+    if is_file {
+        expr!("{}.unlock().unwrap()", expr)
+    } else {
+        expr!("drop({}_guard)", name)
+    }
 }
