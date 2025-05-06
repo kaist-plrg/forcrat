@@ -4,6 +4,7 @@ use std::{
 };
 
 use etrace::some_or;
+use rustc_abi::FieldIdx;
 use rustc_ast::{
     ast::*,
     mut_visit::{self, MutVisitor},
@@ -39,8 +40,10 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// user-defined API functions' signatures' spans
     pub(super) api_ident_spans: &'a FxHashSet<Span>,
-    /// uncopiable struct ident spans
-    pub(super) uncopiable: &'a FxHashSet<Span>,
+    /// uncopiable struct ident span to field indices
+    pub(super) uncopiable: &'a FxHashMap<Span, Vec<FieldIdx>>,
+    /// spans of projections of manually dropped fields
+    pub(super) manually_drop_projections: &'a FxHashSet<Span>,
 
     /// unsupported expr spans
     pub(super) unsupported: &'a FxHashSet<Span>,
@@ -342,7 +345,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ItemKind::Struct(_, _) | ItemKind::Union(_, _) => {
-                if self.uncopiable.contains(&item.ident.span) {
+                if let Some(field_indices) = self.uncopiable.get(&item.ident.span) {
                     for attr in &mut item.attrs {
                         let AttrKind::Normal(attr) = &mut attr.kind else { continue };
                         let AttrArgs::Delimited(args) = &mut attr.item.args else { continue };
@@ -370,6 +373,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             tokens.push(tree.clone());
                         }
                         args.tokens = TokenStream::new(tokens);
+                    }
+                    if let ItemKind::Union(vd, _) = &mut item.kind {
+                        let VariantData::Struct { fields, .. } = vd else { panic!() };
+                        for i in field_indices {
+                            let field = &mut fields[i.as_usize()];
+                            if self.binding_pot(field.span).is_some() {
+                                continue;
+                            }
+                            let ty = pprust::ty_to_string(&field.ty);
+                            let new_ty = ty!("std::mem::ManuallyDrop<{}>", ty);
+                            self.replace_ty(&mut field.ty, new_ty);
+                        }
                     }
                 }
             }
@@ -813,6 +828,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             ExprKind::Ret(Some(e)) => {
                 let Some(pot) = self.return_pot(self.current_fn.unwrap()) else { return };
                 self.convert_rhs(e, pot, true);
+            }
+            ExprKind::Field(_, _) => {
+                if self.manually_drop_projections.contains(&expr_span) {
+                    let new_expr = expr!("(*({}))", pprust::expr_to_string(expr));
+                    self.replace_expr(expr, new_expr);
+                }
             }
             _ => {}
         }

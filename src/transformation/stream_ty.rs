@@ -294,27 +294,27 @@ pub(super) fn convert_expr(
                 let body = convert_expr(*to, *from, "x", true, false);
                 if is_non_local {
                     if to.contains_impl() {
-                        format!("({}).take().map(|x| {})", expr, body)
+                        format!("({}).take().map(|mut x| {})", expr, body)
                     } else {
-                        format!("({}).take().map::<{}, _>(|x| {})", expr, to, body)
+                        format!("({}).take().map::<{}, _>(|mut x| {})", expr, to, body)
                     }
                 } else if to.contains_impl() {
-                    format!("({}).map(|x| {})", expr, body)
+                    format!("({}).map(|mut x| {})", expr, body)
                 } else {
-                    format!("({}).map::<{}, _>(|x| {})", expr, to, body)
+                    format!("({}).map::<{}, _>(|mut x| {})", expr, to, body)
                 }
             } else {
                 let body = convert_expr(*to, Ref(from), "x", true, false);
                 if to.contains_impl() {
-                    format!("({}).as_mut().map(|x| {})", expr, body)
+                    format!("({}).as_mut().map(|mut x| {})", expr, body)
                 } else {
-                    format!("({}).as_mut().map::<{}, _>(|x| {})", expr, to, body)
+                    format!("({}).as_mut().map::<{}, _>(|mut x| {})", expr, to, body)
                 }
             }
         }
         (Ptr(to), Option(from)) if to == from => {
             format!(
-                "({}).as_mut().map_or(std::ptr::null_mut(), |r| r as *mut _)",
+                "({}).as_mut().map_or(std::ptr::null_mut(), |mut r| r as *mut _)",
                 expr
             )
         }
@@ -458,6 +458,9 @@ pub(super) fn convert_expr(
             ),
         ) => {
             format!("&mut *({}) as *mut _", expr)
+        }
+        (Ptr(Dyn(to)), Box(Dyn(from))) if to == from => {
+            format!("&mut ({}) as *mut _", expr)
         }
         (Ptr(Dyn(to)), Ref(Box(Dyn(from)))) if to == from => {
             format!("&mut *({}) as *mut _", expr)

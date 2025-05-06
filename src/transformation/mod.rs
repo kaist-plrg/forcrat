@@ -251,8 +251,8 @@ impl Pass for Transformation {
                 ctx.non_local_assign |= non_local_assign;
                 let ty = type_arena.make_ty(permissions, origins, ctx);
                 if !ty.is_copyable() {
-                    if let HirLoc::Field(def_id, _) = hir_loc {
-                        uncopiable.push(def_id);
+                    if let HirLoc::Field(def_id, field) = hir_loc {
+                        uncopiable.push((def_id, field));
                     }
                 }
                 let pot = Pot {
@@ -304,16 +304,30 @@ impl Pass for Transformation {
         }
         let mut visited = FxHashSet::default();
         let mut work_list = uncopiable;
-        let mut uncopiable = FxHashSet::default();
-        while let Some(def_id) = work_list.pop() {
+        let mut uncopiable: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        let mut uncopiable_union_fields = vec![];
+        while let Some((def_id, field)) = work_list.pop() {
             if !visited.insert(def_id) {
                 continue;
             }
             let node = tcx.hir_node_by_def_id(def_id);
             let hir::Node::Item(item) = node else { panic!() };
-            uncopiable.insert(item.ident.span);
+            uncopiable.entry(item.ident.span).or_default().push(field);
+            if matches!(item.kind, hir::ItemKind::Union(_, _)) {
+                uncopiable_union_fields.push((def_id, field));
+            }
             let owning_structs = some_or!(hir_ctx.struct_to_owning_structs.get(&def_id), continue);
             work_list.extend(owning_structs.iter().copied());
+        }
+
+        let mut manually_drop_projections: FxHashSet<Span> = FxHashSet::default();
+        for (def_id, field) in uncopiable_union_fields {
+            let loc = HirLoc::Field(def_id, field);
+            if hir_loc_to_pot.contains_key(&loc) {
+                continue;
+            }
+            let bounds = some_or!(hir_ctx.loc_to_bound_spans.get(&loc), continue);
+            manually_drop_projections.extend(bounds);
         }
 
         let mut api_ident_spans = FxHashSet::default();
@@ -361,6 +375,7 @@ impl Pass for Transformation {
                 loc_to_pot: &hir_loc_to_pot,
                 api_ident_spans: &api_ident_spans,
                 uncopiable: &uncopiable,
+                manually_drop_projections: &manually_drop_projections,
 
                 unsupported: &unsupported,
                 unsupported_returns: &unsupported_returns,

@@ -77,8 +77,8 @@ pub(super) struct HirCtx {
     /// function def_id to returned expr spans
     pub(super) return_spans: FxHashMap<LocalDefId, Vec<Span>>,
 
-    /// struct id to owning struct ids
-    pub(super) struct_to_owning_structs: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
+    /// struct id to owning struct ids and field indices
+    pub(super) struct_to_owning_structs: FxHashMap<LocalDefId, FxHashSet<(LocalDefId, FieldIdx)>>,
 }
 
 pub(super) struct HirVisitor<'tcx> {
@@ -138,14 +138,14 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 }
                 let adt_def = self.tcx.adt_def(def_id);
                 for variant in adt_def.variants() {
-                    for field in &variant.fields {
+                    for (i, field) in variant.fields.iter_enumerated() {
                         let ty = field.ty(self.tcx, rustc_middle::ty::List::empty());
                         let owned_def_id = some_or!(owned_def_id(ty), continue);
                         self.ctx
                             .struct_to_owning_structs
                             .entry(owned_def_id)
                             .or_default()
-                            .insert(def_id);
+                            .insert((def_id, i));
                     }
                 }
             }

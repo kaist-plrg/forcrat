@@ -1987,6 +1987,40 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_union_struct() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    x: libc::c_int,
+    stream: *mut FILE,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+union u {
+    x: libc::c_int,
+    y: s,
+}
+unsafe fn f() {
+    let mut u: u = u { x: 0 };
+    u.y.x = 0 as libc::c_int;
+    u
+        .y
+        .stream = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(u.y.stream);
+    fgetc(u.y.stream);
+    fclose(u.y.stream);
+}"#,
+        &["Read", "read_exact", "File", "ManuallyDrop"],
+        &["fgetc", "FILE"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
