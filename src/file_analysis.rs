@@ -197,8 +197,42 @@ impl Pass for FileAnalysis {
             }
         }
 
+        let graph = &analyzer.permission_graph;
+        let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&graph.edges));
+        let mut components = vec![MixedBitSet::new_empty(locs.len()); sccs.num_sccs()];
+        for i in graph.solutions.indices() {
+            let scc = sccs.scc(i);
+            components[scc.index()].insert(i);
+        }
+        let mut cycles = vec![];
+        'l: for component in components {
+            for i in component.iter() {
+                for j in component.iter() {
+                    if i == j {
+                        continue;
+                    }
+                    if graph.edges[i].contains(j) != graph.edges[j].contains(i) {
+                        cycles.push(component);
+                        continue 'l;
+                    }
+                }
+            }
+        }
+
         let permissions = analyzer.permission_graph.solve();
         let origins = analyzer.origin_graph.solve();
+
+        for cycle in cycles {
+            if cycle
+                .iter()
+                .any(|loc_id| permissions[loc_id].contains(Permission::Close))
+            {
+                for loc_id in cycle.iter() {
+                    println!("Unsupported close cycle {:?}", locs[loc_id],);
+                    analyzer.unsupported.add(loc_id);
+                }
+            }
+        }
 
         for (((i, loc), permissions), origins) in
             locs.iter_enumerated().zip(&permissions).zip(&origins)
