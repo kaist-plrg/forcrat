@@ -343,28 +343,50 @@ impl MutVisitor for PreprocessVisitor<'_> {
         }
         mut_visit::walk_expr(self, expr);
         let expr_span = expr.span;
-        if let ExprKind::Call(_, args) = &mut expr.kind {
-            let mut indices: Vec<usize> = vec![];
-            if let Some(if_args) = self.call_span_to_if_args.get(&expr_span) {
-                indices.extend(if_args);
-            }
-            if let Some(nested_args) = self.call_span_to_nested_args.get(&expr_span) {
-                indices.extend(nested_args);
-            }
-            if !indices.is_empty() {
-                self.updated = true;
-                indices.sort();
-                indices.dedup();
-                let mut new_expr = "{".to_string();
-                for i in indices {
-                    let a = pprust::expr_to_string(&args[i]);
-                    write!(new_expr, "let __arg_{} = {};", i, a).unwrap();
-                    *args[i] = expr!("__arg_{}", i);
+        match &mut expr.kind {
+            ExprKind::Call(_, args) => {
+                let mut indices: Vec<usize> = vec![];
+                if let Some(if_args) = self.call_span_to_if_args.get(&expr_span) {
+                    indices.extend(if_args);
                 }
-                new_expr.push_str(&pprust::expr_to_string(expr));
-                new_expr.push('}');
-                **expr = expr!("{}", new_expr);
+                if let Some(nested_args) = self.call_span_to_nested_args.get(&expr_span) {
+                    indices.extend(nested_args);
+                }
+                if !indices.is_empty() {
+                    self.updated = true;
+                    indices.sort();
+                    indices.dedup();
+                    let mut new_expr = "{".to_string();
+                    for i in indices {
+                        let a = pprust::expr_to_string(&args[i]);
+                        write!(new_expr, "let __arg_{} = {};", i, a).unwrap();
+                        *args[i] = expr!("__arg_{}", i);
+                    }
+                    new_expr.push_str(&pprust::expr_to_string(expr));
+                    new_expr.push('}');
+                    **expr = expr!("{}", new_expr);
+                }
             }
+            ExprKind::MethodCall(box call) => {
+                if call.seg.ident.name.as_str() != "unwrap" {
+                    return;
+                }
+                let ExprKind::Paren(e) = &call.receiver.kind else { return };
+                let ExprKind::Call(callee, e) = &e.kind else { return };
+                let ExprKind::Path(_, path) = &callee.kind else { return };
+                if path.segments.last().unwrap().ident.name.as_str() != "Some" {
+                    return;
+                }
+                let [arg] = &e[..] else { return };
+                let ExprKind::MethodCall(box call) = &arg.kind else { return };
+                if call.seg.ident.name.as_str() != "unwrap" {
+                    return;
+                }
+                self.updated = true;
+                let arg = pprust::expr_to_string(arg);
+                **expr = expr!("{}", arg);
+            }
+            _ => {}
         }
     }
 }
