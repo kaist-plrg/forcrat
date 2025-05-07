@@ -305,10 +305,11 @@ pub(super) fn convert_expr(
     is_non_local: bool,
 ) -> String {
     tracing::info!("{} := {} // {}", to, from, consume);
-    if to == from && (consume || from.is_copyable()) {
+    use StreamType::*;
+    if to == from && (consume || from.is_copyable()) && (!is_non_local || !matches!(to, Option(_)))
+    {
         return expr.to_string();
     }
-    use StreamType::*;
     match (to, from) {
         (Option(to), Option(from)) => {
             if consume || from.is_copyable() {
