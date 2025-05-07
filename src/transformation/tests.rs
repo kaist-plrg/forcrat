@@ -2110,6 +2110,105 @@ unsafe fn f(mut fmt: *const libc::c_char) {
     );
 }
 
+#[test]
+fn test_fn_ptr_read() {
+    run_test(
+        r#"
+unsafe extern "C" fn h1(mut stream: *mut FILE) {
+    fgetc(stream);
+}
+unsafe extern "C" fn h2(mut stream: *mut FILE) {
+    fgetc(stream);
+    fgetc(stream);
+}
+unsafe fn g(mut func: Option::<unsafe extern "C" fn(*mut FILE) -> ()>) {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    func.unwrap()(stream);
+    fclose(stream);
+}
+unsafe fn f() {
+    g(Some(h1 as unsafe extern "C" fn(*mut FILE) -> ()));
+    g(Some(h2 as unsafe extern "C" fn(*mut FILE) -> ()));
+}"#,
+        &["Read", "read_exact"],
+        &["fopen", "fgetc", "fclose", "FILE", "TT"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_write() {
+    run_test(
+        r#"
+unsafe extern "C" fn h1(
+    mut x: libc::c_int,
+    mut stream: *mut FILE,
+    mut y: libc::c_int,
+) {
+    fputc(x, stream);
+    fputc(y, stream);
+}
+unsafe extern "C" fn h2(
+    mut x: libc::c_int,
+    mut stream: *mut FILE,
+    mut y: libc::c_int,
+) {
+    fputc(y, stream);
+    fputc(x, stream);
+}
+unsafe fn g(
+    mut x: libc::c_int,
+    mut func: Option::<unsafe extern "C" fn(libc::c_int, *mut FILE, libc::c_int) -> ()>,
+    mut y: libc::c_int,
+) {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    func.unwrap()(x, stream, y);
+    fclose(stream);
+}
+unsafe fn f() {
+    g(
+        0 as libc::c_int,
+        Some(h1 as unsafe extern "C" fn(libc::c_int, *mut FILE, libc::c_int) -> ()),
+        1 as libc::c_int,
+    );
+    g(
+        0 as libc::c_int,
+        Some(h2 as unsafe extern "C" fn(libc::c_int, *mut FILE, libc::c_int) -> ()),
+        1 as libc::c_int,
+    );
+}"#,
+        &["Write", "write_all"],
+        &["fopen", "fputc", "fclose", "FILE", "TT"],
+    );
+}
+
+#[test]
+fn test_fn_ptr_none() {
+    run_test(
+        r#"
+unsafe fn g(mut func: Option::<unsafe extern "C" fn(*mut FILE) -> ()>) {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    if func.is_some() {
+        func.unwrap()(stream);
+    }
+    fclose(stream);
+}
+unsafe fn f() {
+    g(None);
+}"#,
+        &["File"],
+        &["fopen", "fclose", "FILE", "TT"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

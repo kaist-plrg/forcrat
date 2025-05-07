@@ -37,6 +37,8 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
 
     /// function parameter to HIR location
     pub(super) param_to_loc: &'a FxHashMap<Parameter, HirLoc>,
+    /// function parameter to file type index
+    pub(super) param_to_file_type_index: &'a FxHashMap<Parameter, usize>,
     /// HIR location to permissions and origins
     pub(super) loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// user-defined API functions' signatures' spans
@@ -280,7 +282,23 @@ impl<'a> TransformVisitor<'_, 'a> {
                         _ => panic!(),
                     }
                 }
-                _ => panic!("{:?}", rhs),
+                ExprKind::Call(callee, _) => {
+                    if let ExprKind::Path(_, path) = &callee.kind {
+                        let name = path.segments.last().unwrap().ident;
+                        if name.as_str() == "Some" {
+                            return;
+                        }
+                    }
+                    panic!("{:?}", rhs.span);
+                }
+                ExprKind::Path(_, path) => {
+                    let name = path.segments.last().unwrap().ident;
+                    if name.as_str() == "None" {
+                        return;
+                    }
+                    panic!("{:?}", rhs.span);
+                }
+                _ => panic!("{:?}", rhs.span),
             }
         }
     }
@@ -321,7 +339,20 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                     let p = Parameter::new(def_id, i);
                     let pot = some_or!(self.param_pot(p), continue);
-                    if let StreamType::Option(StreamType::Impl(bound)) = pot.ty {
+                    if let Some(index) = self.param_to_file_type_index.get(&p) {
+                        // When the parameter type is Option<fn(..) -> ..>
+                        let TyKind::Path(_, path) = &mut param.ty.kind else { panic!() };
+                        let seg = path.segments.last_mut().unwrap();
+                        assert_eq!(seg.ident.as_str(), "Option");
+                        let args = seg.args.as_mut().unwrap();
+                        let AngleBracketed(args) = args.deref_mut() else { panic!() };
+                        let [arg] = &mut args.args[..] else { panic!() };
+                        let AngleBracketedArg::Arg(arg) = arg else { panic!() };
+                        let GenericArg::Type(ty) = arg else { panic!() };
+                        let TyKind::BareFn(fn_ty) = &mut ty.kind else { panic!() };
+                        let param = &mut fn_ty.decl.inputs[*index];
+                        self.replace_ty_with_pot(&mut param.ty, pot);
+                    } else if let StreamType::Option(StreamType::Impl(bound)) = pot.ty {
                         self.replace_ty(&mut param.ty, ty!("Option<TT{}>", i));
                         tparams.push((i, *bound));
                     } else {
@@ -466,360 +497,391 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         }
         match &mut expr.kind {
             ExprKind::Call(callee, args) => {
-                let Some(HirLoc::Global(def_id)) = self.hir.bound_span_to_loc.get(&callee.span)
-                else {
-                    return;
-                };
-                let name = compile_util::def_id_to_value_symbol(*def_id, self.tcx).unwrap();
-                let name = api_list::normalize_api_name(name.as_str());
-                match name {
-                    "fopen" => {
-                        let new_expr = transform_fopen(&args[0], &args[1]);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fdopen" => {
-                        let new_expr = transform_fdopen(&args[0]);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "tmpfile" => {
-                        let new_expr = transform_tmpfile();
-                        self.replace_expr(expr, new_expr);
-                        self.tmpfile = true;
-                    }
-                    "popen" => {
-                        let new_expr = transform_popen(&args[0], &args[1]);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fclose" | "pclose" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
+                if let Some(HirLoc::Global(def_id)) = self.hir.bound_span_to_loc.get(&callee.span) {
+                    let name = compile_util::def_id_to_value_symbol(*def_id, self.tcx).unwrap();
+                    let name = api_list::normalize_api_name(name.as_str());
+                    match name {
+                        "fopen" => {
+                            let new_expr = transform_fopen(&args[0], &args[1]);
+                            self.replace_expr(expr, new_expr);
                         }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let is_non_local = self.is_non_local(args[0].span);
-                        let new_expr = transform_fclose(&args[0], *ty, is_non_local);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fscanf" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
+                        "fdopen" => {
+                            let new_expr = transform_fdopen(&args[0]);
+                            self.replace_expr(expr, new_expr);
                         }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fscanf(&stream, &args[1], &args[2..], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fgetc" | "getc" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
+                        "tmpfile" => {
+                            let new_expr = transform_tmpfile();
+                            self.replace_expr(expr, new_expr);
+                            self.tmpfile = true;
                         }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fgetc(&stream, ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "getchar" => {
-                        if self.is_stdin_unsupported {
-                            return;
+                        "popen" => {
+                            let new_expr = transform_popen(&args[0], &args[1]);
+                            self.replace_expr(expr, new_expr);
                         }
-                        let stream = StdExpr::stdin();
-                        let ic = self.indicator_check_std(callee.span, "stdin");
-                        let new_expr = transform_fgetc(&stream, ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fgets" => {
-                        if self.is_unsupported(&args[2]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[2], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fgets(&stream, &args[0], &args[1], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fread" => {
-                        if self.is_unsupported(&args[3]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[3], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fread(&stream, &args[0], &args[1], &args[2], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "getdelim" => {
-                        if self.is_unsupported(&args[3]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[3], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr =
-                            transform_getdelim(&stream, &args[0], &args[1], &args[2], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "getline" => {
-                        if self.is_unsupported(&args[2]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[2], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_getline(&stream, &args[0], &args[1], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "feof" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let name = self.hir.callee_span_to_stream_name[&callee.span];
-                        let new_expr = expr!("{}_eof", name);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "ferror" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let name = self.hir.callee_span_to_stream_name[&callee.span];
-                        let new_expr = expr!("{}_error", name);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "clearerr" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = expr!("{}", ic.clear());
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fprintf" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let retval_used = self.hir.retval_used_spans.contains(&expr_span);
-                        let ic = self.indicator_check(callee.span);
-                        let ctx = FprintfCtx {
-                            wide: false,
-                            retval_used,
-                            ic,
-                        };
-                        let new_expr = self.transform_fprintf(&stream, &args[1], &args[2..], ctx);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "printf" => {
-                        // if self.is_stdout_unsupported {
-                        //     return;
-                        // }
-                        if self
-                            .analysis_res
-                            .unsupported_printf_spans
-                            .contains(&expr_span)
-                        {
-                            return;
-                        }
-                        let stream = StdExpr::stdout();
-                        let retval_used = self.hir.retval_used_spans.contains(&expr_span);
-                        let ic = self.indicator_check_std(callee.span, "stdout");
-                        let ctx = FprintfCtx {
-                            wide: false,
-                            retval_used,
-                            ic,
-                        };
-                        let new_expr = self.transform_fprintf(&stream, &args[0], &args[1..], ctx);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "wprintf" => {
-                        // if self.is_stdout_unsupported {
-                        //     return;
-                        // }
-                        if self
-                            .analysis_res
-                            .unsupported_printf_spans
-                            .contains(&expr_span)
-                        {
-                            return;
-                        }
-                        let stream = StdExpr::stdout();
-                        let retval_used = self.hir.retval_used_spans.contains(&expr_span);
-                        let ic = self.indicator_check_std(callee.span, "stdout");
-                        let ctx = FprintfCtx {
-                            wide: true,
-                            retval_used,
-                            ic,
-                        };
-                        let new_expr = self.transform_fprintf(&stream, &args[0], &args[1..], ctx);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fputc" | "putc" => {
-                        if self.is_unsupported(&args[1]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[1], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fputc(&stream, &args[0], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "putchar" => {
-                        // if self.is_stdout_unsupported {
-                        //     return;
-                        // }
-                        let stream = StdExpr::stdout();
-                        let ic = self.indicator_check_std(callee.span, "stdout");
-                        let new_expr = transform_fputc(&stream, &args[0], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fputwc" | "putwc" => {
-                        if self.is_unsupported(&args[1]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[1], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fputwc(&stream, &args[0], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fputs" => {
-                        if self.is_unsupported(&args[1]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[1], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fputs(&stream, &args[0], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "puts" => {
-                        // if self.is_stdout_unsupported {
-                        //     return;
-                        // }
-                        let ic = self.indicator_check_std(callee.span, "stdout");
-                        let new_expr = transform_puts(&args[0], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fwrite" => {
-                        if self.is_unsupported(&args[3]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[3], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fwrite(&stream, &args[0], &args[1], &args[2], ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fflush" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let ic = self.indicator_check(callee.span);
-                        let new_expr = transform_fflush(&stream, ic);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fseek" | "fseeko" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr = transform_fseek(&stream, &args[1], &args[2]);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "ftell" | "ftello" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr = transform_ftell(&stream);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "rewind" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr = transform_rewind(&stream);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "fgetpos" => todo!(),
-                    "fsetpos" => todo!(),
-                    "fileno" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let new_expr = transform_fileno(&stream);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    "flockfile" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let name = self.hir.callee_span_to_stream_name[&callee.span];
-                        let (new_expr, guard) = transform_flockfile(&stream, name);
-                        self.replace_expr(expr, new_expr);
-                        if guard {
-                            self.guards.insert(name);
-                        }
-                    }
-                    "funlockfile" => {
-                        if self.is_unsupported(&args[0]) {
-                            return;
-                        }
-                        let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                        let stream = TypedExpr::new(&args[0], ty);
-                        let name = self.hir.callee_span_to_stream_name[&callee.span];
-                        let new_expr = transform_funlockfile(&stream, name);
-                        self.replace_expr(expr, new_expr);
-                    }
-                    _ => {
-                        let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(*def_id) else {
-                            return;
-                        };
-                        let hir::ItemKind::Fn { sig, .. } = item.kind else { panic!() };
-                        let mut targs = vec![];
-                        for (i, arg) in args[..sig.decl.inputs.len()].iter_mut().enumerate() {
-                            if self.is_unsupported(arg) {
-                                continue;
+                        "fclose" | "pclose" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
                             }
-                            let p = Parameter::new(*def_id, i);
-                            let param_pot = some_or!(self.param_pot(p), continue);
-                            let is_null = matches!(remove_cast(arg).kind, ExprKind::Lit(_));
-                            let permissions = param_pot.permissions;
-                            let consume = permissions.contains(Permission::Close)
-                                || matches!(
-                                    arg.kind,
-                                    ExprKind::Call(_, _) | ExprKind::MethodCall(_)
-                                );
-                            self.convert_rhs(arg, param_pot, consume);
-                            if param_pot.ty.contains_impl() {
-                                if is_null {
-                                    let targ = if permissions.contains(Permission::BufRead) {
-                                        "std::io::BufReader<std::fs::File>"
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let is_non_local = self.is_non_local(args[0].span);
+                            let new_expr = transform_fclose(&args[0], *ty, is_non_local);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fscanf" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = transform_fscanf(&stream, &args[1], &args[2..], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fgetc" | "getc" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = transform_fgetc(&stream, ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "getchar" => {
+                            if self.is_stdin_unsupported {
+                                return;
+                            }
+                            let stream = StdExpr::stdin();
+                            let ic = self.indicator_check_std(callee.span, "stdin");
+                            let new_expr = transform_fgetc(&stream, ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fgets" => {
+                            if self.is_unsupported(&args[2]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[2], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = transform_fgets(&stream, &args[0], &args[1], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fread" => {
+                            if self.is_unsupported(&args[3]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[3], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr =
+                                transform_fread(&stream, &args[0], &args[1], &args[2], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "getdelim" => {
+                            if self.is_unsupported(&args[3]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[3], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr =
+                                transform_getdelim(&stream, &args[0], &args[1], &args[2], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "getline" => {
+                            if self.is_unsupported(&args[2]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[2], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = transform_getline(&stream, &args[0], &args[1], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "feof" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let name = self.hir.callee_span_to_stream_name[&callee.span];
+                            let new_expr = expr!("{}_eof", name);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "ferror" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let name = self.hir.callee_span_to_stream_name[&callee.span];
+                            let new_expr = expr!("{}_error", name);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "clearerr" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = expr!("{}", ic.clear());
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fprintf" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let retval_used = self.hir.retval_used_spans.contains(&expr_span);
+                            let ic = self.indicator_check(callee.span);
+                            let ctx = FprintfCtx {
+                                wide: false,
+                                retval_used,
+                                ic,
+                            };
+                            let new_expr =
+                                self.transform_fprintf(&stream, &args[1], &args[2..], ctx);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "printf" => {
+                            // if self.is_stdout_unsupported {
+                            //     return;
+                            // }
+                            if self
+                                .analysis_res
+                                .unsupported_printf_spans
+                                .contains(&expr_span)
+                            {
+                                return;
+                            }
+                            let stream = StdExpr::stdout();
+                            let retval_used = self.hir.retval_used_spans.contains(&expr_span);
+                            let ic = self.indicator_check_std(callee.span, "stdout");
+                            let ctx = FprintfCtx {
+                                wide: false,
+                                retval_used,
+                                ic,
+                            };
+                            let new_expr =
+                                self.transform_fprintf(&stream, &args[0], &args[1..], ctx);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "wprintf" => {
+                            // if self.is_stdout_unsupported {
+                            //     return;
+                            // }
+                            if self
+                                .analysis_res
+                                .unsupported_printf_spans
+                                .contains(&expr_span)
+                            {
+                                return;
+                            }
+                            let stream = StdExpr::stdout();
+                            let retval_used = self.hir.retval_used_spans.contains(&expr_span);
+                            let ic = self.indicator_check_std(callee.span, "stdout");
+                            let ctx = FprintfCtx {
+                                wide: true,
+                                retval_used,
+                                ic,
+                            };
+                            let new_expr =
+                                self.transform_fprintf(&stream, &args[0], &args[1..], ctx);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fputc" | "putc" => {
+                            if self.is_unsupported(&args[1]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[1], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = transform_fputc(&stream, &args[0], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "putchar" => {
+                            // if self.is_stdout_unsupported {
+                            //     return;
+                            // }
+                            let stream = StdExpr::stdout();
+                            let ic = self.indicator_check_std(callee.span, "stdout");
+                            let new_expr = transform_fputc(&stream, &args[0], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fputwc" | "putwc" => {
+                            if self.is_unsupported(&args[1]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[1], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = transform_fputwc(&stream, &args[0], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fputs" => {
+                            if self.is_unsupported(&args[1]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[1], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = transform_fputs(&stream, &args[0], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "puts" => {
+                            // if self.is_stdout_unsupported {
+                            //     return;
+                            // }
+                            let ic = self.indicator_check_std(callee.span, "stdout");
+                            let new_expr = transform_puts(&args[0], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fwrite" => {
+                            if self.is_unsupported(&args[3]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[3], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr =
+                                transform_fwrite(&stream, &args[0], &args[1], &args[2], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fflush" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let ic = self.indicator_check(callee.span);
+                            let new_expr = transform_fflush(&stream, ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fseek" | "fseeko" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let new_expr = transform_fseek(&stream, &args[1], &args[2]);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "ftell" | "ftello" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let new_expr = transform_ftell(&stream);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "rewind" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let new_expr = transform_rewind(&stream);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "fgetpos" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            todo!()
+                        }
+                        "fsetpos" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            todo!()
+                        }
+                        "fileno" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let new_expr = transform_fileno(&stream);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "flockfile" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let name = self.hir.callee_span_to_stream_name[&callee.span];
+                            let (new_expr, guard) = transform_flockfile(&stream, name);
+                            self.replace_expr(expr, new_expr);
+                            if guard {
+                                self.guards.insert(name);
+                            }
+                        }
+                        "funlockfile" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let name = self.hir.callee_span_to_stream_name[&callee.span];
+                            let new_expr = transform_funlockfile(&stream, name);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        _ => {
+                            let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(*def_id) else {
+                                return;
+                            };
+                            let hir::ItemKind::Fn { sig, .. } = item.kind else { panic!() };
+                            let mut targs = vec![];
+                            for (i, arg) in args[..sig.decl.inputs.len()].iter_mut().enumerate() {
+                                if self.is_unsupported(arg) {
+                                    continue;
+                                }
+                                let p = Parameter::new(*def_id, i);
+                                let param_pot = some_or!(self.param_pot(p), continue);
+                                let is_null = matches!(remove_cast(arg).kind, ExprKind::Lit(_));
+                                let permissions = param_pot.permissions;
+                                let consume = permissions.contains(Permission::Close)
+                                    || matches!(
+                                        arg.kind,
+                                        ExprKind::Call(_, _) | ExprKind::MethodCall(_)
+                                    );
+                                self.convert_rhs(arg, param_pot, consume);
+                                if param_pot.ty.contains_impl() {
+                                    if is_null {
+                                        let targ = if permissions.contains(Permission::BufRead) {
+                                            "std::io::BufReader<std::fs::File>"
+                                        } else {
+                                            "std::fs::File"
+                                        };
+                                        targs.push(targ);
                                     } else {
-                                        "std::fs::File"
-                                    };
-                                    targs.push(targ);
-                                } else {
-                                    targs.push("_");
+                                        targs.push("_");
+                                    }
                                 }
                             }
-                        }
-                        if targs.iter().any(|targ| *targ != "_") {
-                            let c = pprust::expr_to_string(callee);
-                            let new_expr = expr!("{}::<{}>", c, targs.join(", "));
-                            self.replace_expr(callee, new_expr);
+                            if targs.iter().any(|targ| *targ != "_") {
+                                let c = pprust::expr_to_string(callee);
+                                let new_expr = expr!("{}::<{}>", c, targs.join(", "));
+                                self.replace_expr(callee, new_expr);
+                            }
                         }
                     }
+                } else if let ExprKind::MethodCall(box call) = &callee.kind {
+                    if call.seg.ident.as_str() != "unwrap" {
+                        return;
+                    }
+                    let pot = some_or!(self.bound_expr_pot(&call.receiver), return);
+                    let permissions = pot.permissions;
+                    for arg in args {
+                        if self.is_unsupported(arg) {
+                            continue;
+                        }
+                        if self.bound_expr_pot(arg).is_none() {
+                            continue;
+                        }
+                        let consume = permissions.contains(Permission::Close)
+                            || matches!(arg.kind, ExprKind::Call(_, _) | ExprKind::MethodCall(_));
+                        self.convert_rhs(arg, pot, consume);
+                    }
+                    println!("{}", pot.ty);
                 }
             }
             ExprKind::Path(None, path) => {
@@ -835,6 +897,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ExprKind::MethodCall(box MethodCall { receiver, seg, .. }) => {
+                if seg.ident.as_str() != "is_null" {
+                    return;
+                }
                 if self.is_unsupported(receiver) {
                     return;
                 }
@@ -865,6 +930,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if self.manually_drop_projections.contains(&expr_span) {
                     let new_expr = expr!("(*({}))", pprust::expr_to_string(expr));
                     self.replace_expr(expr, new_expr);
+                }
+            }
+            ExprKind::Cast(expr, ty) => {
+                let loc = some_or!(self.hir.bound_span_to_loc.get(&expr.span), return);
+                let HirLoc::Global(def_id) = loc else { return };
+                let TyKind::BareFn(fn_ty) = &mut ty.kind else { return };
+                for (i, param) in fn_ty.decl.inputs.iter_mut().enumerate() {
+                    let p = Parameter::new(*def_id, i);
+                    let pot = some_or!(self.param_pot(p), continue);
+                    self.replace_ty_with_pot(&mut param.ty, pot);
                 }
             }
             _ => {}

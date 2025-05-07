@@ -170,6 +170,7 @@ impl Pass for Transformation {
         let arena = Arena::new();
         let type_arena = TypeArena::new(&arena);
         let mut param_to_hir_loc = FxHashMap::default();
+        let mut param_to_file_type_index = FxHashMap::default();
         let mut hir_loc_to_pot = FxHashMap::default();
         let mut uncopiable = vec![];
         for ((loc, permissions), origins) in analysis_res
@@ -198,6 +199,10 @@ impl Pass for Transformation {
                             if locs.is_empty() {
                                 continue;
                             }
+
+                            let body = tcx.optimized_mir(*def_id);
+                            let ty = body.local_decls[*local].ty;
+
                             let arity = sig.decl.inputs.len();
                             let is_param = (1..=arity).contains(&local.as_usize());
                             let is_generic = if is_param {
@@ -205,19 +210,23 @@ impl Pass for Transformation {
                                     func: *def_id,
                                     index: local.as_usize() - 1,
                                 };
+                                let index = file_type_index(ty, tcx);
+                                if let Some(index) = index {
+                                    param_to_file_type_index.insert(param, index);
+                                }
                                 let loc = locs[0];
                                 param_to_hir_loc.insert(param, loc);
                                 let bounds = hir_ctx.loc_to_bound_spans.get(&loc);
-                                bounds.is_none_or(|bounds| {
-                                    bounds
-                                        .iter()
-                                        .all(|bound| !hir_ctx.lhs_to_rhs.contains_key(bound))
-                                })
+                                index.is_none()
+                                    && !analysis_res.fn_ptrs.contains(def_id)
+                                    && bounds.is_none_or(|bounds| {
+                                        bounds
+                                            .iter()
+                                            .all(|bound| !hir_ctx.lhs_to_rhs.contains_key(bound))
+                                    })
                             } else {
                                 false
                             };
-                            let body = tcx.optimized_mir(*def_id);
-                            let ty = body.local_decls[*local].ty;
                             (locs, LocCtx::new(is_generic, false, is_static_return, ty))
                         }
                         hir::ItemKind::Static(_, _, _) => {
@@ -383,6 +392,7 @@ impl Pass for Transformation {
                 analysis_res: &analysis_res,
                 hir: &hir_ctx,
                 param_to_loc: &param_to_hir_loc,
+                param_to_file_type_index: &param_to_file_type_index,
                 loc_to_pot: &hir_loc_to_pot,
                 api_ident_spans: &api_ident_spans,
                 uncopiable: &uncopiable,
@@ -447,6 +457,33 @@ fn mir_local_span(
     };
     let local_decl = &body.local_decls[local];
     local_decl.source_info.span
+}
+
+fn file_type_index<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<usize> {
+    match ty.kind() {
+        rustc_middle::ty::TyKind::Adt(adt_def, targs) => {
+            if compile_util::is_option_ty(adt_def.did(), tcx) {
+                let targs = targs.into_type_list(tcx);
+                file_type_index(targs[0], tcx)
+            } else {
+                None
+            }
+        }
+        rustc_middle::ty::TyKind::FnPtr(binder, _) => binder
+            .as_ref()
+            .skip_binder()
+            .inputs()
+            .iter()
+            .enumerate()
+            .find_map(|(i, ty)| {
+                if compile_util::is_file_ptr(*ty, tcx) {
+                    Some(i)
+                } else {
+                    None
+                }
+            }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

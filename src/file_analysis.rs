@@ -17,7 +17,8 @@ use rustc_middle::{
     hir::nested_filter,
     mir::{
         AggregateKind, CastKind, Const, ConstOperand, ConstValue, Local, LocalDecl, Operand, Place,
-        PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, RETURN_PLACE,
+        PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnevaluatedConst,
+        RETURN_PLACE,
     },
     query::IntoQueryParam,
     ty::{adjustment::PointerCoercion, List, Ty, TyCtxt, TyKind},
@@ -45,6 +46,7 @@ pub struct AnalysisResult {
     pub static_span_to_lit: FxHashMap<Span, Symbol>,
     pub defined_apis: FxHashSet<LocalDefId>,
     pub unsupported_printf_spans: FxHashSet<Span>,
+    pub fn_ptrs: FxHashSet<LocalDefId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,6 +163,7 @@ impl Pass for FileAnalysis {
             popen_read,
             unsupported_printf_spans: &unsupported_printf_spans,
             loc_ind_map: &loc_ind_map,
+            fn_ptrs: FxHashSet::default(),
             permission_graph,
             origin_graph,
             unsupported: UnsupportedTracker::new(&arena),
@@ -219,14 +222,11 @@ impl Pass for FileAnalysis {
         }
 
         let unsupported = analyzer.unsupported.compute_all();
-        if unsupported.is_empty() {
-            tracing::info!("No unsupported locations");
-        } else {
-            tracing::info!("Unsupported locations:");
-        }
         for loc_id in unsupported.iter() {
-            tracing::info!("{:?}", locs[*loc_id]);
+            tracing::info!("{:?} unsupported", locs[*loc_id]);
         }
+
+        let fn_ptrs = analyzer.fn_ptrs;
 
         AnalysisResult {
             locs,
@@ -237,6 +237,7 @@ impl Pass for FileAnalysis {
             static_span_to_lit,
             defined_apis,
             unsupported_printf_spans,
+            fn_ptrs,
         }
     }
 }
@@ -266,6 +267,7 @@ struct Analyzer<'a, 'tcx> {
     popen_read: FxHashMap<Span, bool>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     unsupported_printf_spans: &'a FxHashSet<Span>,
+    fn_ptrs: FxHashSet<LocalDefId>,
     permission_graph: Graph<LocId, Permission>,
     origin_graph: Graph<LocId, Origin>,
     unsupported: UnsupportedTracker<'a>,
@@ -348,6 +350,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 let r = Loc::Var(def_id, Local::new(i + 1));
                                 let r = self.loc_ind_map[&r];
                                 self.assign(l, r, variance);
+                                self.fn_ptrs.insert(def_id);
                             }
                         }
                     }
@@ -412,8 +415,22 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 let l = self.transfer_place(*l, ctx);
                 match r {
                     Rvalue::Use(op) | Rvalue::Repeat(op, _) => {
-                        let r = self.transfer_operand(op, ctx);
-                        self.assign(l, r, variance);
+                        if !matches!(
+                            op,
+                            Operand::Constant(box ConstOperand {
+                                const_:
+                                    Const::Unevaluated(
+                                        UnevaluatedConst {
+                                            promoted: Some(_), ..
+                                        },
+                                        _,
+                                    ),
+                                ..
+                            })
+                        ) {
+                            let r = self.transfer_operand(op, ctx);
+                            self.assign(l, r, variance);
+                        }
                     }
                     Rvalue::Cast(_, _, _) => unreachable!(),
                     Rvalue::Ref(_, _, place)
