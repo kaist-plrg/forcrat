@@ -2238,6 +2238,35 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_fn_ptr_arg_param() {
+    run_test(
+        r#"
+unsafe extern "C" fn h(mut stream: *mut FILE) {
+    fgetc(stream);
+    fgetc(stream);
+}
+unsafe fn g(
+    mut stream: *mut FILE,
+    mut func: Option::<unsafe extern "C" fn(*mut FILE) -> ()>,
+) {
+    func.unwrap()(stream);
+    func.unwrap()(stream);
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"test.txt\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream, Some(h as unsafe extern "C" fn(*mut FILE) -> ()));
+    g(stream, Some(h as unsafe extern "C" fn(*mut FILE) -> ()));
+    fclose(stream);
+}"#,
+        &["Read", "read_exact"],
+        &["fopen", "fgetc", "fclose", "FILE"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

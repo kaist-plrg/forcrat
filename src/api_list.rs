@@ -53,18 +53,6 @@ pub enum Permission {
 
 impl Permission {
     pub const NUM: usize = 7;
-
-    #[inline]
-    pub fn full_name(self) -> &'static str {
-        match self {
-            Self::Read => "std::io::Read",
-            Self::BufRead => "std::io::BufRead",
-            Self::Write => "std::io::Write",
-            Self::Seek => "std::io::Seek",
-            Self::AsRawFd => "std::os::fd::AsRawFd",
-            _ => panic!(),
-        }
-    }
 }
 
 impl Idx for Permission {

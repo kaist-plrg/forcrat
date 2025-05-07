@@ -167,6 +167,12 @@ impl Pass for Transformation {
             }
         }
 
+        let fn_ptr_args: FxHashSet<_> = hir_ctx
+            .fn_ptr_arg_spans
+            .iter()
+            .filter_map(|span| hir_ctx.bound_span_to_loc.get(span))
+            .collect();
+
         let arena = Arena::new();
         let type_arena = TypeArena::new(&arena);
         let mut param_to_hir_loc = FxHashMap::default();
@@ -212,8 +218,8 @@ impl Pass for Transformation {
                                 let loc = locs[0];
                                 param_to_hir_loc.insert(param, loc);
                                 let bounds = hir_ctx.loc_to_bound_spans.get(&loc);
-                                file_param_index(ty, tcx).is_none()
-                                    && !analysis_res.fn_ptrs.contains(def_id)
+                                !analysis_res.fn_ptrs.contains(def_id)
+                                    && !fn_ptr_args.contains(&loc)
                                     && bounds.is_none_or(|bounds| {
                                         bounds
                                             .iter()
@@ -262,7 +268,9 @@ impl Pass for Transformation {
                         matches!(loc, HirLoc::Global(_) | HirLoc::Field(_, _))
                     })
                 });
-                ctx.non_local_assign |= non_local_assign;
+                ctx.is_non_local_assign |= non_local_assign;
+                let file_param_index = file_param_index(ctx.ty, tcx);
+                ctx.is_generic &= file_param_index.is_none();
                 let ty = type_arena.make_ty(permissions, origins, ctx, tcx);
                 if !ty.is_copyable() {
                     if let HirLoc::Field(def_id, field) = hir_loc {
@@ -273,7 +281,7 @@ impl Pass for Transformation {
                     permissions,
                     origins,
                     ty,
-                    file_param_index: file_param_index(ctx.ty, tcx),
+                    file_param_index,
                 };
                 let old = hir_loc_to_pot.insert(hir_loc, pot);
                 if let Some(old) = old {

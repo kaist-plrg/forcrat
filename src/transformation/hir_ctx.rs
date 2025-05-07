@@ -62,6 +62,8 @@ pub(super) struct HirCtx {
     pub(super) ferror_functions: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
     /// callee span to stream argument name
     pub(super) callee_span_to_stream_name: FxHashMap<Span, Symbol>,
+    /// fn ptr call argument spans
+    pub(super) fn_ptr_arg_spans: Vec<Span>,
 
     /// callee span to expr hir_id
     pub(super) callee_span_to_hir_id: FxHashMap<Span, HirId>,
@@ -198,64 +200,69 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 }
             }
             hir::ExprKind::Call(callee, args) => {
-                let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind else { return };
-                self.ctx
-                    .callee_span_to_hir_id
-                    .insert(path.span, expr.hir_id);
-                if let Res::Def(DefKind::Fn, def_id) = path.res {
-                    if let Some(def_id) = def_id.as_local() {
-                        self.ctx.call_span_to_callee_id.insert(expr.span, def_id);
+                if let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind {
+                    self.ctx
+                        .callee_span_to_hir_id
+                        .insert(path.span, expr.hir_id);
+                    if let Res::Def(DefKind::Fn, def_id) = path.res {
+                        if let Some(def_id) = def_id.as_local() {
+                            self.ctx.call_span_to_callee_id.insert(expr.span, def_id);
+                        }
                     }
-                }
-                let name = path.segments.last().unwrap().ident.name;
-                if api_list::is_symbol_api(name) {
-                    for (_, parent) in self.tcx.hir().parent_iter(expr.hir_id) {
-                        match parent {
-                            hir::Node::Expr(e) => {
-                                if !matches!(e.kind, hir::ExprKind::DropTemps(_)) {
+                    let name = path.segments.last().unwrap().ident.name;
+                    if api_list::is_symbol_api(name) {
+                        for (_, parent) in self.tcx.hir().parent_iter(expr.hir_id) {
+                            match parent {
+                                hir::Node::Expr(e) => {
+                                    if !matches!(e.kind, hir::ExprKind::DropTemps(_)) {
+                                        self.ctx.retval_used_spans.insert(expr.span);
+                                        break;
+                                    }
+                                }
+                                hir::Node::ExprField(_)
+                                | hir::Node::LetStmt(_)
+                                | hir::Node::Block(_) => {
                                     self.ctx.retval_used_spans.insert(expr.span);
                                     break;
                                 }
+                                hir::Node::Stmt(_) => {
+                                    break;
+                                }
+                                _ => panic!("{:?}", parent),
                             }
-                            hir::Node::ExprField(_)
-                            | hir::Node::LetStmt(_)
-                            | hir::Node::Block(_) => {
-                                self.ctx.retval_used_spans.insert(expr.span);
-                                break;
-                            }
-                            hir::Node::Stmt(_) => {
-                                break;
-                            }
-                            _ => panic!("{:?}", parent),
                         }
                     }
-                }
-                let name = api_list::normalize_api_name(name.as_str());
-                let i = match name {
-                    "fscanf" | "fgetc" | "getc" | "fprintf" | "fflush" | "feof" | "ferror"
-                    | "clearerr" | "flockfile" | "funlockfile" => 0,
-                    "fputc" | "putc" | "fputwc" | "putwc" | "fputs" => 1,
-                    "fgets" | "getline" => 2,
-                    "fread" | "getdelim" | "fwrite" => 3,
-                    _ => return,
-                };
-                let arg_name = match &args[i].kind {
-                    hir::ExprKind::Path(QPath::Resolved(_, path)) => {
-                        path.segments.last().unwrap().ident.name
+                    let name = api_list::normalize_api_name(name.as_str());
+                    let i = match name {
+                        "fscanf" | "fgetc" | "getc" | "fprintf" | "fflush" | "feof" | "ferror"
+                        | "clearerr" | "flockfile" | "funlockfile" => 0,
+                        "fputc" | "putc" | "fputwc" | "putwc" | "fputs" => 1,
+                        "fgets" | "getline" => 2,
+                        "fread" | "getdelim" | "fwrite" => 3,
+                        _ => return,
+                    };
+                    let arg_name = match &args[i].kind {
+                        hir::ExprKind::Path(QPath::Resolved(_, path)) => {
+                            path.segments.last().unwrap().ident.name
+                        }
+                        hir::ExprKind::Field(_, field) => field.name,
+                        _ => return,
+                    };
+                    self.ctx
+                        .callee_span_to_stream_name
+                        .insert(path.span, arg_name);
+                    let funcs = match name {
+                        "feof" => &mut self.ctx.feof_functions,
+                        "ferror" => &mut self.ctx.ferror_functions,
+                        _ => return,
+                    };
+                    let curr_func = expr.hir_id.owner.def_id;
+                    funcs.entry(curr_func).or_default().insert(arg_name);
+                } else {
+                    for arg in args {
+                        self.ctx.fn_ptr_arg_spans.push(arg.span);
                     }
-                    hir::ExprKind::Field(_, field) => field.name,
-                    _ => return,
-                };
-                self.ctx
-                    .callee_span_to_stream_name
-                    .insert(path.span, arg_name);
-                let funcs = match name {
-                    "feof" => &mut self.ctx.feof_functions,
-                    "ferror" => &mut self.ctx.ferror_functions,
-                    _ => return,
-                };
-                let curr_func = expr.hir_id.owner.def_id;
-                funcs.entry(curr_func).or_default().insert(arg_name);
+                }
             }
             hir::ExprKind::Ret(Some(e)) => {
                 let curr_func = expr.hir_id.owner.def_id;
