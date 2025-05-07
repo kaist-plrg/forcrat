@@ -747,11 +747,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[0]) {
                                 return;
                             }
-                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
-                            let stream = TypedExpr::new(&args[0], ty);
-                            let ic = self.indicator_check(callee.span);
-                            let new_expr = transform_fflush(&stream, ic);
-                            self.replace_expr(expr, new_expr);
+                            if matches!(remove_cast(&args[0]).kind, ExprKind::Lit(_)) {
+                                self.replace_expr(expr, expr!("0"));
+                            } else {
+                                let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                                let stream = TypedExpr::new(&args[0], ty);
+                                let ic = self.indicator_check(callee.span);
+                                let new_expr = transform_fflush(&stream, ic);
+                                self.replace_expr(expr, new_expr);
+                            }
                         }
                         "fseek" | "fseeko" => {
                             if self.is_unsupported(&args[0]) {
