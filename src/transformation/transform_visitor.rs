@@ -37,8 +37,6 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
 
     /// function parameter to HIR location
     pub(super) param_to_loc: &'a FxHashMap<Parameter, HirLoc>,
-    /// function parameter to file type index
-    pub(super) param_to_file_type_index: &'a FxHashMap<Parameter, usize>,
     /// HIR location to permissions and origins
     pub(super) loc_to_pot: &'a FxHashMap<HirLoc, Pot<'a>>,
     /// user-defined API functions' signatures' spans
@@ -302,6 +300,20 @@ impl<'a> TransformVisitor<'_, 'a> {
             }
         }
     }
+
+    fn replace_fn_ptr_param_type(&mut self, ty: &mut Ty, pot: Pot<'_>, index: usize) {
+        let TyKind::Path(_, path) = &mut ty.kind else { panic!() };
+        let seg = path.segments.last_mut().unwrap();
+        assert_eq!(seg.ident.as_str(), "Option");
+        let args = seg.args.as_mut().unwrap();
+        let AngleBracketed(args) = args.deref_mut() else { panic!() };
+        let [arg] = &mut args.args[..] else { panic!() };
+        let AngleBracketedArg::Arg(arg) = arg else { panic!() };
+        let GenericArg::Type(ty) = arg else { panic!() };
+        let TyKind::BareFn(fn_ty) = &mut ty.kind else { panic!() };
+        let param = &mut fn_ty.decl.inputs[index];
+        self.replace_ty_with_pot(&mut param.ty, pot);
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
@@ -339,19 +351,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                     let p = Parameter::new(def_id, i);
                     let pot = some_or!(self.param_pot(p), continue);
-                    if let Some(index) = self.param_to_file_type_index.get(&p) {
+                    if let Some(index) = pot.file_param_index {
                         // When the parameter type is Option<fn(..) -> ..>
-                        let TyKind::Path(_, path) = &mut param.ty.kind else { panic!() };
-                        let seg = path.segments.last_mut().unwrap();
-                        assert_eq!(seg.ident.as_str(), "Option");
-                        let args = seg.args.as_mut().unwrap();
-                        let AngleBracketed(args) = args.deref_mut() else { panic!() };
-                        let [arg] = &mut args.args[..] else { panic!() };
-                        let AngleBracketedArg::Arg(arg) = arg else { panic!() };
-                        let GenericArg::Type(ty) = arg else { panic!() };
-                        let TyKind::BareFn(fn_ty) = &mut ty.kind else { panic!() };
-                        let param = &mut fn_ty.decl.inputs[*index];
-                        self.replace_ty_with_pot(&mut param.ty, pot);
+                        self.replace_fn_ptr_param_type(&mut param.ty, pot, index);
                     } else if let StreamType::Option(StreamType::Impl(bound)) = pot.ty {
                         self.replace_ty(&mut param.ty, ty!("Option<TT{}>", i));
                         tparams.push((i, *bound));
@@ -451,7 +453,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 continue;
             }
             let pot = some_or!(self.binding_pot(f.span), continue);
-            self.replace_ty_with_pot(&mut f.ty, pot);
+            if let Some(index) = pot.file_param_index {
+                // When the file type is Option<fn(..) -> ..>
+                self.replace_fn_ptr_param_type(&mut f.ty, pot, index);
+            } else {
+                self.replace_ty_with_pot(&mut f.ty, pot);
+            }
         }
     }
 
@@ -874,18 +881,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     }
                     let pot = some_or!(self.bound_expr_pot(&call.receiver), return);
                     let permissions = pot.permissions;
-                    for arg in args {
+                    if let Some(index) = pot.file_param_index {
+                        let arg = &mut args[index];
                         if self.is_unsupported(arg) {
-                            continue;
-                        }
-                        if self.bound_expr_pot(arg).is_none() {
-                            continue;
+                            return;
                         }
                         let consume = permissions.contains(Permission::Close)
                             || matches!(arg.kind, ExprKind::Call(_, _) | ExprKind::MethodCall(_));
                         self.convert_rhs(arg, pot, consume);
                     }
-                    println!("{}", pot.ty);
                 }
             }
             ExprKind::Path(None, path) => {

@@ -2209,6 +2209,35 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_fn_ptr_field() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    func: Option::<unsafe extern "C" fn(*mut FILE) -> ()>,
+}
+unsafe extern "C" fn g(mut stream: *mut FILE) {
+    fgetc(stream);
+    fgetc(stream);
+}
+unsafe fn f() {
+    let mut s: s = s { func: None };
+    s.func = Some(g as unsafe extern "C" fn(*mut FILE) -> ());
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    (s.func).unwrap()(stream);
+    (s.func).unwrap()(stream);
+    fclose(stream);
+}"#,
+        &["Read", "read_exact"],
+        &["fopen", "fgetc", "fclose", "FILE"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

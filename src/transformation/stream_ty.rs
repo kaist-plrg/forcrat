@@ -19,6 +19,7 @@ pub(super) struct Pot<'a> {
     #[allow(unused)]
     pub(super) origins: BitSet8<Origin>,
     pub(super) ty: &'a StreamType<'a>,
+    pub(super) file_param_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]

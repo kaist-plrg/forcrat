@@ -170,7 +170,6 @@ impl Pass for Transformation {
         let arena = Arena::new();
         let type_arena = TypeArena::new(&arena);
         let mut param_to_hir_loc = FxHashMap::default();
-        let mut param_to_file_type_index = FxHashMap::default();
         let mut hir_loc_to_pot = FxHashMap::default();
         let mut uncopiable = vec![];
         for ((loc, permissions), origins) in analysis_res
@@ -210,14 +209,10 @@ impl Pass for Transformation {
                                     func: *def_id,
                                     index: local.as_usize() - 1,
                                 };
-                                let index = file_type_index(ty, tcx);
-                                if let Some(index) = index {
-                                    param_to_file_type_index.insert(param, index);
-                                }
                                 let loc = locs[0];
                                 param_to_hir_loc.insert(param, loc);
                                 let bounds = hir_ctx.loc_to_bound_spans.get(&loc);
-                                index.is_none()
+                                file_param_index(ty, tcx).is_none()
                                     && !analysis_res.fn_ptrs.contains(def_id)
                                     && bounds.is_none_or(|bounds| {
                                         bounds
@@ -278,6 +273,7 @@ impl Pass for Transformation {
                     permissions,
                     origins,
                     ty,
+                    file_param_index: file_param_index(ctx.ty, tcx),
                 };
                 let old = hir_loc_to_pot.insert(hir_loc, pot);
                 if let Some(old) = old {
@@ -301,6 +297,7 @@ impl Pass for Transformation {
                 permissions,
                 origins,
                 ty,
+                file_param_index: None,
             };
             let old = hir_loc_to_pot.insert(*hir_loc, pot);
             assert!(old.is_none());
@@ -392,7 +389,6 @@ impl Pass for Transformation {
                 analysis_res: &analysis_res,
                 hir: &hir_ctx,
                 param_to_loc: &param_to_hir_loc,
-                param_to_file_type_index: &param_to_file_type_index,
                 loc_to_pot: &hir_loc_to_pot,
                 api_ident_spans: &api_ident_spans,
                 uncopiable: &uncopiable,
@@ -459,12 +455,12 @@ fn mir_local_span(
     local_decl.source_info.span
 }
 
-fn file_type_index<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<usize> {
+fn file_param_index<'tcx>(ty: rustc_middle::ty::Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<usize> {
     match ty.kind() {
         rustc_middle::ty::TyKind::Adt(adt_def, targs) => {
             if compile_util::is_option_ty(adt_def.did(), tcx) {
                 let targs = targs.into_type_list(tcx);
-                file_type_index(targs[0], tcx)
+                file_param_index(targs[0], tcx)
             } else {
                 None
             }
