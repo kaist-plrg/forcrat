@@ -2300,6 +2300,35 @@ unsafe fn e() {
     );
 }
 
+#[test]
+fn test_fn_ptr_unused_param() {
+    run_test(
+        r#"
+unsafe extern "C" fn h0(mut stream: *mut FILE) {}
+unsafe extern "C" fn h1(mut stream: *mut FILE) {
+    fputc('a' as i32, stream);
+}
+unsafe fn g(
+    mut stream: *mut FILE,
+    mut func: Option::<unsafe extern "C" fn(*mut FILE) -> ()>,
+) {
+    func.unwrap()(stream);
+    func.unwrap()(stream);
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"w\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream, Some(h0 as unsafe extern "C" fn(*mut FILE) -> ()));
+    g(stream, Some(h1 as unsafe extern "C" fn(*mut FILE) -> ()));
+    fclose(stream);
+}"#,
+        &["Write", "write_all"],
+        &["fopen", "fputc", "fclose", "FILE"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

@@ -713,10 +713,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 self.permission_graph.add_edge(lhs, rhs);
                 self.origin_graph.add_edge(rhs, lhs);
             }
-            Variance::Contravariant => {
-                self.permission_graph.add_edge(rhs, lhs);
-                self.origin_graph.add_edge(lhs, rhs);
-            }
             Variance::Invariant => {
                 self.permission_graph.add_edge(lhs, rhs);
                 self.permission_graph.add_edge(rhs, lhs);
@@ -766,19 +762,6 @@ fn strip_index_projection<'a, 'tcx>(
 enum Variance {
     Covariant,
     Invariant,
-    Contravariant,
-}
-
-impl std::ops::Not for Variance {
-    type Output = Self;
-
-    fn not(self) -> Self::Output {
-        match self {
-            Variance::Covariant => Variance::Contravariant,
-            Variance::Invariant => Variance::Invariant,
-            Variance::Contravariant => Variance::Covariant,
-        }
-    }
 }
 
 fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance> {
@@ -810,7 +793,9 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
             .skip_binder()
             .inputs()
             .iter()
-            .find_map(|ty| file_type_variance(*ty, tcx).map(|v| !v)),
+            // use invariance instead of contravariance
+            // because fn(A) cannot be coerced to fn(B) if A != B
+            .find_map(|ty| file_type_variance(*ty, tcx).map(|_| Variance::Invariant)),
         _ => None,
     };
     assert_eq!(
