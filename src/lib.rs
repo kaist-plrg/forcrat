@@ -58,6 +58,7 @@ pub mod extern_finder;
 pub mod file_analysis;
 pub mod format;
 pub mod formatter;
+pub mod graph;
 pub mod likely_lit;
 pub mod preprocessor;
 pub mod return_finder;

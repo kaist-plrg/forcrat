@@ -7,6 +7,7 @@ use rustc_ast::mut_visit::MutVisitor;
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir, HirId};
+use rustc_index::IndexVec;
 use rustc_middle::{
     mir,
     ty::{List, TyCtxt},
@@ -18,8 +19,10 @@ use transform_visitor::*;
 use typed_arena::Arena;
 
 use crate::{
+    api_list::Permission,
     compile_util::{self, Pass},
     file_analysis::{self, Loc},
+    graph,
 };
 
 pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
@@ -173,18 +176,12 @@ impl Pass for Transformation {
             .filter_map(|span| hir_ctx.bound_span_to_loc.get(span))
             .collect();
 
-        let arena = Arena::new();
-        let type_arena = TypeArena::new(&arena);
         let mut param_to_hir_loc = FxHashMap::default();
-        let mut hir_loc_to_pot = FxHashMap::default();
-        let mut uncopiable = vec![];
-        for ((loc, permissions), origins) in analysis_res
-            .locs
-            .iter()
-            .zip(analysis_res.permissions.iter().copied())
-            .zip(analysis_res.origins.iter().copied())
-        {
-            let (hir_locs, mut ctx) = match loc {
+        let mut hir_loc_to_param = FxHashMap::default();
+        let mut non_generic_params = FxHashSet::default();
+        let mut loc_id_to_hir_locs = IndexVec::from_raw(vec![None; analysis_res.locs.len()]);
+        for (loc_id, loc) in analysis_res.locs.iter_enumerated() {
+            let (hir_locs, ctx) = match loc {
                 Loc::Var(def_id, local) => {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     match item.kind {
@@ -208,27 +205,28 @@ impl Pass for Transformation {
                             let body = tcx.optimized_mir(*def_id);
                             let ty = body.local_decls[*local].ty;
 
-                            let arity = sig.decl.inputs.len();
-                            let is_param = (1..=arity).contains(&local.as_usize());
-                            let is_generic = if is_param {
+                            if (1..=sig.decl.inputs.len()).contains(&local.as_usize()) {
+                                // if this local is a parameter
                                 let param = Parameter {
                                     func: *def_id,
                                     index: local.as_usize() - 1,
                                 };
                                 let loc = locs[0];
                                 param_to_hir_loc.insert(param, loc);
-                                let bounds = hir_ctx.loc_to_bound_spans.get(&loc);
-                                !analysis_res.fn_ptrs.contains(def_id)
-                                    && !fn_ptr_args.contains(&loc)
-                                    && bounds.is_none_or(|bounds| {
-                                        bounds
-                                            .iter()
-                                            .all(|bound| !hir_ctx.lhs_to_rhs.contains_key(bound))
-                                    })
-                            } else {
-                                false
-                            };
-                            (locs, LocCtx::new(is_generic, false, is_static_return, ty))
+                                hir_loc_to_param.insert(loc, param);
+
+                                if analysis_res.fn_ptrs.contains(def_id)
+                                    || fn_ptr_args.contains(&loc)
+                                    || analysis_res.permissions[loc_id].contains(Permission::Lock)
+                                    || compile_util::is_file_ptr_ptr(ty, tcx)
+                                    || file_param_index(ty, tcx).is_some()
+                                    || hir_ctx.is_loc_used_in_assign(loc)
+                                {
+                                    non_generic_params.insert(param);
+                                }
+                            }
+
+                            (locs, LocCtx::new(false, false, is_static_return, ty))
                         }
                         hir::ItemKind::Static(_, _, _) => {
                             if *local != mir::Local::ZERO {
@@ -256,10 +254,53 @@ impl Pass for Transformation {
                 }
                 _ => continue,
             };
+            loc_id_to_hir_locs[loc_id] = Some((hir_locs, ctx));
+        }
+
+        let mut param_flow: FxHashMap<Parameter, FxHashSet<Parameter>> = param_to_hir_loc
+            .keys()
+            .map(|p| (*p, FxHashSet::default()))
+            .collect();
+        for ((func, index), spans) in &hir_ctx.fn_param_to_arg_spans {
+            let param = Parameter {
+                func: *func,
+                index: *index,
+            };
+            if !param_to_hir_loc.contains_key(&param) {
+                continue;
+            }
+            let set = param_flow.get_mut(&param).unwrap();
+            for span in spans {
+                let loc = some_or!(hir_ctx.bound_span_to_loc.get(span), continue);
+                let param = some_or!(hir_loc_to_param.get(loc), continue);
+                set.insert(*param);
+            }
+        }
+        let transitive_param_flow = graph::transitive_closure(&param_flow);
+        let non_generic_params: FxHashSet<_> = non_generic_params
+            .into_iter()
+            .flat_map(|param| {
+                transitive_param_flow[&param]
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(param))
+            })
+            .collect();
+
+        let arena = Arena::new();
+        let type_arena = TypeArena::new(&arena);
+        let mut hir_loc_to_pot = FxHashMap::default();
+        let mut uncopiable = vec![];
+        for (loc_id, v) in loc_id_to_hir_locs.into_iter_enumerated() {
+            let (hir_locs, mut ctx) = some_or!(v, continue);
+            let permissions = analysis_res.permissions[loc_id];
+            let origins = analysis_res.origins[loc_id];
+
             for hir_loc in hir_locs {
                 if unsupported_locs.contains(&hir_loc) {
                     continue;
                 }
+
                 let bounds = hir_ctx.loc_to_bound_spans.get(&hir_loc);
                 let non_local_assign = bounds.is_some_and(|bounds| {
                     bounds.iter().any(|bound| {
@@ -269,19 +310,25 @@ impl Pass for Transformation {
                     })
                 });
                 ctx.is_non_local_assign |= non_local_assign;
-                let file_param_index = file_param_index(ctx.ty, tcx);
-                ctx.is_generic &= file_param_index.is_none();
+
+                if let Some(param) = hir_loc_to_param.get(&hir_loc) {
+                    if !non_generic_params.contains(param) {
+                        ctx.is_generic = true;
+                    }
+                }
+
                 let ty = type_arena.make_ty(permissions, origins, ctx, tcx);
                 if !ty.is_copyable() {
                     if let HirLoc::Field(def_id, field) = hir_loc {
                         uncopiable.push((def_id, field));
                     }
                 }
+
                 let pot = Pot {
                     permissions,
                     origins,
                     ty,
-                    file_param_index,
+                    file_param_index: file_param_index(ctx.ty, tcx),
                 };
                 let old = hir_loc_to_pot.insert(hir_loc, pot);
                 if let Some(old) = old {
@@ -289,6 +336,7 @@ impl Pass for Transformation {
                 }
             }
         }
+
         for hir_loc in hir_ctx.loc_to_bound_spans.keys() {
             let HirLoc::Global(def_id) = hir_loc else { continue };
             let name = some_or!(compile_util::def_id_to_value_symbol(*def_id, tcx), continue);
@@ -310,6 +358,7 @@ impl Pass for Transformation {
             let old = hir_loc_to_pot.insert(*hir_loc, pot);
             assert!(old.is_none());
         }
+
         for param_loc in param_to_hir_loc.values() {
             let bound = some_or!(hir_ctx.loc_to_bound_spans.get(param_loc), continue);
             let mut tys = vec![];
@@ -326,6 +375,7 @@ impl Pass for Transformation {
             let pot = hir_loc_to_pot.get_mut(param_loc).unwrap();
             pot.ty = ty;
         }
+
         let mut visited = FxHashSet::default();
         let mut work_list = uncopiable;
         let mut uncopiable: FxHashMap<_, Vec<_>> = FxHashMap::default();

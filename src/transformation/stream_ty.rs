@@ -104,8 +104,7 @@ impl<'a> TypeArena<'a> {
         ctx: LocCtx<'tcx>,
         tcx: TyCtxt<'tcx>,
     ) -> &'a StreamType<'a> {
-        let is_ptr_ptr = compile_util::is_file_ptr_ptr(ctx.ty, tcx);
-        let ty = if ctx.is_generic && !permissions.contains(Permission::Lock) && !is_ptr_ptr {
+        let ty = if ctx.is_generic {
             let mut traits = BitSet8::new_empty();
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
@@ -170,7 +169,11 @@ impl<'a> TypeArena<'a> {
             };
             self.option(ty)
         };
-        let ty = if is_ptr_ptr { self.ptr(ty) } else { ty };
+        let ty = if compile_util::is_file_ptr_ptr(ctx.ty, tcx) {
+            self.ptr(ty)
+        } else {
+            ty
+        };
         if ctx.is_union && !ty.is_copyable() {
             self.manually_drop(ty)
         } else {

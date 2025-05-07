@@ -462,7 +462,7 @@ impl Conversion {
                 }
             }
             Self::Double | Self::DoubleExp | Self::DoubleAuto | Self::DoubleError => match length {
-                None => "f64",
+                None | Some(Long) => "f64",
                 Some(LongDouble) => "f128::f128",
                 _ => panic!(),
             },

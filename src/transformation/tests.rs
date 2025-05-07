@@ -2267,6 +2267,39 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_non_generic_param_param() {
+    run_test(
+        r#"
+unsafe extern "C" fn h(mut stream: *mut FILE) {
+    fgetc(stream);
+    fgetc(stream);
+}
+unsafe fn g(
+    mut stream: *mut FILE,
+    mut func: Option::<unsafe extern "C" fn(*mut FILE) -> ()>,
+) {
+    func.unwrap()(stream);
+    func.unwrap()(stream);
+}
+unsafe fn f(mut stream: *mut FILE) {
+    g(stream, Some(h as unsafe extern "C" fn(*mut FILE) -> ()));
+    g(stream, Some(h as unsafe extern "C" fn(*mut FILE) -> ()));
+}
+unsafe fn e() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    f(stream);
+    f(stream);
+    fclose(stream);
+}"#,
+        &["Read", "read_exact"],
+        &["fopen", "fgetc", "fclose", "FILE"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

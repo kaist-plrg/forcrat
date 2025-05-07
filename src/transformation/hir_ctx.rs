@@ -64,6 +64,8 @@ pub(super) struct HirCtx {
     pub(super) callee_span_to_stream_name: FxHashMap<Span, Symbol>,
     /// fn ptr call argument spans
     pub(super) fn_ptr_arg_spans: Vec<Span>,
+    /// fn def_id and param index to arg spans
+    pub(super) fn_param_to_arg_spans: FxHashMap<(LocalDefId, usize), Vec<Span>>,
 
     /// callee span to expr hir_id
     pub(super) callee_span_to_hir_id: FxHashMap<Span, HirId>,
@@ -81,6 +83,15 @@ pub(super) struct HirCtx {
 
     /// struct id to owning struct ids and field indices
     pub(super) struct_to_owning_structs: FxHashMap<LocalDefId, FxHashSet<(LocalDefId, FieldIdx)>>,
+}
+
+impl HirCtx {
+    pub(super) fn is_loc_used_in_assign(&self, loc: HirLoc) -> bool {
+        let spans = some_or!(self.loc_to_bound_spans.get(&loc), return false);
+        spans
+            .iter()
+            .any(|span| self.lhs_to_rhs.contains_key(span) || self.rhs_to_lhs.contains_key(span))
+    }
 }
 
 pub(super) struct HirVisitor<'tcx> {
@@ -207,6 +218,13 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     if let Res::Def(DefKind::Fn, def_id) = path.res {
                         if let Some(def_id) = def_id.as_local() {
                             self.ctx.call_span_to_callee_id.insert(expr.span, def_id);
+                            for (i, arg) in args.iter().enumerate() {
+                                self.ctx
+                                    .fn_param_to_arg_spans
+                                    .entry((def_id, i))
+                                    .or_default()
+                                    .push(arg.span);
+                            }
                         }
                     }
                     let name = path.segments.last().unwrap().ident.name;
