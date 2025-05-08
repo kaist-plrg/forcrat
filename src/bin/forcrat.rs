@@ -23,6 +23,7 @@ enum Command {
     },
     CountReturnValues,
     FindFileReturns,
+    FindErrorHandles,
     FindFileTypes {
         #[arg(long, default_value = "false")]
         mir: bool,
@@ -141,6 +142,9 @@ fn main() {
         }
         Command::FindFileTypes { mir } => {
             ty_finder::TyFinder { mir }.run_on_path(&file);
+        }
+        Command::FindErrorHandles => {
+            error_finder::ErrorFinder.run_on_path(&file);
         }
         Command::Steensgaard => {
             let res = steensgaard::Steensgaard.run_on_path(&file);
