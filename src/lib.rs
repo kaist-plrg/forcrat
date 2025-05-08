@@ -54,7 +54,6 @@ pub mod ast_maker;
 pub mod bit_set;
 pub mod compile_util;
 pub mod disjoint_set;
-pub mod extern_finder;
 pub mod file_analysis;
 pub mod format;
 pub mod formatter;
