@@ -1357,22 +1357,34 @@ if !c.is_ascii_whitespace() {
                 };
                 let assign = if let Some(arg) = arg {
                     let ty = spec.ty();
-                    if ty == "&str" {
-                        format!(
-                            "
+                    match ty {
+                        "&str" => {
+                            format!(
+                                "
     let bytes = s.as_bytes();
     let buf: &mut [u8] = std::slice::from_raw_parts_mut(({}) as _, bytes.len() + 1);
     buf.copy_from_slice(bytes);
-    buf[bytes.len()] = 0;",
-                            arg
-                        )
-                    } else {
-                        format!(
-                            "
+    buf[bytes.len()] = 0;
+    count += 1;",
+                                arg
+                            )
+                        }
+                        "f128::f128" => {
+                            format!(
+                                "
+    *(({}) as *mut {}) = <f128::f128 as num_traits::Num>::from_str_radix(&s, 10).unwrap();
+    count += 1;",
+                                arg, ty
+                            )
+                        }
+                        _ => {
+                            format!(
+                                "
     *(({}) as *mut {}) = s.parse().unwrap();
     count += 1;",
-                            arg, ty
-                        )
+                                arg, ty
+                            )
+                        }
                     }
                 } else {
                     "".to_string()

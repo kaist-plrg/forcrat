@@ -301,14 +301,31 @@ impl Pass for Transformation {
                     continue;
                 }
 
-                let bounds = hir_ctx.loc_to_bound_spans.get(&hir_loc);
-                let non_local_assign = bounds.is_some_and(|bounds| {
-                    bounds.iter().any(|bound| {
-                        let rhs = some_or!(hir_ctx.lhs_to_rhs.get(bound), return false);
-                        let loc = some_or!(hir_ctx.bound_span_to_loc.get(rhs), return false);
-                        matches!(loc, HirLoc::Global(_) | HirLoc::Field(_, _))
-                    })
-                });
+                let non_local_assign =
+                    // is a global variable or a field assigned to this location without assigning
+                    // a local variable to the variable/field in the same function
+                    hir_ctx.rhs_locs_of_lhs(hir_loc).any(|rhs| {
+                        match rhs {
+                            HirLoc::Local(_) | HirLoc::Return(_) => return false,
+                            HirLoc::Global(def_id) => {
+                                let name = compile_util::def_id_to_value_symbol(def_id, tcx).unwrap();
+                                let name = name.as_str();
+                                if name == "stdin" || name == "stdout" || name == "stderr" {
+                                    return false;
+                                }
+                            }
+                            HirLoc::Field(_, _) => {}
+                        }
+                        if matches!(rhs, HirLoc::Local(_)) {
+                            return false;
+                        }
+                        let HirLoc::Local(loc_id) = hir_loc else { return true };
+                        // to handle `test_return_old_static`-like cases
+                        !hir_ctx.rhs_locs_of_lhs(rhs).any(|rhs| {
+                            let HirLoc::Local(hir_id) = rhs else { return false };
+                            hir_id.owner == loc_id.owner
+                        })
+                    });
                 ctx.is_non_local_assign |= non_local_assign;
 
                 if let Some(param) = hir_loc_to_param.get(&hir_loc) {

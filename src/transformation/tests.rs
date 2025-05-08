@@ -2329,6 +2329,25 @@ unsafe fn f() {
     );
 }
 
+#[test]
+fn test_return_old_static() {
+    run_test(
+        r#"
+static mut stream: *mut FILE = 0 as *const FILE as *mut FILE;
+unsafe extern "C" fn f(mut new_stream: *mut FILE) -> *mut FILE {
+    let mut previous_stream: *mut FILE = 0 as *mut FILE;
+    if stream.is_null() {
+        stream = stderr;
+    }
+    previous_stream = stream;
+    stream = new_stream;
+    return previous_stream;
+}"#,
+        &["Stderr"],
+        &["FILE"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

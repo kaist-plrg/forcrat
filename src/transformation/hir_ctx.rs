@@ -92,6 +92,17 @@ impl HirCtx {
             .iter()
             .any(|span| self.lhs_to_rhs.contains_key(span) || self.rhs_to_lhs.contains_key(span))
     }
+
+    pub(super) fn rhs_locs_of_lhs(&self, lhs: HirLoc) -> Box<dyn Iterator<Item = HirLoc> + '_> {
+        let spans = some_or!(
+            self.loc_to_bound_spans.get(&lhs),
+            return Box::new(std::iter::empty())
+        );
+        Box::new(spans.iter().filter_map(|span| {
+            let rhs = self.lhs_to_rhs.get(span)?;
+            self.bound_span_to_loc.get(rhs).copied()
+        }))
+    }
 }
 
 pub(super) struct HirVisitor<'tcx> {
