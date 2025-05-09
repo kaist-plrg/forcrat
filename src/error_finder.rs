@@ -10,7 +10,7 @@ use rustc_hir::{
 };
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, Const, Operand, TerminatorKind},
+    mir::{Const, Operand, TerminatorKind},
     query::IntoQueryParam,
     ty::{self, TyCtxt},
 };
@@ -46,21 +46,15 @@ impl Pass for ErrorFinder {
                     continue;
                 }
 
-                let handle_arg = visitor.call_span_to_args[&term.source_info.span][0]
-                    .as_ref()
-                    .unwrap();
-                let mut worklist = vec![(handle_bb, Path::default())];
-                let mut bb_to_calls = FxHashMap::default();
-                let mut existing_call_bbss = FxHashSet::default();
-                let mut existing_completed_call_bbss = FxHashSet::default();
-                let mut existing_bb_call_bbs = FxHashSet::default();
-                let mut completed_paths_with_source = vec![];
-                let mut completed_paths_without_source = vec![];
-                while let Some((bb, mut path)) = worklist.pop() {
-                    if !path.visited.insert(bb) {
-                        continue;
-                    }
-                    if !existing_bb_call_bbs.insert((bb, path.calls.clone())) {
+                let handle_span = term.source_info.span;
+                let handle_arg = visitor.call_span_to_args[&handle_span][0].as_ref().unwrap();
+                let mut worklist = vec![handle_bb];
+                let mut visited = FxHashSet::default();
+                let mut sources = vec![];
+                let mut non_sources = vec![];
+                let mut entry = false;
+                while let Some(bb) = worklist.pop() {
+                    if !visited.insert(bb) {
                         continue;
                     }
 
@@ -76,25 +70,13 @@ impl Pass for ErrorFinder {
                                 arg.as_ref().is_some_and(|arg| arg.is_prefix_of(handle_arg))
                             })
                         }) {
-                            path.calls.push(bb);
-                            if !existing_call_bbss.insert(path.calls.clone()) {
-                                continue;
-                            }
-                            bb_to_calls
-                                .entry(bb)
-                                .or_insert_with(|| Call { callee, args, span });
+                            let call = Call { callee, args, span };
 
-                            if callee.is_some_and(|callee| is_non_handling_api(callee, tcx)) {
-                                let paths = if path.calls.iter().all(|bb| {
-                                    bb_to_calls[bb]
-                                        .callee
-                                        .is_some_and(|callee| api_list::is_def_id_api(callee, tcx))
-                                }) {
-                                    &mut completed_paths_with_source
-                                } else {
-                                    &mut completed_paths_without_source
-                                };
-                                paths.push(path);
+                            if !callee.is_some_and(|callee| api_list::is_def_id_api(callee, tcx)) {
+                                non_sources.push(call);
+                                continue;
+                            } else if !is_handling_api(callee.unwrap(), tcx) {
+                                sources.push(call);
                                 continue;
                             }
                         }
@@ -102,45 +84,38 @@ impl Pass for ErrorFinder {
 
                     let preds = &predecessors[bb];
                     if preds.is_empty() {
-                        if existing_completed_call_bbss.insert(path.calls.clone()) {
-                            completed_paths_without_source.push(path);
-                        }
-                        continue;
+                        entry = true;
                     }
                     for pred in preds {
-                        worklist.push((*pred, path.clone()));
+                        worklist.push(*pred);
                     }
                 }
 
-                if !completed_paths_without_source.is_empty() {
+                if !non_sources.is_empty() || entry && sources.is_empty() {
                     if !def_id_printed {
                         println!("{:?}", def_id);
                         def_id_printed = true;
                     }
-                    println!(" {:?}", handle_bb);
-                    for path in completed_paths_without_source {
-                        println!("  Path");
-                        for bb in path.calls {
-                            let call = bb_to_calls[&bb];
-                            println!("   {:?} {:?}", bb, call);
-                        }
+                    println!(" {} {:?}", def_id_to_string(handle_callee), handle_span);
+                    if entry {
+                        println!("  Entry");
                     }
-                    println!("  {} source-found paths", completed_paths_with_source.len());
+                    for path in non_sources {
+                        println!("  NonSource {:?}", path);
+                    }
+                    for call in sources {
+                        println!("  Source {:?}", call);
+                    }
                 }
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct Path {
-    visited: FxHashSet<BasicBlock>,
-    calls: Vec<BasicBlock>,
-}
-
 #[derive(Clone, Copy)]
 struct Call<'a> {
     callee: Option<LocalDefId>,
+    #[allow(unused)]
     args: Option<&'a Vec<Option<ExprLoc>>>,
     span: Span,
 }
@@ -153,17 +128,17 @@ impl std::fmt::Debug for Call<'_> {
         } else {
             write!(f, "?(")?;
         }
-        if let Some(args) = self.args {
-            for arg in args {
-                if let Some(arg) = arg {
-                    write!(f, "{:?}, ", arg)?;
-                } else {
-                    write!(f, "?, ")?;
-                }
-            }
-        } else {
-            write!(f, "??")?;
-        }
+        // if let Some(args) = self.args {
+        //     for arg in args {
+        //         if let Some(arg) = arg {
+        //             write!(f, "{:?}, ", arg)?;
+        //         } else {
+        //             write!(f, "?, ")?;
+        //         }
+        //     }
+        // } else {
+        //     write!(f, "??")?;
+        // }
         write!(f, ")")
     }
 }
@@ -173,12 +148,6 @@ fn is_handling_api(def_id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool 
     let name = compile_util::def_id_to_value_symbol(def_id, tcx).unwrap();
     let name = api_list::normalize_api_name(name.as_str());
     name == "feof" || name == "ferror" || name == "clearerr"
-}
-
-#[inline]
-fn is_non_handling_api(def_id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
-    let def_id = def_id.into_query_param();
-    api_list::is_def_id_api(def_id, tcx) && !is_handling_api(def_id, tcx)
 }
 
 fn operand_to_def_id(op: &Operand<'_>) -> Option<LocalDefId> {
