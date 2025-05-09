@@ -6,15 +6,16 @@ use rustc_hir::{
     def::{DefKind, Res},
     def_id::{DefId, LocalDefId},
     intravisit::{self, Visitor},
-    Expr, ExprKind, HirId, QPath,
+    Expr, ExprKind, HirId, ItemKind, Node, PatKind, QPath,
 };
 use rustc_middle::{
     hir::nested_filter,
-    mir::{Const, Operand, TerminatorKind},
+    mir::{BasicBlock, Const, Operand, TerminatorKind},
     query::IntoQueryParam,
     ty::{self, TyCtxt},
 };
 use rustc_span::{Span, Symbol};
+use typed_arena::Arena;
 
 use crate::{
     api_list,
@@ -35,12 +36,10 @@ impl Pass for ErrorFinder {
         tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
         for def_id in visitor.error_handling_fns {
-            let mut def_id_printed = false;
-
             let body = tcx.optimized_mir(def_id);
-            let predecessors = body.basic_blocks.predecessors();
 
-            for (handle_bb, bbd) in body.basic_blocks.iter_enumerated() {
+            let mut results = vec![];
+            for (bb, bbd) in body.basic_blocks.iter_enumerated() {
                 let term = bbd.terminator();
                 let TerminatorKind::Call { func, args, .. } = &term.kind else { continue };
 
@@ -56,101 +55,134 @@ impl Pass for ErrorFinder {
                     continue;
                 }
 
-                let handle_span = term.source_info.span;
-                let handle_arg = visitor.call_span_to_args[&handle_span][0].as_ref().unwrap();
-                let mut worklist = vec![handle_bb];
-                let mut visited = FxHashSet::default();
-                let mut sources = vec![];
-                let mut non_sources = vec![];
-                let mut entry = false;
-                while let Some(bb) = worklist.pop() {
-                    if !visited.insert(bb) {
-                        continue;
-                    }
+                let span = term.source_info.span;
+                let func = def_id;
+                let loc = visitor.call_span_to_args[&span][0].as_ref().unwrap();
+                let label = Label { func, bb, loc };
+                let result = analyze(label, &visitor.call_span_to_args, tcx);
+                results.push((span, loc, result));
+            }
 
-                    let bbd = &body.basic_blocks[bb];
-                    let term = bbd.terminator();
-
-                    if let TerminatorKind::Call { func, .. } = &term.kind {
-                        let callee = operand_to_def_id(func);
-                        let span = term.source_info.span;
-                        let args = visitor.call_span_to_args.get(&span);
-                        if args.is_some_and(|args| {
-                            args.iter().any(|arg| {
-                                arg.as_ref().is_some_and(|arg| arg.is_prefix_of(handle_arg))
-                            })
-                        }) {
-                            let call = Call { callee, args, span };
-
-                            if !callee.is_some_and(|callee| api_list::is_def_id_api(callee, tcx)) {
-                                non_sources.push(call);
-                                continue;
-                            } else if !is_handling_api(callee.unwrap(), tcx) {
-                                sources.push(call);
-                                continue;
-                            }
-                        }
-                    }
-
-                    let preds = &predecessors[bb];
-                    if preds.is_empty() {
-                        entry = true;
-                    }
-                    for pred in preds {
-                        worklist.push(*pred);
-                    }
+            if results.is_empty() {
+                continue;
+            }
+            let mut def_id_printed = false;
+            for (span, loc, (sources, fn_ptr_call)) in results {
+                let msg = if fn_ptr_call {
+                    "fn ptr call"
+                } else if sources.is_empty() {
+                    "no source"
+                } else if loc.is_std() {
+                    "std"
+                } else {
+                    continue;
+                };
+                if !def_id_printed {
+                    println!("{:?}", def_id);
+                    def_id_printed = true;
                 }
-
-                if !non_sources.is_empty() || entry && sources.is_empty() {
-                    if !def_id_printed {
-                        println!("{:?}", def_id);
-                        def_id_printed = true;
-                    }
-                    println!(" {} {:?}", def_id_to_string(handle_callee), handle_span);
-                    if entry {
-                        println!("  Entry");
-                    }
-                    for path in non_sources {
-                        println!("  NonSource {:?}", path);
-                    }
-                    for call in sources {
-                        println!("  Source {:?}", call);
-                    }
-                }
+                println!(" {}: {:?}", msg, span);
             }
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct Call<'a> {
-    callee: Option<LocalDefId>,
-    #[allow(unused)]
-    args: Option<&'a Vec<Option<ExprLoc>>>,
-    span: Span,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Label<'a> {
+    func: LocalDefId,
+    bb: BasicBlock,
+    loc: &'a ExprLoc,
 }
 
-impl std::fmt::Debug for Call<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: ", self.span)?;
-        if let Some(callee) = self.callee {
-            write!(f, "{}(", def_id_to_string(callee))?;
-        } else {
-            write!(f, "?(")?;
+fn analyze(
+    start_label: Label<'_>,
+    call_span_to_args: &FxHashMap<Span, Vec<Option<ExprLoc>>>,
+    tcx: TyCtxt<'_>,
+) -> (Vec<Source>, bool) {
+    let mut worklist = vec![start_label];
+    let mut visited = FxHashSet::default();
+    let mut func_to_return_bb = FxHashMap::default();
+    let arena = Arena::new();
+    let mut sources = vec![];
+    let mut fn_ptr_call = false;
+
+    'l: while let Some(label) = worklist.pop() {
+        if !visited.insert(label) {
+            continue;
         }
-        // if let Some(args) = self.args {
-        //     for arg in args {
-        //         if let Some(arg) = arg {
-        //             write!(f, "{:?}, ", arg)?;
-        //         } else {
-        //             write!(f, "?, ")?;
-        //         }
-        //     }
-        // } else {
-        //     write!(f, "??")?;
-        // }
-        write!(f, ")")
+
+        let body = tcx.optimized_mir(label.func);
+        let bbd = &body.basic_blocks[label.bb];
+        let term = bbd.terminator();
+
+        if let TerminatorKind::Call { func, .. } = &term.kind {
+            let span = term.source_info.span;
+            if let Some(args) = call_span_to_args.get(&span) {
+                for (i, arg) in args.iter().enumerate() {
+                    let arg = some_or!(arg, continue);
+                    if !arg.is_prefix_of(label.loc) {
+                        continue;
+                    }
+
+                    if let Some(callee) = operand_to_def_id(func) {
+                        if !api_list::is_def_id_api(callee, tcx) {
+                            // intra call
+                            let return_bb = *func_to_return_bb.entry(callee).or_insert_with(|| {
+                                let body = tcx.optimized_mir(callee);
+                                for (bb, bbd) in body.basic_blocks.iter_enumerated().rev() {
+                                    let term = bbd.terminator();
+                                    if matches!(term.kind, TerminatorKind::Return) {
+                                        return bb;
+                                    }
+                                }
+                                panic!()
+                            });
+                            let Some(Node::Item(item)) = tcx.hir_get_if_local(callee.to_def_id())
+                            else {
+                                panic!()
+                            };
+                            let ItemKind::Fn { body, .. } = item.kind else { panic!() };
+                            let body = tcx.hir_body(body);
+                            let param = &body.params[i];
+                            let PatKind::Binding(_, id, _, _) = param.pat.kind else { panic!() };
+                            let base = ExprBase::Local(id);
+                            let label = Label {
+                                func: callee,
+                                bb: return_bb,
+                                loc: arena.alloc(label.loc.subst_prefix(base, arg)),
+                            };
+                            worklist.push(label);
+                        } else if !is_handling_api(callee, tcx) {
+                            // api call
+                            let source = Source {
+                                caller: label.func,
+                                span,
+                            };
+                            sources.push(source);
+                            continue 'l;
+                        }
+                    } else {
+                        fn_ptr_call = true;
+                        break 'l;
+                    }
+                }
+            }
+        }
+
+        let predecessors = body.basic_blocks.predecessors();
+        for pred in &predecessors[label.bb] {
+            let label = Label { bb: *pred, ..label };
+            worklist.push(label);
+        }
     }
+
+    (sources, fn_ptr_call)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Source {
+    pub caller: LocalDefId,
+    pub span: Span,
 }
 
 #[inline]
@@ -193,6 +225,18 @@ impl ExprLoc {
                 .zip(&other.projections)
                 .all(|(a, b)| a == b)
     }
+
+    fn subst_prefix(&self, base: ExprBase, prefix: &Self) -> Self {
+        assert!(prefix.is_prefix_of(self));
+        Self {
+            base,
+            projections: self.projections[prefix.projections.len()..].to_vec(),
+        }
+    }
+
+    fn is_std(&self) -> bool {
+        self.base.is_std()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -221,6 +265,12 @@ impl std::fmt::Debug for ExprBase {
     }
 }
 
+impl ExprBase {
+    fn is_std(self) -> bool {
+        matches!(self, ExprBase::Stdin | ExprBase::Stdout | ExprBase::Stderr)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ExprProj {
     Field(Symbol),
@@ -240,9 +290,10 @@ fn expr_to_path(mut expr: &Expr<'_>, tcx: TyCtxt<'_>) -> Option<ExprLoc> {
     let mut projections = vec![];
     loop {
         match expr.kind {
-            ExprKind::Unary(UnOp::Deref, e) | ExprKind::Cast(e, _) | ExprKind::DropTemps(e) => {
-                expr = e
-            }
+            ExprKind::Unary(UnOp::Deref, e)
+            | ExprKind::AddrOf(_, _, e)
+            | ExprKind::Cast(e, _)
+            | ExprKind::DropTemps(e) => expr = e,
             ExprKind::Field(e, f) => {
                 projections.push(ExprProj::Field(f.name));
                 expr = e;
