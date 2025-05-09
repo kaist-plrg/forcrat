@@ -50,7 +50,9 @@ pub struct AnalysisResult {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct FileAnalysis;
+pub struct FileAnalysis {
+    pub verbose: bool,
+}
 
 impl Pass for FileAnalysis {
     type Out = AnalysisResult;
@@ -160,6 +162,7 @@ impl Pass for FileAnalysis {
         let arena = Arena::new();
         let mut analyzer = Analyzer {
             tcx,
+            verbose: self.verbose,
             popen_read,
             unsupported_printf_spans: &unsupported_printf_spans,
             loc_ind_map: &loc_ind_map,
@@ -228,7 +231,9 @@ impl Pass for FileAnalysis {
                 .any(|loc_id| permissions[loc_id].contains(Permission::Close))
             {
                 for loc_id in cycle.iter() {
-                    println!("Unsupported close cycle {:?}", locs[loc_id],);
+                    if self.verbose {
+                        println!("Unsupported close cycle {:?}", locs[loc_id],);
+                    }
                     analyzer.unsupported.add(loc_id);
                 }
             }
@@ -247,10 +252,12 @@ impl Pass for FileAnalysis {
                 || permissions.contains(Permission::Read)
                     && (origins.contains(Origin::Stdout) || origins.contains(Origin::Stderr))
             {
-                println!(
-                    "Unsupported permission {:?}: {:?}, {:?}",
-                    loc, permissions, origins
-                );
+                if self.verbose {
+                    println!(
+                        "Unsupported permission {:?}: {:?}, {:?}",
+                        loc, permissions, origins
+                    );
+                }
                 analyzer.unsupported.add(i);
             }
         }
@@ -298,6 +305,7 @@ pub fn is_popen_read(arg: &LikelyLit<'_>) -> Option<bool> {
 
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    verbose: bool,
     popen_read: FxHashMap<Span, bool>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     unsupported_printf_spans: &'a FxHashSet<Span>,
@@ -328,12 +336,16 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         self.assign(l, r, variance);
                     }
                     (Some(_), false) => {
-                        println!("Unsupported ptr cast {:?}", rty);
+                        if self.verbose {
+                            println!("Unsupported ptr cast {:?}", rty);
+                        }
                         let l = self.transfer_place(*l, ctx);
                         self.unsupported.add(l);
                     }
                     (None, true) => {
-                        println!("Unsupported ptr cast {:?}", ty);
+                        if self.verbose {
+                            println!("Unsupported ptr cast {:?}", ty);
+                        }
                         let r = self.transfer_operand(op, ctx);
                         self.unsupported.add(r);
                     }
@@ -403,7 +415,9 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             Rvalue::BinaryOp(op, box (op1, op2)) => {
                 let ty = op1.ty(ctx.local_decls, self.tcx);
                 if compile_util::contains_file_ty(ty, self.tcx) {
-                    println!("Unsupported op {:?}", op);
+                    if self.verbose {
+                        println!("Unsupported op {:?}", op);
+                    }
                     let op1 = self.transfer_operand(op1, ctx);
                     self.unsupported.add(op1);
                     let op2 = self.transfer_operand(op2, ctx);
@@ -572,7 +586,9 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             if let Some(origin) = origin {
                                 self.add_origin(x, origin);
                             } else {
-                                println!("Unsupported open {:?}", def_id);
+                                if self.verbose {
+                                    println!("Unsupported open {:?}", def_id);
+                                }
                                 self.unsupported.add(x);
                             }
                         }
@@ -611,7 +627,9 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             }
                         }
                         ApiKind::Unsupported => {
-                            println!("Unsupported api {:?}", def_id);
+                            if self.verbose {
+                                println!("Unsupported api {:?}", def_id);
+                            }
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if compile_util::contains_file_ty(*t, self.tcx) {
@@ -728,15 +746,17 @@ impl<'tcx> Analyzer<'_, 'tcx> {
     }
 
     fn print_code(&self, msg: &str, span: Span) {
-        let code = self
-            .tcx
-            .sess
-            .source_map()
-            .span_to_snippet(span)
-            .unwrap()
-            .replace('\n', " ");
-        let re = Regex::new(r"\s+").unwrap();
-        println!("Unsupported {} {}", msg, re.replace_all(&code, " "));
+        if self.verbose {
+            let code = self
+                .tcx
+                .sess
+                .source_map()
+                .span_to_snippet(span)
+                .unwrap()
+                .replace('\n', " ");
+            let re = Regex::new(r"\s+").unwrap();
+            println!("Unsupported {} {}", msg, re.replace_all(&code, " "));
+        }
     }
 }
 

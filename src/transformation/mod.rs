@@ -90,7 +90,7 @@ impl Pass for Transformation {
     type Out = TransformationResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        let analysis_res = file_analysis::FileAnalysis.run(tcx);
+        let analysis_res = file_analysis::FileAnalysis { verbose: true }.run(tcx);
 
         // collect information from HIR
         let mut hir_visitor = HirVisitor {

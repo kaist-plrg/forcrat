@@ -154,7 +154,7 @@ fn main() {
             println!("{:?}", res.fn_tys);
         }
         Command::Analyze => {
-            file_analysis::FileAnalysis.run_on_path(&file);
+            file_analysis::FileAnalysis { verbose: true }.run_on_path(&file);
         }
         Command::Transformation { mut output } => {
             output.push(args.input.file_name().unwrap());

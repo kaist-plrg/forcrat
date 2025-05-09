@@ -19,6 +19,7 @@ use rustc_span::{Span, Symbol};
 use crate::{
     api_list,
     compile_util::{self, Pass},
+    file_analysis::{self, Loc},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +29,8 @@ impl Pass for ErrorFinder {
     type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
+        let analysis_res = file_analysis::FileAnalysis { verbose: false }.run(tcx);
+
         let mut visitor = HirVisitor::new(tcx);
         tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
@@ -39,10 +42,17 @@ impl Pass for ErrorFinder {
 
             for (handle_bb, bbd) in body.basic_blocks.iter_enumerated() {
                 let term = bbd.terminator();
-                let TerminatorKind::Call { func, .. } = &term.kind else { continue };
+                let TerminatorKind::Call { func, args, .. } = &term.kind else { continue };
 
                 let handle_callee = some_or!(operand_to_def_id(func), continue);
                 if !is_handling_api(handle_callee, tcx) {
+                    continue;
+                }
+
+                let place = args[0].node.place().unwrap();
+                let loc = Loc::Var(def_id, place.local);
+                let loc_id = analysis_res.loc_ind_map[&loc];
+                if analysis_res.unsupported.contains(&loc_id) {
                     continue;
                 }
 
