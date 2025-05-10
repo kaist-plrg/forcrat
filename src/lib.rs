@@ -28,6 +28,7 @@
 #![feature(rustc_private)]
 #![feature(box_patterns)]
 #![feature(min_specialization)]
+#![feature(let_chains)]
 
 extern crate rustc_abi;
 extern crate rustc_ast;
