@@ -33,107 +33,112 @@ impl Pass for ErrorFinder {
     type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        let mut visitor = HirVisitor::new(tcx);
-        tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-
         let arena = Arena::new();
-        let mut propagations = CollectedPropagations::default();
+        let result = analyze(&arena, tcx);
+        println!("No source locs: {:#?}", result.no_source_locs);
+        println!("Tracking fns: {:#?}", result.tracking_fns);
+        println!("Returning fns: {:#?}", result.returning_fns);
+        println!("Taking fns: {:#?}", result.taking_fns);
+    }
+}
 
-        for def_id in &visitor.ctx.error_handling_fns {
-            let body = tcx.optimized_mir(*def_id);
+#[derive(Debug, Default)]
+pub struct AnalysisResult<'a> {
+    pub no_source_locs: Vec<Loc>,
+    pub tracking_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
+    pub returning_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
+    pub taking_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
+}
 
-            for (bb, bbd) in body.basic_blocks.iter_enumerated() {
-                let term = bbd.terminator();
-                let TerminatorKind::Call { func, args, .. } = &term.kind else { continue };
+pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult<'a> {
+    let mut result = AnalysisResult::default();
 
-                let handle_callee = some_or!(operand_to_def_id(func), continue);
-                let indicator = some_or!(handling_api_indicator(handle_callee, tcx), continue);
+    let mut visitor = HirVisitor::new(arena, tcx);
+    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
-                let place = args[0].node.place().unwrap();
-                let hir_loc = Loc::Var(*def_id, place.local);
+    for def_id in &visitor.ctx.error_handling_fns {
+        let body = tcx.optimized_mir(*def_id);
 
-                let span = term.source_info.span;
-                let func = *def_id;
-                let loc = visitor.ctx.call_span_to_args[&span][0].as_ref().unwrap();
-                let label = Label::new(func, bb, loc);
-                let result = analyze(label, FxHashSet::default(), &arena, &visitor.ctx, tcx);
+        for (bb, bbd) in body.basic_blocks.iter_enumerated() {
+            let term = bbd.terminator();
+            let TerminatorKind::Call { func, args, .. } = &term.kind else { continue };
 
-                if result.sources.is_empty() {
-                    propagations.no_source_locs.push(hir_loc);
-                    continue;
-                }
+            let handle_callee = some_or!(operand_to_def_id(func), continue);
+            let indicator = some_or!(handling_api_indicator(handle_callee, tcx), continue);
 
-                propagations.add_tracking_fn(label.func_loc, indicator);
+            let place = args[0].node.place().unwrap();
+            let hir_loc = Loc::Var(*def_id, place.local);
 
-                if result.call_graph.is_empty() {
-                    continue;
-                }
+            let span = term.source_info.span;
+            let func = *def_id;
+            let loc = visitor.ctx.call_span_to_args[&span][0].as_ref().unwrap();
+            let label = Label::new(func, bb, loc);
+            let sink_result = analyze_sink(label, FxHashSet::default(), arena, &visitor.ctx, tcx);
 
-                let mut call_graph = result.call_graph;
-                let mut nodes: FxHashSet<FuncLoc<'_>> = FxHashSet::default();
-                for succs in call_graph.values() {
-                    nodes.extend(succs.iter().filter(|succ| !call_graph.contains_key(succ)));
-                }
-                for node in nodes {
-                    assert!(call_graph.insert(node, FxHashSet::default()).is_none());
-                }
-                let transitive_call_graph = graph::transitive_closure(&call_graph);
-                let inv_call_graph = graph::inverse(&call_graph);
-                let transitive_inv_call_graph = graph::transitive_closure(&inv_call_graph);
+            if sink_result.sources.is_empty() {
+                result.no_source_locs.push(hir_loc);
+                continue;
+            }
 
-                if inv_call_graph[&label.func_loc].is_empty() {
-                    let source_reachables: FxHashSet<_> = result
-                        .sources
-                        .iter()
-                        .flat_map(|source| &transitive_inv_call_graph[source])
-                        .chain(&result.sources)
-                        .copied()
-                        .collect();
-                    for l in &transitive_call_graph[&label.func_loc] {
-                        if source_reachables.contains(l) {
-                            propagations.add_returning_fn(*l, indicator);
-                        }
+            result.add_tracking_fn(label.func_loc, indicator);
+
+            if sink_result.call_graph.is_empty() {
+                continue;
+            }
+
+            let mut call_graph = sink_result.call_graph;
+            let mut nodes: FxHashSet<FuncLoc<'_>> = FxHashSet::default();
+            for succs in call_graph.values() {
+                nodes.extend(succs.iter().filter(|succ| !call_graph.contains_key(succ)));
+            }
+            for node in nodes {
+                assert!(call_graph.insert(node, FxHashSet::default()).is_none());
+            }
+            let transitive_call_graph = graph::transitive_closure(&call_graph);
+            let inv_call_graph = graph::inverse(&call_graph);
+            let transitive_inv_call_graph = graph::transitive_closure(&inv_call_graph);
+
+            if inv_call_graph[&label.func_loc].is_empty() {
+                let source_reachables: FxHashSet<_> = sink_result
+                    .sources
+                    .iter()
+                    .flat_map(|source| &transitive_inv_call_graph[source])
+                    .chain(&sink_result.sources)
+                    .copied()
+                    .collect();
+                for l in &transitive_call_graph[&label.func_loc] {
+                    if source_reachables.contains(l) {
+                        result.add_returning_fn(*l, indicator);
                     }
-                } else {
-                    let sink_reachables = &transitive_inv_call_graph[&label.func_loc];
-                    for source in result.sources {
-                        let source_reachables = &transitive_inv_call_graph[&source];
-                        for caller in sink_reachables {
-                            if *caller != source && !source_reachables.contains(caller) {
-                                continue;
-                            }
-                            propagations.add_tracking_fn(*caller, indicator);
+                }
+            } else {
+                let sink_reachables = &transitive_inv_call_graph[&label.func_loc];
+                for source in sink_result.sources {
+                    let source_reachables = &transitive_inv_call_graph[&source];
+                    for caller in sink_reachables {
+                        if *caller != source && !source_reachables.contains(caller) {
+                            continue;
+                        }
+                        result.add_tracking_fn(*caller, indicator);
 
-                            for l in &transitive_call_graph[caller] {
-                                if *l == source || source_reachables.contains(l) {
-                                    propagations.add_returning_fn(*l, indicator);
-                                }
-                                if *l == label.func_loc || sink_reachables.contains(l) {
-                                    propagations.add_taking_fn(*l, indicator);
-                                }
+                        for l in &transitive_call_graph[caller] {
+                            if *l == source || source_reachables.contains(l) {
+                                result.add_returning_fn(*l, indicator);
+                            }
+                            if *l == label.func_loc || sink_reachables.contains(l) {
+                                result.add_taking_fn(*l, indicator);
                             }
                         }
                     }
                 }
             }
         }
-
-        println!("No source locs: {:#?}", propagations.no_source_locs);
-        println!("Tracking fns: {:#?}", propagations.tracking_fns);
-        println!("Returning fns: {:#?}", propagations.returning_fns);
-        println!("Taking fns: {:#?}", propagations.taking_fns);
     }
+
+    result
 }
 
-#[derive(Debug, Default)]
-struct CollectedPropagations<'a> {
-    no_source_locs: Vec<Loc>,
-    tracking_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
-    returning_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
-    taking_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
-}
-
-impl<'a> CollectedPropagations<'a> {
+impl<'a> AnalysisResult<'a> {
     #[inline]
     fn add_tracking_fn(&mut self, func_loc: FuncLoc<'a>, indicator: Indicator) {
         self.tracking_fns
@@ -223,23 +228,23 @@ impl<'a> FuncLoc<'a> {
 }
 
 #[derive(Debug, Clone)]
-struct AnalysisResult<'a> {
+struct SinkResult<'a> {
     sources: Vec<FuncLoc<'a>>,
     call_graph: FxHashMap<FuncLoc<'a>, FxHashSet<FuncLoc<'a>>>,
 }
 
-fn analyze<'a>(
-    start_label: Label<'a>,
+fn analyze_sink<'a>(
+    sink_label: Label<'a>,
     mut analyzed_labels: FxHashSet<Label<'a>>,
     arena: &'a Arena<ExprLoc>,
-    ctx: &'a HirCtx,
+    ctx: &HirCtx<'a>,
     tcx: TyCtxt<'_>,
-) -> AnalysisResult<'a> {
-    analyzed_labels.insert(start_label);
-    let callers = ctx.callee_to_callers.get(&start_label.func_loc.func);
-    let used_as_fn_ptr = ctx.ptr_used_fns.contains(&start_label.func_loc.func);
+) -> SinkResult<'a> {
+    analyzed_labels.insert(sink_label);
+    let callers = ctx.callee_to_callers.get(&sink_label.func_loc.func);
+    let used_as_fn_ptr = ctx.ptr_used_fns.contains(&sink_label.func_loc.func);
 
-    let mut worklist = vec![start_label];
+    let mut worklist = vec![sink_label];
     let mut visited = FxHashSet::default();
     let mut func_to_return_bb = FxHashMap::default();
     let mut sources = vec![];
@@ -311,7 +316,7 @@ fn analyze<'a>(
         }
     }
 
-    if let ExprBase::Local(hir_id) = start_label.func_loc.loc.base
+    if let ExprBase::Local(hir_id) = sink_label.func_loc.loc.base
         && let Some(param_idx) = ctx.param_indices.get(&hir_id)
         && let Some(callers) = callers
         && !fn_ptr_call
@@ -327,17 +332,17 @@ fn analyze<'a>(
                 let term = bbd.terminator();
                 let TerminatorKind::Call { func, .. } = &term.kind else { continue };
                 let callee = some_or!(operand_to_def_id(func), continue);
-                if callee != start_label.func_loc.func {
+                if callee != sink_label.func_loc.func {
                     continue;
                 }
 
                 let args = &ctx.call_span_to_args[&term.source_info.span];
                 let arg = args[*param_idx].as_ref().unwrap();
-                let loc = start_label.func_loc.loc.change_base(arg);
+                let loc = sink_label.func_loc.loc.change_base(arg);
                 let label = Label::new(*caller, bb, arena.alloc(loc));
 
                 if !analyzed_labels.contains(&label) {
-                    let res = analyze(label, analyzed_labels.clone(), arena, ctx, tcx);
+                    let res = analyze_sink(label, analyzed_labels.clone(), arena, ctx, tcx);
                     if !res.sources.is_empty() {
                         sources.extend(res.sources);
                         for (caller, callees) in res.call_graph {
@@ -357,7 +362,7 @@ fn analyze<'a>(
         }
     }
 
-    AnalysisResult {
+    SinkResult {
         sources,
         call_graph,
     }
@@ -385,7 +390,7 @@ fn operand_to_def_id(op: &Operand<'_>) -> Option<LocalDefId> {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct ExprLoc {
+pub struct ExprLoc {
     base: ExprBase,
     projections: Vec<ExprProj>,
 }
@@ -540,29 +545,31 @@ fn expr_to_path(mut expr: &Expr<'_>, tcx: TyCtxt<'_>) -> Option<ExprLoc> {
 }
 
 #[derive(Debug, Default)]
-struct HirCtx {
-    call_span_to_args: FxHashMap<Span, Vec<Option<ExprLoc>>>,
+struct HirCtx<'a> {
+    call_span_to_args: FxHashMap<Span, Vec<Option<&'a ExprLoc>>>,
     error_handling_fns: FxHashSet<LocalDefId>,
     callee_to_callers: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     ptr_used_fns: FxHashSet<LocalDefId>,
     param_indices: FxHashMap<HirId, usize>,
 }
 
-struct HirVisitor<'tcx> {
+struct HirVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    ctx: HirCtx,
+    ctx: HirCtx<'a>,
+    arena: &'a Arena<ExprLoc>,
 }
 
-impl<'tcx> HirVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
+impl<'a, 'tcx> HirVisitor<'a, 'tcx> {
+    fn new(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
             ctx: HirCtx::default(),
+            arena,
         }
     }
 }
 
-impl<'tcx> Visitor<'tcx> for HirVisitor<'tcx> {
+impl<'tcx> Visitor<'tcx> for HirVisitor<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
@@ -585,7 +592,8 @@ impl<'tcx> Visitor<'tcx> for HirVisitor<'tcx> {
             ExprKind::Call(path, args) => {
                 let mut v = vec![];
                 for arg in args {
-                    v.push(expr_to_path(arg, self.tcx));
+                    let loc = expr_to_path(arg, self.tcx).map(|loc| &*self.arena.alloc(loc));
+                    v.push(loc);
                 }
                 if !v.is_empty() {
                     self.ctx.call_span_to_args.insert(expr.span, v);

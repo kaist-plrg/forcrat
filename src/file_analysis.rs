@@ -31,6 +31,7 @@ use crate::{
     bit_set::BitSet8,
     compile_util::{self, Pass},
     disjoint_set::DisjointSet,
+    error_finder::{self, ExprLoc},
     likely_lit::LikelyLit,
     rustc_ast::visit::Visitor as _,
     rustc_index::bit_set::BitRelations,
@@ -55,231 +56,244 @@ pub struct FileAnalysis {
 }
 
 impl Pass for FileAnalysis {
-    type Out = AnalysisResult;
+    type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        let stolen = tcx.resolver_for_lowering().borrow();
-        let (_, krate) = stolen.deref();
-        let mut ast_visitor = AstVisitor::default();
-        ast_visitor.visit_crate(krate);
-        let popen_read: FxHashMap<_, _> = ast_visitor
-            .popen_args
-            .into_iter()
-            .filter_map(|(span, arg)| is_popen_read(&arg).map(|r| (span, r)))
-            .collect();
-        let mut fprintf_path_spans = FxHashMap::default();
-        let mut unsupported_printf_spans = FxHashSet::default();
-        for (call_span, arg) in ast_visitor.fprintf_args {
-            match arg {
-                LikelyLit::Lit(_) => {}
-                LikelyLit::Path(_, path_span) => {
-                    fprintf_path_spans.insert(call_span, path_span);
-                }
-                LikelyLit::If(_, _, _) | LikelyLit::Other(_) => {
-                    unsupported_printf_spans.insert(call_span);
-                }
-            }
-        }
-        let static_span_to_lit = ast_visitor.static_span_to_lit;
-        drop(stolen);
+        let arena = Arena::new();
+        let result = analyze(&arena, self.verbose, tcx);
+        println!("{:#?}", result);
+    }
+}
 
-        let mut visitor = HirVisitor::new(tcx);
-        tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-        for (call_span, path_span) in fprintf_path_spans {
-            let def_id = some_or!(visitor.bound_span_to_def_id.get(&path_span), {
-                unsupported_printf_spans.insert(call_span);
-                continue;
-            });
-            let static_span = visitor.def_id_to_binding_span[def_id];
-            if !static_span_to_lit.contains_key(&static_span) {
+pub fn analyze(arena: &Arena<ExprLoc>, verbose: bool, tcx: TyCtxt<'_>) -> AnalysisResult {
+    let stolen = tcx.resolver_for_lowering().borrow();
+    let (_, krate) = stolen.deref();
+    let mut ast_visitor = AstVisitor::default();
+    ast_visitor.visit_crate(krate);
+    let popen_read: FxHashMap<_, _> = ast_visitor
+        .popen_args
+        .into_iter()
+        .filter_map(|(span, arg)| is_popen_read(&arg).map(|r| (span, r)))
+        .collect();
+    let mut fprintf_path_spans = FxHashMap::default();
+    let mut unsupported_printf_spans = FxHashSet::default();
+    for (call_span, arg) in ast_visitor.fprintf_args {
+        match arg {
+            LikelyLit::Lit(_) => {}
+            LikelyLit::Path(_, path_span) => {
+                fprintf_path_spans.insert(call_span, path_span);
+            }
+            LikelyLit::If(_, _, _) | LikelyLit::Other(_) => {
                 unsupported_printf_spans.insert(call_span);
             }
         }
+    }
+    let static_span_to_lit = ast_visitor.static_span_to_lit;
+    drop(stolen);
 
-        let mut defined_apis = FxHashSet::default();
-        let mut worklist = visitor.defined_apis;
-        while let Some(def_id) = worklist.pop() {
-            if !defined_apis.insert(def_id) {
-                continue;
-            }
-            let callees = some_or!(visitor.dependencies.get(&def_id), continue);
-            for def_id in callees {
-                worklist.push(*def_id);
-            }
+    let error_analysis = error_finder::analyze(arena, tcx);
+
+    let mut visitor = HirVisitor::new(tcx);
+    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
+    for (call_span, path_span) in fprintf_path_spans {
+        let def_id = some_or!(visitor.bound_span_to_def_id.get(&path_span), {
+            unsupported_printf_spans.insert(call_span);
+            continue;
+        });
+        let static_span = visitor.def_id_to_binding_span[def_id];
+        if !static_span_to_lit.contains_key(&static_span) {
+            unsupported_printf_spans.insert(call_span);
         }
-        tracing::info!("Defined APIs:");
-        for def_id in &defined_apis {
-            tracing::info!("{:?}", def_id);
+    }
+
+    let mut defined_apis = FxHashSet::default();
+    let mut worklist = visitor.defined_apis;
+    while let Some(def_id) = worklist.pop() {
+        if !defined_apis.insert(def_id) {
+            continue;
         }
+        let callees = some_or!(visitor.dependencies.get(&def_id), continue);
+        for def_id in callees {
+            worklist.push(*def_id);
+        }
+    }
+    tracing::info!("Defined APIs:");
+    for def_id in &defined_apis {
+        tracing::info!("{:?}", def_id);
+    }
 
-        let mut locs: IndexVec<LocId, Loc> =
-            IndexVec::from_raw(vec![Loc::Stdin, Loc::Stdout, Loc::Stderr]);
+    let mut locs: IndexVec<LocId, Loc> =
+        IndexVec::from_raw(vec![Loc::Stdin, Loc::Stdout, Loc::Stderr]);
 
-        for item_id in tcx.hir_free_items() {
-            let item = tcx.hir_item(item_id);
-            let local_def_id = item.owner_id.def_id;
-            let body = match item.kind {
-                ItemKind::Fn { .. } => {
-                    if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
-                        continue;
-                    }
-                    tcx.optimized_mir(local_def_id)
-                }
-                ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
-                ItemKind::Struct(_, _) | ItemKind::Union(_, _)
-                    if item.ident.as_str() != "_IO_FILE" =>
-                {
-                    let adt_def = tcx.adt_def(item.owner_id);
-                    for (i, fd) in adt_def.variant(FIRST_VARIANT).fields.iter_enumerated() {
-                        let ty = fd.ty(tcx, List::empty());
-                        if compile_util::contains_file_ty(ty, tcx) {
-                            locs.push(Loc::Field(local_def_id, i));
-                        }
-                    }
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let local_def_id = item.owner_id.def_id;
+        let body = match item.kind {
+            ItemKind::Fn { .. } => {
+                if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
                     continue;
                 }
-                _ => continue,
-            };
-            for (i, local_decl) in body.local_decls.iter_enumerated() {
-                if compile_util::contains_file_ty(local_decl.ty, tcx) {
-                    let loc = Loc::Var(local_def_id, i);
-                    locs.push(loc);
-                }
+                tcx.optimized_mir(local_def_id)
             }
-        }
-
-        for (i, loc) in locs.iter_enumerated() {
-            tracing::info!("{:?}: {:?}", i, loc);
-        }
-        let loc_ind_map: FxHashMap<_, _> = locs.iter_enumerated().map(|(i, l)| (*l, i)).collect();
-
-        let permission_graph: Graph<LocId, Permission> = Graph::new(locs.len(), Permission::NUM);
-        let mut origin_graph: Graph<LocId, Origin> = Graph::new(locs.len(), Origin::NUM);
-        origin_graph.add_solution(loc_ind_map[&Loc::Stdin], Origin::Stdin);
-        origin_graph.add_solution(loc_ind_map[&Loc::Stdout], Origin::Stdout);
-        origin_graph.add_solution(loc_ind_map[&Loc::Stderr], Origin::Stderr);
-
-        let arena = Arena::new();
-        let mut analyzer = Analyzer {
-            tcx,
-            verbose: self.verbose,
-            popen_read,
-            unsupported_printf_spans: &unsupported_printf_spans,
-            loc_ind_map: &loc_ind_map,
-            fn_ptrs: FxHashSet::default(),
-            permission_graph,
-            origin_graph,
-            unsupported: UnsupportedTracker::new(&arena),
+            ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
+            ItemKind::Struct(_, _) | ItemKind::Union(_, _) if item.ident.as_str() != "_IO_FILE" => {
+                let adt_def = tcx.adt_def(item.owner_id);
+                for (i, fd) in adt_def.variant(FIRST_VARIANT).fields.iter_enumerated() {
+                    let ty = fd.ty(tcx, List::empty());
+                    if compile_util::contains_file_ty(ty, tcx) {
+                        locs.push(Loc::Field(local_def_id, i));
+                    }
+                }
+                continue;
+            }
+            _ => continue,
         };
-
-        for item_id in tcx.hir_free_items() {
-            let item = tcx.hir_item(item_id);
-            let local_def_id = item.owner_id.def_id;
-            let body = match item.kind {
-                ItemKind::Fn { .. } => {
-                    if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
-                        continue;
-                    }
-                    tcx.optimized_mir(local_def_id)
-                }
-                ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
-                _ => continue,
-            };
-            tracing::info!("{:?}", local_def_id);
-            let ctx = Ctx {
-                function: local_def_id,
-                local_decls: &body.local_decls,
-            };
-            for bbd in body.basic_blocks.iter() {
-                for stmt in &bbd.statements {
-                    tracing::info!("{:?}", stmt);
-                    analyzer.transfer_stmt(stmt, ctx);
-                }
-                tracing::info!("{:?}", bbd.terminator().kind);
-                analyzer.transfer_term(bbd.terminator(), ctx);
+        for (i, local_decl) in body.local_decls.iter_enumerated() {
+            if compile_util::contains_file_ty(local_decl.ty, tcx) {
+                let loc = Loc::Var(local_def_id, i);
+                locs.push(loc);
             }
         }
+    }
 
-        let graph = &analyzer.permission_graph;
-        let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&graph.edges));
-        let mut components = vec![MixedBitSet::new_empty(locs.len()); sccs.num_sccs()];
-        for i in graph.solutions.indices() {
-            let scc = sccs.scc(i);
-            components[scc.index()].insert(i);
+    for (i, loc) in locs.iter_enumerated() {
+        tracing::info!("{:?}: {:?}", i, loc);
+    }
+    let loc_ind_map: FxHashMap<_, _> = locs.iter_enumerated().map(|(i, l)| (*l, i)).collect();
+
+    let permission_graph: Graph<LocId, Permission> = Graph::new(locs.len(), Permission::NUM);
+    let mut origin_graph: Graph<LocId, Origin> = Graph::new(locs.len(), Origin::NUM);
+    origin_graph.add_solution(loc_ind_map[&Loc::Stdin], Origin::Stdin);
+    origin_graph.add_solution(loc_ind_map[&Loc::Stdout], Origin::Stdout);
+    origin_graph.add_solution(loc_ind_map[&Loc::Stderr], Origin::Stderr);
+
+    let arena = Arena::new();
+    let mut analyzer = Analyzer {
+        tcx,
+        verbose,
+        popen_read,
+        unsupported_printf_spans: &unsupported_printf_spans,
+        loc_ind_map: &loc_ind_map,
+        fn_ptrs: FxHashSet::default(),
+        permission_graph,
+        origin_graph,
+        unsupported: UnsupportedTracker::new(&arena),
+    };
+
+    for loc in &error_analysis.no_source_locs {
+        let loc_id = loc_ind_map[loc];
+        analyzer.unsupported.add(loc_id);
+        if verbose {
+            println!("Unsupported error handling {:?}", loc);
         }
-        let mut cycles = vec![];
-        'l: for component in components {
-            for i in component.iter() {
-                for j in component.iter() {
-                    if i == j {
-                        continue;
-                    }
-                    if graph.edges[i].contains(j) != graph.edges[j].contains(i) {
-                        cycles.push(component);
-                        continue 'l;
-                    }
+    }
+
+    for item_id in tcx.hir_free_items() {
+        let item = tcx.hir_item(item_id);
+        let local_def_id = item.owner_id.def_id;
+        let body = match item.kind {
+            ItemKind::Fn { .. } => {
+                if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
+                    continue;
+                }
+                tcx.optimized_mir(local_def_id)
+            }
+            ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
+            _ => continue,
+        };
+        tracing::info!("{:?}", local_def_id);
+        let ctx = Ctx {
+            function: local_def_id,
+            local_decls: &body.local_decls,
+        };
+        for bbd in body.basic_blocks.iter() {
+            for stmt in &bbd.statements {
+                tracing::info!("{:?}", stmt);
+                analyzer.transfer_stmt(stmt, ctx);
+            }
+            tracing::info!("{:?}", bbd.terminator().kind);
+            analyzer.transfer_term(bbd.terminator(), ctx);
+        }
+    }
+
+    let graph = &analyzer.permission_graph;
+    let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&graph.edges));
+    let mut components = vec![MixedBitSet::new_empty(locs.len()); sccs.num_sccs()];
+    for i in graph.solutions.indices() {
+        let scc = sccs.scc(i);
+        components[scc.index()].insert(i);
+    }
+    let mut cycles = vec![];
+    'l: for component in components {
+        for i in component.iter() {
+            for j in component.iter() {
+                if i == j {
+                    continue;
+                }
+                if graph.edges[i].contains(j) != graph.edges[j].contains(i) {
+                    cycles.push(component);
+                    continue 'l;
                 }
             }
         }
+    }
 
-        let permissions = analyzer.permission_graph.solve();
-        let origins = analyzer.origin_graph.solve();
+    let permissions = analyzer.permission_graph.solve();
+    let origins = analyzer.origin_graph.solve();
 
-        for cycle in cycles {
-            if cycle
-                .iter()
-                .any(|loc_id| permissions[loc_id].contains(Permission::Close))
-            {
-                for loc_id in cycle.iter() {
-                    if self.verbose {
-                        println!("Unsupported close cycle {:?}", locs[loc_id],);
-                    }
-                    analyzer.unsupported.add(loc_id);
-                }
-            }
-        }
-
-        for (((i, loc), permissions), origins) in
-            locs.iter_enumerated().zip(&permissions).zip(&origins)
+    for cycle in cycles {
+        if cycle
+            .iter()
+            .any(|loc_id| permissions[loc_id].contains(Permission::Close))
         {
-            tracing::info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
-
-            if permissions.contains(Permission::Seek)
-                && (origins.contains(Origin::Stdin)
-                    || origins.contains(Origin::Stdout)
-                    || origins.contains(Origin::Stderr))
-                || permissions.contains(Permission::Write) && origins.contains(Origin::Stdin)
-                || permissions.contains(Permission::Read)
-                    && (origins.contains(Origin::Stdout) || origins.contains(Origin::Stderr))
-            {
-                if self.verbose {
-                    println!(
-                        "Unsupported permission {:?}: {:?}, {:?}",
-                        loc, permissions, origins
-                    );
+            for loc_id in cycle.iter() {
+                if verbose {
+                    println!("Unsupported close cycle {:?}", locs[loc_id],);
                 }
-                analyzer.unsupported.add(i);
+                analyzer.unsupported.add(loc_id);
             }
         }
+    }
 
-        let unsupported = analyzer.unsupported.compute_all();
-        for loc_id in unsupported.iter() {
-            tracing::info!("{:?} unsupported", locs[*loc_id]);
+    for (((i, loc), permissions), origins) in locs.iter_enumerated().zip(&permissions).zip(&origins)
+    {
+        tracing::info!("{:?} {:?}: {:?}, {:?}", i, loc, permissions, origins);
+
+        if permissions.contains(Permission::Seek)
+            && (origins.contains(Origin::Stdin)
+                || origins.contains(Origin::Stdout)
+                || origins.contains(Origin::Stderr))
+            || permissions.contains(Permission::Write) && origins.contains(Origin::Stdin)
+            || permissions.contains(Permission::Read)
+                && (origins.contains(Origin::Stdout) || origins.contains(Origin::Stderr))
+        {
+            if verbose {
+                println!(
+                    "Unsupported permission {:?}: {:?}, {:?}",
+                    loc, permissions, origins
+                );
+            }
+            analyzer.unsupported.add(i);
         }
+    }
 
-        let fn_ptrs = analyzer.fn_ptrs;
+    let unsupported = analyzer.unsupported.compute_all();
+    for loc_id in unsupported.iter() {
+        tracing::info!("{:?} unsupported", locs[*loc_id]);
+    }
 
-        AnalysisResult {
-            locs,
-            loc_ind_map,
-            permissions,
-            origins,
-            unsupported,
-            static_span_to_lit,
-            defined_apis,
-            unsupported_printf_spans,
-            fn_ptrs,
-        }
+    let fn_ptrs = analyzer.fn_ptrs;
+
+    AnalysisResult {
+        locs,
+        loc_ind_map,
+        permissions,
+        origins,
+        unsupported,
+        static_span_to_lit,
+        defined_apis,
+        unsupported_printf_spans,
+        fn_ptrs,
     }
 }
 
