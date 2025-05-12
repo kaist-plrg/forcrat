@@ -1,6 +1,6 @@
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
-pub fn transitive_closure<T: Clone + Eq + std::hash::Hash>(
+pub fn transitive_closure<T: Copy + Eq + std::hash::Hash>(
     graph: &FxHashMap<T, FxHashSet<T>>,
 ) -> FxHashMap<T, FxHashSet<T>> {
     for succs in graph.values() {
@@ -8,10 +8,10 @@ pub fn transitive_closure<T: Clone + Eq + std::hash::Hash>(
             assert!(graph.contains_key(succ));
         }
     }
-    let id_to_v: Vec<_> = graph.keys().cloned().collect();
+    let id_to_v: Vec<_> = graph.keys().copied().collect();
     let v_to_id: FxHashMap<_, _> = id_to_v
         .iter()
-        .cloned()
+        .copied()
         .enumerate()
         .map(|(k, v)| (v, k))
         .collect();
@@ -40,13 +40,25 @@ pub fn transitive_closure<T: Clone + Eq + std::hash::Hash>(
             .enumerate()
             .filter_map(|(to, is_reachable)| {
                 if *is_reachable {
-                    Some(id_to_v[to].clone())
+                    Some(id_to_v[to])
                 } else {
                     None
                 }
             })
             .collect();
-        new_graph.insert(id_to_v[i].clone(), neighbors);
+        new_graph.insert(id_to_v[i], neighbors);
     }
     new_graph
+}
+
+pub fn inverse<T: Copy + Eq + std::hash::Hash>(
+    map: &FxHashMap<T, FxHashSet<T>>,
+) -> FxHashMap<T, FxHashSet<T>> {
+    let mut inv: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+    for (node, succs) in map {
+        for succ in succs {
+            inv.entry(*succ).or_default().insert(*node);
+        }
+    }
+    inv
 }

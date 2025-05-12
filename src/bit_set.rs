@@ -7,9 +7,10 @@ pub struct BitSet8<T> {
     _marker: std::marker::PhantomData<T>,
 }
 
-#[inline]
-fn word_mask<T: Idx>(elem: T) -> u8 {
-    1 << elem.index()
+impl<T> Default for BitSet8<T> {
+    fn default() -> Self {
+        Self::new_empty()
+    }
 }
 
 impl<T: Idx + std::fmt::Debug> std::fmt::Debug for BitSet8<T> {
@@ -18,7 +19,7 @@ impl<T: Idx + std::fmt::Debug> std::fmt::Debug for BitSet8<T> {
     }
 }
 
-impl<T: Idx> BitSet8<T> {
+impl<T> BitSet8<T> {
     #[inline]
     pub fn new_empty() -> Self {
         Self {
@@ -28,17 +29,47 @@ impl<T: Idx> BitSet8<T> {
     }
 
     #[inline]
+    pub fn clear(&mut self) {
+        self.word = 0;
+    }
+
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.word.count_ones() as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.word == 0
+    }
+
+    #[inline]
+    pub fn insert_all(&mut self, domain_size: u32) {
+        self.word = 1u8.overflowing_shl(domain_size).0 - 1;
+    }
+
+    #[inline]
+    pub fn superset(&self, other: &BitSet8<T>) -> bool {
+        (self.word & other.word) == other.word
+    }
+
+    #[inline]
+    pub fn iter(&self) -> SmallBitIter<'_, T> {
+        SmallBitIter {
+            word: self.word,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Idx> BitSet8<T> {
+    #[inline]
     pub fn new<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let mut set = Self::new_empty();
         for elem in iter {
             set.insert(elem);
         }
         set
-    }
-
-    #[inline]
-    pub fn clear(&mut self) {
-        self.word = 0;
     }
 
     #[inline]
@@ -62,36 +93,11 @@ impl<T: Idx> BitSet8<T> {
         self.word &= !mask;
         old_word != self.word
     }
+}
 
-    #[inline]
-    pub fn insert_all(&mut self, domain_size: u32) {
-        self.word = 1u8.overflowing_shl(domain_size).0 - 1;
-    }
-
-    #[inline]
-    pub fn count(&self) -> usize {
-        self.word.count_ones() as usize
-    }
-
-    #[inline]
-    pub fn superset(&self, other: &BitSet8<T>) -> bool {
-        (self.word & other.word) == other.word
-    }
-
-    /// Is the set empty?
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.word == 0
-    }
-
-    /// Iterates over the indices of set bits in a sorted order.
-    #[inline]
-    pub fn iter(&self) -> SmallBitIter<'_, T> {
-        SmallBitIter {
-            word: self.word,
-            _marker: std::marker::PhantomData,
-        }
-    }
+#[inline]
+fn word_mask<T: Idx>(elem: T) -> u8 {
+    1 << elem.index()
 }
 
 pub struct SmallBitIter<'a, T> {

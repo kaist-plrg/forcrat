@@ -8,6 +8,7 @@ use rustc_hir::{
     intravisit::{self, Visitor},
     Expr, ExprKind, HirId, ItemKind, Node, PatKind, QPath,
 };
+use rustc_index::Idx;
 use rustc_middle::{
     hir::nested_filter,
     mir::{BasicBlock, Const, Operand, TerminatorKind},
@@ -19,8 +20,10 @@ use typed_arena::Arena;
 
 use crate::{
     api_list,
+    bit_set::BitSet8,
     compile_util::{self, Pass},
-    file_analysis::{self, Loc},
+    file_analysis::Loc,
+    graph,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -30,84 +33,159 @@ impl Pass for ErrorFinder {
     type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
-        let analysis_res = file_analysis::FileAnalysis { verbose: false }.run(tcx);
+        // let analysis_res = file_analysis::FileAnalysis { verbose: false }.run(tcx);
 
         let mut visitor = HirVisitor::new(tcx);
         tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
+        let arena = Arena::new();
+        let mut no_source_locs = vec![];
+        let mut indicator_tracking_fns: FxHashMap<_, FxHashMap<_, BitSet8<_>>> =
+            FxHashMap::default();
+        let mut indicator_returning_fns: FxHashMap<_, FxHashMap<_, BitSet8<_>>> =
+            FxHashMap::default();
+        let mut calls = FxHashSet::default();
+
         for def_id in &visitor.ctx.error_handling_fns {
             let body = tcx.optimized_mir(*def_id);
 
-            let mut results = vec![];
             for (bb, bbd) in body.basic_blocks.iter_enumerated() {
                 let term = bbd.terminator();
                 let TerminatorKind::Call { func, args, .. } = &term.kind else { continue };
 
                 let handle_callee = some_or!(operand_to_def_id(func), continue);
-                if !is_handling_api(handle_callee, tcx) {
-                    continue;
-                }
+                let indicator = some_or!(handling_api_indicator(handle_callee, tcx), continue);
 
                 let place = args[0].node.place().unwrap();
-                let loc = Loc::Var(*def_id, place.local);
-                let loc_id = analysis_res.loc_ind_map[&loc];
-                if analysis_res.unsupported.contains(&loc_id) {
-                    continue;
-                }
+                let hir_loc = Loc::Var(*def_id, place.local);
+                // let loc_id = analysis_res.loc_ind_map[&loc];
+                // if analysis_res.unsupported.contains(&loc_id) {
+                //     continue;
+                // }
 
                 let span = term.source_info.span;
                 let func = *def_id;
                 let loc = visitor.ctx.call_span_to_args[&span][0].as_ref().unwrap();
-                let label = Label { func, bb, loc };
-                let arena = Arena::new();
+                let label = Label::new(func, bb, loc);
                 let result = analyze(label, FxHashSet::default(), &arena, &visitor.ctx, tcx);
-                results.push((span, result));
-            }
 
-            if results.is_empty() {
-                continue;
-            }
-
-            println!("{:?}", def_id);
-            for (span, res) in results {
-                println!(" {:?}", span);
-                if res.sources.is_empty() {
-                    println!("  No sources found");
-                }
-                for source in res.sources {
-                    println!("  {:?}", source);
-                }
-                for (caller, callees) in res.call_graph {
-                    println!("  {:?} -> {:?}", caller, callees);
+                if result.sources.is_empty() {
+                    no_source_locs.push(hir_loc);
+                } else {
+                    let inv_call_graph = graph::inverse(&result.call_graph);
+                    if inv_call_graph.contains_key(&label.func_loc) {
+                        todo!()
+                    } else {
+                        let mut visited = FxHashSet::default();
+                        let mut worklist = result.sources;
+                        while let Some(func_loc) = worklist.pop() {
+                            if !visited.insert(func_loc) {
+                                continue;
+                            }
+                            indicator_tracking_fns
+                                .entry(func_loc.func)
+                                .or_default()
+                                .entry(func_loc.loc)
+                                .or_default()
+                                .insert(indicator);
+                            if func_loc == label.func_loc {
+                                continue;
+                            }
+                            indicator_returning_fns
+                                .entry(func_loc.func)
+                                .or_default()
+                                .entry(func_loc.loc)
+                                .or_default()
+                                .insert(indicator);
+                            let callers = some_or!(inv_call_graph.get(&func_loc), continue);
+                            worklist.extend(callers.iter().copied());
+                            for caller in callers {
+                                calls.insert((*caller, func_loc));
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        println!("No source locs: {:#?}", no_source_locs);
+        println!("Tracking fns: {:#?}", indicator_tracking_fns);
+        println!("Returning fns: {:#?}", indicator_returning_fns);
+        println!("Calls: {:#?}", calls);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Indicator {
+    Error,
+    Eof,
+}
+
+impl Indicator {
+    pub const NUM: usize = 2;
+}
+
+impl Idx for Indicator {
+    #[inline]
+    fn new(idx: usize) -> Self {
+        if idx >= Self::NUM {
+            panic!()
+        }
+        unsafe { std::mem::transmute(idx as u8) }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self as _
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Label<'a> {
-    func: LocalDefId,
+    func_loc: FnLoc<'a>,
     bb: BasicBlock,
+}
+
+impl<'a> Label<'a> {
+    #[inline]
+    fn new(func: LocalDefId, bb: BasicBlock, loc: &'a ExprLoc) -> Self {
+        Self {
+            func_loc: FnLoc::new(func, loc),
+            bb,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FnLoc<'a> {
+    func: LocalDefId,
     loc: &'a ExprLoc,
 }
 
+impl<'a> FnLoc<'a> {
+    #[inline]
+    fn new(func: LocalDefId, loc: &'a ExprLoc) -> Self {
+        Self { func, loc }
+    }
+}
+
 #[derive(Debug, Clone)]
-struct AnalysisResult {
-    sources: Vec<Source>,
-    call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
+struct AnalysisResult<'a> {
+    sources: Vec<FnLoc<'a>>,
+    call_graph: FxHashMap<FnLoc<'a>, FxHashSet<FnLoc<'a>>>,
 }
 
 fn analyze<'a>(
     start_label: Label<'a>,
     mut analyzed_labels: FxHashSet<Label<'a>>,
     arena: &'a Arena<ExprLoc>,
-    ctx: &HirCtx,
+    ctx: &'a HirCtx,
     tcx: TyCtxt<'_>,
-) -> AnalysisResult {
+) -> AnalysisResult<'a> {
     analyzed_labels.insert(start_label);
-    let callers = ctx.callee_to_callers.get(&start_label.func);
-    let used_as_fn_ptr = ctx.ptr_used_fns.contains(&start_label.func);
+    let callers = ctx.callee_to_callers.get(&start_label.func_loc.func);
+    let used_as_fn_ptr = ctx.ptr_used_fns.contains(&start_label.func_loc.func);
 
     let mut worklist = vec![start_label];
     let mut visited = FxHashSet::default();
@@ -121,7 +199,7 @@ fn analyze<'a>(
             continue;
         }
 
-        let body = tcx.optimized_mir(label.func);
+        let body = tcx.optimized_mir(label.func_loc.func);
         let bbd = &body.basic_blocks[label.bb];
         let term = bbd.terminator();
 
@@ -130,14 +208,13 @@ fn analyze<'a>(
         {
             for (i, arg) in args.iter().enumerate() {
                 let arg = some_or!(arg, continue);
-                if !arg.is_prefix_of(label.loc) {
+                if !arg.is_prefix_of(label.func_loc.loc) {
                     continue;
                 }
 
                 if let Some(callee) = operand_to_def_id(func) {
                     if !api_list::is_def_id_api(callee, tcx) {
                         // intra call
-                        call_graph.entry(label.func).or_default().insert(callee);
                         let return_bb = *func_to_return_bb.entry(callee).or_insert_with(|| {
                             let body = tcx.optimized_mir(callee);
                             for (bb, bbd) in body.basic_blocks.iter_enumerated().rev() {
@@ -155,19 +232,16 @@ fn analyze<'a>(
                         let param = &body.params[i];
                         let PatKind::Binding(_, id, _, _) = param.pat.kind else { panic!() };
                         let base = ExprBase::Local(id);
-                        let label = Label {
-                            func: callee,
-                            bb: return_bb,
-                            loc: arena.alloc(label.loc.subst_prefix(base, arg)),
-                        };
-                        worklist.push(label);
-                    } else if !is_handling_api(callee, tcx) {
+                        let new_arg = arena.alloc(label.func_loc.loc.subst_prefix(base, arg));
+                        let new_label = Label::new(callee, return_bb, new_arg);
+                        call_graph
+                            .entry(label.func_loc)
+                            .or_default()
+                            .insert(new_label.func_loc);
+                        worklist.push(new_label);
+                    } else if handling_api_indicator(callee, tcx).is_none() {
                         // api call
-                        let source = Source {
-                            caller: label.func,
-                            span: term.source_info.span,
-                        };
-                        sources.push(source);
+                        sources.push(label.func_loc);
                         continue 'l;
                     }
                 } else {
@@ -185,7 +259,7 @@ fn analyze<'a>(
         }
     }
 
-    if let ExprBase::Local(hir_id) = start_label.loc.base
+    if let ExprBase::Local(hir_id) = start_label.func_loc.loc.base
         && let Some(param_idx) = ctx.param_indices.get(&hir_id)
         && let Some(callers) = callers
         && !fn_ptr_call
@@ -201,18 +275,14 @@ fn analyze<'a>(
                 let term = bbd.terminator();
                 let TerminatorKind::Call { func, .. } = &term.kind else { continue };
                 let callee = some_or!(operand_to_def_id(func), continue);
-                if callee != start_label.func {
+                if callee != start_label.func_loc.func {
                     continue;
                 }
 
                 let args = &ctx.call_span_to_args[&term.source_info.span];
                 let arg = args[*param_idx].as_ref().unwrap();
-                let loc = start_label.loc.change_base(arg);
-                let label = Label {
-                    func: *caller,
-                    bb,
-                    loc: arena.alloc(loc),
-                };
+                let loc = start_label.func_loc.loc.change_base(arg);
+                let label = Label::new(*caller, bb, arena.alloc(loc));
 
                 if !analyzed_labels.contains(&label) {
                     let res = analyze(label, analyzed_labels.clone(), arena, ctx, tcx);
@@ -241,17 +311,18 @@ fn analyze<'a>(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Source {
-    pub caller: LocalDefId,
-    pub span: Span,
-}
-
 #[inline]
-fn is_handling_api(def_id: impl IntoQueryParam<DefId>, tcx: TyCtxt<'_>) -> bool {
+fn handling_api_indicator(
+    def_id: impl IntoQueryParam<DefId>,
+    tcx: TyCtxt<'_>,
+) -> Option<Indicator> {
     let name = compile_util::def_id_to_value_symbol(def_id, tcx).unwrap();
     let name = api_list::normalize_api_name(name.as_str());
-    name == "feof" || name == "ferror"
+    match name {
+        "ferror" => Some(Indicator::Error),
+        "feof" => Some(Indicator::Eof),
+        _ => None,
+    }
 }
 
 fn operand_to_def_id(op: &Operand<'_>) -> Option<LocalDefId> {
@@ -471,7 +542,7 @@ impl<'tcx> Visitor<'tcx> for HirVisitor<'tcx> {
                 let ExprKind::Path(QPath::Resolved(_, path)) = path.kind else { return };
                 let Res::Def(DefKind::Fn, def_id) = path.res else { return };
                 let curr_fn = expr.hir_id.owner.def_id;
-                if is_handling_api(def_id, self.tcx) {
+                if handling_api_indicator(def_id, self.tcx).is_some() {
                     self.ctx.error_handling_fns.insert(curr_fn);
                 }
                 let def_id = some_or!(def_id.as_local(), return);
