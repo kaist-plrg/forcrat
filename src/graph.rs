@@ -54,10 +54,13 @@ pub fn transitive_closure<T: Copy + Eq + std::hash::Hash>(
 pub fn inverse<T: Copy + Eq + std::hash::Hash>(
     map: &FxHashMap<T, FxHashSet<T>>,
 ) -> FxHashMap<T, FxHashSet<T>> {
-    let mut inv: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+    let mut inv = FxHashMap::default();
+    for node in map.keys() {
+        inv.insert(*node, FxHashSet::default());
+    }
     for (node, succs) in map {
         for succ in succs {
-            inv.entry(*succ).or_default().insert(*node);
+            inv.get_mut(succ).unwrap().insert(*node);
         }
     }
     inv
