@@ -27,9 +27,9 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy)]
-pub struct ErrorFinder;
+pub struct ErrorAnalysis;
 
-impl Pass for ErrorFinder {
+impl Pass for ErrorAnalysis {
     type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {

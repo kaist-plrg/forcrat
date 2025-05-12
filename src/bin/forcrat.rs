@@ -23,7 +23,6 @@ enum Command {
     },
     CountReturnValues,
     FindFileReturns,
-    FindErrorHandles,
     FindFileTypes {
         #[arg(long, default_value = "false")]
         mir: bool,
@@ -34,8 +33,9 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
     },
-    Analyze,
-    Transformation {
+    AnalyzeError,
+    AnalyzeFile,
+    Transform {
         #[arg(short, long)]
         output: PathBuf,
     },
@@ -143,9 +143,6 @@ fn main() {
         Command::FindFileTypes { mir } => {
             ty_finder::TyFinder { mir }.run_on_path(&file);
         }
-        Command::FindErrorHandles => {
-            error_finder::ErrorFinder.run_on_path(&file);
-        }
         Command::Steensgaard => {
             let res = steensgaard::Steensgaard.run_on_path(&file);
             println!("{:?}", res.vars);
@@ -153,10 +150,13 @@ fn main() {
             println!("{:?}", res.fns);
             println!("{:?}", res.fn_tys);
         }
-        Command::Analyze => {
+        Command::AnalyzeFile => {
             file_analysis::FileAnalysis { verbose: true }.run_on_path(&file);
         }
-        Command::Transformation { mut output } => {
+        Command::AnalyzeError => {
+            error_analysis::ErrorAnalysis.run_on_path(&file);
+        }
+        Command::Transform { mut output } => {
             output.push(args.input.file_name().unwrap());
             if output.exists() {
                 assert!(output.is_dir());

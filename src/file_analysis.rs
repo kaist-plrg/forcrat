@@ -31,7 +31,7 @@ use crate::{
     bit_set::BitSet8,
     compile_util::{self, Pass},
     disjoint_set::DisjointSet,
-    error_finder::{self, ExprLoc},
+    error_analysis::{self, ExprLoc},
     likely_lit::LikelyLit,
     rustc_ast::visit::Visitor as _,
     rustc_index::bit_set::BitRelations,
@@ -91,7 +91,7 @@ pub fn analyze(arena: &Arena<ExprLoc>, verbose: bool, tcx: TyCtxt<'_>) -> Analys
     let static_span_to_lit = ast_visitor.static_span_to_lit;
     drop(stolen);
 
-    let error_analysis = error_finder::analyze(arena, tcx);
+    let error_analysis = error_analysis::analyze(arena, tcx);
 
     let mut visitor = HirVisitor::new(tcx);
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
