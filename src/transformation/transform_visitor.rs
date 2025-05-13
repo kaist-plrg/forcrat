@@ -67,7 +67,7 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     /// is this file updated
     pub(super) updated: bool,
     pub(super) tmpfile: bool,
-    pub(super) current_fn: Option<LocalDefId>,
+    pub(super) current_fns: Vec<LocalDefId>,
     pub(super) bounds: Vec<TraitBound>,
     pub(super) guards: FxHashSet<Symbol>,
 }
@@ -155,10 +155,15 @@ impl<'a> TransformVisitor<'_, 'a> {
         self.loc_to_pot.get(&HirLoc::Return(func)).copied()
     }
 
+    #[inline]
+    fn current_fn(&self) -> LocalDefId {
+        *self.current_fns.last().unwrap()
+    }
+
     fn indicator_check(&self, span: Span) -> IndicatorCheck<'_> {
         if let Some(expr_loc) = self.analysis_res.span_to_expr_loc.get(&span) {
             let name = Some(*expr_loc);
-            let func = self.current_fn.unwrap();
+            let func = self.current_fn();
             let mut eof = false;
             let mut error = false;
             if let Some(vars) = self.analysis_res.tracking_fns.get(&func) {
@@ -331,11 +336,20 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             return;
         }
 
-        if let Some(HirLoc::Global(def_id)) = self.hir.binding_span_to_loc.get(&item.ident.span) {
-            self.current_fn = Some(*def_id);
-        }
+        let is_fn = if matches!(item.kind, ItemKind::Fn(_))
+            && let Some(HirLoc::Global(def_id)) = self.hir.binding_span_to_loc.get(&item.ident.span)
+        {
+            self.current_fns.push(*def_id);
+            true
+        } else {
+            false
+        };
 
         mut_visit::walk_item(self, item);
+
+        if is_fn {
+            self.current_fns.pop();
+        }
 
         let ident_span = item.ident.span;
         match &mut item.kind {
@@ -930,7 +944,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 self.replace_expr(callee, new_expr);
                             }
                             if let Some(params) = self.error_taking_fns.get(def_id) {
-                                let curr = self.current_fn.unwrap();
+                                let curr = self.current_fn();
                                 let trackings = &self.analysis_res.tracking_fns[&curr];
                                 for (param_loc, param_indicator) in params {
                                     let (loc, indicator) = trackings
@@ -970,7 +984,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 }
 
                                 let mut assigns = String::new();
-                                let curr = self.current_fn.unwrap();
+                                let curr = self.current_fn();
                                 if let Some(trackings) = self.analysis_res.tracking_fns.get(&curr) {
                                     for (loc0, i0) in trackings {
                                         for (i, (loc1, i1)) in returns.iter().enumerate() {
@@ -1050,7 +1064,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ExprKind::Ret(opt_e) => {
-                let curr = self.current_fn.unwrap();
+                let curr = self.current_fn();
                 if let Some(e) = opt_e
                     && let Some(pot) = self.return_pot(curr)
                 {

@@ -492,7 +492,7 @@ impl Pass for Transformation {
 
                 updated: false,
                 tmpfile: false,
-                current_fn: None,
+                current_fns: vec![],
                 bounds: vec![],
                 guards: FxHashSet::default(),
             };
