@@ -373,10 +373,14 @@ fn analyze_sink<'a>(
                 let args = &ctx.call_span_to_args[&term.source_info.span];
                 let arg = args[*param_idx].as_ref().unwrap();
                 let loc = sink_label.func_loc.loc.change_base(arg);
-                let label = Label::new(*caller, bb, arena.alloc(loc));
+                let caller_label = Label::new(*caller, bb, arena.alloc(loc));
+                call_graph
+                    .entry(caller_label.func_loc)
+                    .or_default()
+                    .insert(sink_label.func_loc);
 
-                if !analyzed_labels.contains(&label) {
-                    let res = analyze_sink(label, analyzed_labels.clone(), arena, ctx, tcx);
+                if !analyzed_labels.contains(&caller_label) {
+                    let res = analyze_sink(caller_label, analyzed_labels.clone(), arena, ctx, tcx);
                     if !res.sources.is_empty() {
                         sources.extend(res.sources);
                         for (caller, callees) in res.call_graph {

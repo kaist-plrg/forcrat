@@ -1255,6 +1255,66 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_ferror_param() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    if ferror(stream) != 0 {
+        clearerr(stream);
+    }
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream);
+    g(stream);
+    fclose(stream);
+}"#,
+        &[
+            "Read",
+            "read_exact",
+            "stream_error = 1",
+            "stream_error: i32",
+        ],
+        &["FILE", "fgetc", "ferror"],
+    );
+}
+
+#[test]
+fn test_ferror_feof_param() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    if ferror(stream) != 0 {
+        clearerr(stream);
+    } else if feof(stream) != 0 {
+        clearerr(stream);
+    }
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream);
+    g(stream);
+    fclose(stream);
+}"#,
+        &[
+            "Read",
+            "read_exact",
+            "stream_error = 1",
+            "stream_eof = 1",
+            "stream_error: i32",
+            "stream_eof: i32",
+        ],
+        &["FILE", "fgetc", "ferror", "feof"],
+    );
+}
+
+#[test]
 fn test_static() {
     run_test(
         r#"

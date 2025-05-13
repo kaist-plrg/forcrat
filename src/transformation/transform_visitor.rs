@@ -433,7 +433,15 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
                 if let Some(vars) = self.analysis_res.tracking_fns.get(&def_id) {
                     let stmts = &mut item.body.as_mut().unwrap().stmts;
-                    for (loc, indicator) in vars {
+                    for var in vars {
+                        if self
+                            .error_taking_fns
+                            .get(&def_id)
+                            .is_some_and(|params| params.contains(var))
+                        {
+                            continue;
+                        }
+                        let (loc, indicator) = var;
                         let stmt = stmt!("let mut {}_{} = 0;", loc, indicator);
                         stmts.insert(0, stmt);
                     }
@@ -920,6 +928,24 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 let c = pprust::expr_to_string(callee);
                                 let new_expr = expr!("{}::<{}>", c, targs.join(", "));
                                 self.replace_expr(callee, new_expr);
+                            }
+                            if let Some(params) = self.error_taking_fns.get(def_id) {
+                                let curr = self.current_fn.unwrap();
+                                let trackings = &self.analysis_res.tracking_fns[&curr];
+                                for (param_loc, param_indicator) in params {
+                                    let (loc, indicator) = trackings
+                                        .iter()
+                                        .find(|(var_loc, var_indicator)| {
+                                            param_indicator == var_indicator
+                                                && self.can_propagate(
+                                                    curr, var_loc, *def_id, param_loc,
+                                                )
+                                        })
+                                        .unwrap();
+                                    let arg = expr!("{}_{}", loc, indicator);
+                                    args.push(P(arg));
+                                    self.updated = true;
+                                }
                             }
                             if let Some(returns) = self.error_returning_fns.get(def_id) {
                                 let node = self.tcx.hir_node_by_def_id(*def_id);
