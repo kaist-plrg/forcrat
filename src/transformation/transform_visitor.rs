@@ -26,7 +26,7 @@ use crate::{
     api_list::{self, Permission},
     ast_maker::*,
     compile_util,
-    error_analysis::{ExprLoc, Indicator},
+    error_analysis::{ErrorPropagation, ExprLoc, Indicator},
     file_analysis,
     likely_lit::LikelyLit,
 };
@@ -309,6 +309,20 @@ impl<'a> TransformVisitor<'_, 'a> {
         let param = &mut fn_ty.decl.inputs[index];
         self.replace_ty_with_pot(&mut param.ty, pot);
     }
+
+    fn can_propagate(
+        &self,
+        caller: LocalDefId,
+        caller_loc: &'a ExprLoc,
+        callee: LocalDefId,
+        callee_loc: &'a ExprLoc,
+    ) -> bool {
+        self.analysis_res
+            .propagations
+            .contains(&ErrorPropagation::new(
+                caller, caller_loc, callee, callee_loc,
+            ))
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
@@ -389,6 +403,19 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 let ty = ty!("({})", ty);
                                 item.sig.decl.output = FnRetTy::Ty(P(ty));
                             }
+                            let mut rv = String::new();
+                            for (i, (loc, indicator)) in returns.iter().enumerate() {
+                                if i != 0 {
+                                    rv.push_str(", ");
+                                }
+                                write!(rv, "{}_{}", loc, indicator).unwrap();
+                            }
+                            if returns.len() != 1 {
+                                rv = format!("({})", rv);
+                            }
+                            let stmt = stmt!("return {};", rv);
+                            let stmts = &mut item.body.as_mut().unwrap().stmts;
+                            stmts.push(stmt);
                             self.updated = true;
                         }
                     }
@@ -894,6 +921,51 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 let new_expr = expr!("{}::<{}>", c, targs.join(", "));
                                 self.replace_expr(callee, new_expr);
                             }
+                            if let Some(returns) = self.error_returning_fns.get(def_id) {
+                                let node = self.tcx.hir_node_by_def_id(*def_id);
+                                let hir::Node::Item(item) = node else { panic!() };
+                                let hir::ItemKind::Fn { sig, .. } = item.kind else { panic!() };
+                                let mut vs = String::new();
+                                let mut res = "";
+                                if matches!(sig.decl.output, hir::FnRetTy::Return(_)) {
+                                    vs.push_str("___v");
+                                    res = "___v";
+                                }
+                                let mut multiple = false;
+                                for i in 0..returns.len() {
+                                    if !vs.is_empty() {
+                                        vs.push_str(", ");
+                                        multiple = true;
+                                    }
+                                    write!(vs, "___v{}", i).unwrap();
+                                }
+                                if multiple {
+                                    vs = format!("({})", vs);
+                                }
+
+                                let mut assigns = String::new();
+                                let curr = self.current_fn.unwrap();
+                                if let Some(trackings) = self.analysis_res.tracking_fns.get(&curr) {
+                                    for (loc0, i0) in trackings {
+                                        for (i, (loc1, i1)) in returns.iter().enumerate() {
+                                            if i0 == i1
+                                                && self.can_propagate(curr, loc0, *def_id, loc1)
+                                            {
+                                                write!(assigns, "{}_{} = ___v{};", loc0, i0, i)
+                                                    .unwrap();
+                                            }
+                                        }
+                                    }
+                                }
+                                let new_expr = expr!(
+                                    "{{ let {} = {}; {} {} }}",
+                                    vs,
+                                    pprust::expr_to_string(expr),
+                                    assigns,
+                                    res
+                                );
+                                self.replace_expr(expr, new_expr);
+                            }
                         }
                     }
                 } else if let ExprKind::MethodCall(box call) = &callee.kind {
@@ -951,9 +1023,27 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.convert_rhs(&mut f.expr, lhs_pot, true);
                 }
             }
-            ExprKind::Ret(Some(e)) => {
-                let Some(pot) = self.return_pot(self.current_fn.unwrap()) else { return };
-                self.convert_rhs(e, pot, true);
+            ExprKind::Ret(opt_e) => {
+                let curr = self.current_fn.unwrap();
+                if let Some(e) = opt_e
+                    && let Some(pot) = self.return_pot(curr)
+                {
+                    self.convert_rhs(e, pot, true);
+                }
+                if let Some(rets) = self.error_returning_fns.get(&curr) {
+                    let mut new_v = String::new();
+                    if let Some(e) = opt_e {
+                        new_v.push_str(&pprust::expr_to_string(e));
+                    }
+                    for (loc, i) in rets {
+                        if !new_v.is_empty() {
+                            new_v.push_str(", ");
+                        }
+                        write!(new_v, "{}_{}", loc, i).unwrap();
+                    }
+                    let new_expr = expr!("return ({})", new_v);
+                    self.replace_expr(expr, new_expr);
+                }
             }
             ExprKind::Field(_, _) => {
                 if self.manually_drop_projections.contains(&expr_span) {

@@ -1123,10 +1123,10 @@ unsafe fn f() {
 }
 
 #[test]
-fn test_indicators() {
+fn test_ferror() {
     run_test(
         r#"
-unsafe fn f() -> libc::c_int {
+unsafe fn f() {
     let mut stream: *mut FILE = fopen(
         b"a\0" as *const u8 as *const libc::c_char,
         b"r\0" as *const u8 as *const libc::c_char,
@@ -1134,19 +1134,123 @@ unsafe fn f() -> libc::c_int {
     fgetc(stream);
     if ferror(stream) != 0 {
         clearerr(stream);
-        fclose(stream);
-        return 0 as libc::c_int;
-    } else if feof(stream) != 0 {
-        clearerr(stream);
-        fclose(stream);
-        return 1 as libc::c_int;
-    } else {
-        fclose(stream);
-        return 2 as libc::c_int
-    };
+    }
+    fclose(stream);
 }"#,
-        &["Read", "read_exact", "std::io::ErrorKind"],
-        &["FILE", "fgetc", "ferror", "feof", "clearerr"],
+        &["Read", "read_exact", "stream_error = 1"],
+        &["FILE", "fgetc", "ferror"],
+    );
+}
+
+#[test]
+fn test_feof() {
+    run_test(
+        r#"
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    fgetc(stream);
+    if feof(stream) != 0 {
+        clearerr(stream);
+    }
+    fclose(stream);
+}"#,
+        &["Read", "read_exact", "stream_eof = 1"],
+        &["FILE", "fgetc", "feof"],
+    );
+}
+
+#[test]
+fn test_ferror_return() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    if fgetc(stream) != 0 {
+        return;
+    }
+    fgetc(stream);
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream);
+    if ferror(stream) != 0 {
+        clearerr(stream);
+    }
+    fclose(stream);
+}"#,
+        &[
+            "Read",
+            "read_exact",
+            "stream_error = 1",
+            "return stream_error",
+        ],
+        &["FILE", "fgetc", "ferror"],
+    );
+}
+
+#[test]
+fn test_ferror_feof_return() {
+    run_test(
+        r#"
+unsafe fn g(mut stream: *mut FILE) {
+    if fgetc(stream) != 0 {
+        return;
+    }
+    fgetc(stream);
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    g(stream);
+    if ferror(stream) != 0 {
+        clearerr(stream);
+    }
+    if feof(stream) != 0 {
+        clearerr(stream);
+    }
+    fclose(stream);
+}"#,
+        &["Read", "read_exact", "stream_error = 1", "stream_eof = 1"],
+        &["FILE", "fgetc", "ferror", "feof"],
+    );
+}
+
+#[test]
+fn test_ferror_feof_return_orig() {
+    run_test(
+        r#"
+unsafe fn h(mut x: libc::c_int) {}
+unsafe fn g(mut stream: *mut FILE) -> libc::c_int {
+    if fgetc(stream) != 0 {
+        return 0 as libc::c_int;
+    }
+    fgetc(stream);
+    return 1 as libc::c_int;
+}
+unsafe fn f() {
+    let mut stream: *mut FILE = fopen(
+        b"a\0" as *const u8 as *const libc::c_char,
+        b"r\0" as *const u8 as *const libc::c_char,
+    );
+    let mut x: libc::c_int = g(stream);
+    h(x);
+    if ferror(stream) != 0 {
+        clearerr(stream);
+    }
+    if feof(stream) != 0 {
+        clearerr(stream);
+    }
+    fclose(stream);
+}"#,
+        &["Read", "read_exact", "stream_error = 1", "stream_eof = 1"],
+        &["FILE", "fgetc", "ferror", "feof"],
     );
 }
 

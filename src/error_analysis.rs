@@ -48,6 +48,28 @@ pub struct AnalysisResult<'a> {
     pub returning_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
     pub taking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
     pub span_to_loc: FxHashMap<Span, &'a ExprLoc>,
+    pub propagations: FxHashSet<ErrorPropagation<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ErrorPropagation<'a> {
+    pub caller: FuncLoc<'a>,
+    pub callee: FuncLoc<'a>,
+}
+
+impl<'a> ErrorPropagation<'a> {
+    #[inline]
+    pub fn new(
+        caller_func: LocalDefId,
+        caller_loc: &'a ExprLoc,
+        callee_func: LocalDefId,
+        callee_loc: &'a ExprLoc,
+    ) -> Self {
+        Self {
+            caller: FuncLoc::new(caller_func, caller_loc),
+            callee: FuncLoc::new(callee_func, callee_loc),
+        }
+    }
 }
 
 pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult<'a> {
@@ -84,6 +106,14 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
 
             if sink_result.call_graph.is_empty() {
                 continue;
+            }
+            for (caller, callees) in &sink_result.call_graph {
+                for callee in callees {
+                    result.propagations.insert(ErrorPropagation {
+                        caller: *caller,
+                        callee: *callee,
+                    });
+                }
             }
 
             let mut call_graph = sink_result.call_graph;
@@ -219,9 +249,9 @@ impl<'a> Label<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FuncLoc<'a> {
-    func: LocalDefId,
-    loc: &'a ExprLoc,
+pub struct FuncLoc<'a> {
+    pub func: LocalDefId,
+    pub loc: &'a ExprLoc,
 }
 
 impl<'a> FuncLoc<'a> {

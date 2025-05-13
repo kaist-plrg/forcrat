@@ -31,7 +31,7 @@ use crate::{
     bit_set::BitSet8,
     compile_util::{self, Pass},
     disjoint_set::DisjointSet,
-    error_analysis::{self, ExprLoc, Indicator},
+    error_analysis::{self, ErrorPropagation, ExprLoc, Indicator},
     likely_lit::LikelyLit,
     rustc_ast::visit::Visitor as _,
     rustc_index::bit_set::BitRelations,
@@ -52,6 +52,7 @@ pub struct AnalysisResult<'a> {
     pub returning_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
     pub taking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
     pub span_to_expr_loc: FxHashMap<Span, &'a ExprLoc>,
+    pub propagations: FxHashSet<ErrorPropagation<'a>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -306,6 +307,7 @@ pub fn analyze<'a>(
         returning_fns: error_analysis.returning_fns,
         taking_fns: error_analysis.taking_fns,
         span_to_expr_loc: error_analysis.span_to_loc,
+        propagations: error_analysis.propagations,
     }
 }
 
