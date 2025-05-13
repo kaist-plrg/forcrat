@@ -93,6 +93,17 @@ impl Pass for Transformation {
         let arena = Arena::new();
         let analysis_res = file_analysis::analyze(&arena, true, tcx);
 
+        let error_returning_fns: FxHashMap<_, Vec<_>> = analysis_res
+            .returning_fns
+            .iter()
+            .map(|(def_id, set)| (*def_id, set.iter().copied().collect()))
+            .collect();
+        let error_taking_fns: FxHashMap<_, Vec<_>> = analysis_res
+            .taking_fns
+            .iter()
+            .map(|(def_id, set)| (*def_id, set.iter().copied().collect()))
+            .collect();
+
         // collect information from HIR
         let mut hir_visitor = HirVisitor {
             tcx,
@@ -460,10 +471,13 @@ impl Pass for Transformation {
             let mut krate = parser.parse_crate_mod().unwrap();
             let mut visitor = TransformVisitor {
                 tcx,
-
                 type_arena: &type_arena,
                 analysis_res: &analysis_res,
                 hir: &hir_ctx,
+
+                error_returning_fns: &error_returning_fns,
+                error_taking_fns: &error_taking_fns,
+
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
                 api_ident_spans: &api_ident_spans,

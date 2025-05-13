@@ -526,68 +526,6 @@ pub(super) fn convert_expr(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct IndicatorCheck<'a> {
-    pub(super) name: &'a str,
-    pub(super) eof: bool,
-    pub(super) error: bool,
-}
-
-impl IndicatorCheck<'_> {
-    #[inline]
-    pub(super) fn has_check(&self) -> bool {
-        self.eof || self.error
-    }
-
-    #[inline]
-    pub(super) fn error_handling(&self) -> String {
-        match (self.eof, self.error) {
-            (true, true) => {
-                format!(
-                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{
-    {0}_eof = 1;
-}} else {{
-    {0}_error = 1;
-}}",
-                    self.name
-                )
-            }
-            (true, false) => {
-                format!(
-                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{ {}_eof = 1; }}",
-                    self.name,
-                )
-            }
-            (false, true) => {
-                format!(
-                    "if e.kind() != std::io::ErrorKind::UnexpectedEof {{ {}_error = 1; }}",
-                    self.name
-                )
-            }
-            (false, false) => "".to_string(),
-        }
-    }
-
-    #[inline]
-    pub(super) fn error_handling_no_eof(&self) -> String {
-        if self.error {
-            format!("{}_error = 1;", self.name)
-        } else {
-            "".to_string()
-        }
-    }
-
-    #[inline]
-    pub(super) fn clear(&self) -> String {
-        match (self.eof, self.error) {
-            (true, true) => format!("{{ {0}_eof = 0; {0}_error = 0; }}", self.name),
-            (true, false) => format!("{{ {}_eof = 0; }}", self.name),
-            (false, true) => format!("{{ {}_error = 0; }}", self.name),
-            (false, false) => "()".to_string(),
-        }
-    }
-}
-
 pub(super) trait StreamExpr {
     fn expr(&self) -> String;
     fn ty(&self) -> StreamType<'_>;

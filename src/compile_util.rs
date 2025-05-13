@@ -330,3 +330,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for FileTypeVisitor<'tcx> {
         t.super_visit_with(self)
     }
 }
+
+pub fn with_tcx<R, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> R>(f: F) -> R {
+    rustc_middle::ty::tls::with_opt(|tcx| f(tcx.unwrap()))
+}

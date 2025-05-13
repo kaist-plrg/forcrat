@@ -20,7 +20,6 @@ use typed_arena::Arena;
 
 use crate::{
     api_list,
-    bit_set::BitSet8,
     compile_util::{self, Pass},
     file_analysis::Loc,
     graph,
@@ -45,9 +44,10 @@ impl Pass for ErrorAnalysis {
 #[derive(Debug, Default)]
 pub struct AnalysisResult<'a> {
     pub no_source_locs: Vec<Loc>,
-    pub tracking_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
-    pub returning_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
-    pub taking_fns: FxHashMap<LocalDefId, FxHashMap<&'a ExprLoc, BitSet8<Indicator>>>,
+    pub tracking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub returning_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub taking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub span_to_loc: FxHashMap<Span, &'a ExprLoc>,
 }
 
 pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult<'a> {
@@ -135,6 +135,7 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
         }
     }
 
+    result.span_to_loc = visitor.ctx.span_to_loc;
     result
 }
 
@@ -144,9 +145,7 @@ impl<'a> AnalysisResult<'a> {
         self.tracking_fns
             .entry(func_loc.func)
             .or_default()
-            .entry(func_loc.loc)
-            .or_default()
-            .insert(indicator);
+            .insert((func_loc.loc, indicator));
     }
 
     #[inline]
@@ -154,9 +153,7 @@ impl<'a> AnalysisResult<'a> {
         self.returning_fns
             .entry(func_loc.func)
             .or_default()
-            .entry(func_loc.loc)
-            .or_default()
-            .insert(indicator);
+            .insert((func_loc.loc, indicator));
         self.add_tracking_fn(func_loc, indicator);
     }
 
@@ -165,9 +162,7 @@ impl<'a> AnalysisResult<'a> {
         self.taking_fns
             .entry(func_loc.func)
             .or_default()
-            .entry(func_loc.loc)
-            .or_default()
-            .insert(indicator);
+            .insert((func_loc.loc, indicator));
         self.add_tracking_fn(func_loc, indicator);
     }
 }
@@ -195,6 +190,15 @@ impl Idx for Indicator {
     #[inline]
     fn index(self) -> usize {
         self as _
+    }
+}
+
+impl std::fmt::Display for Indicator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Indicator::Error => write!(f, "error"),
+            Indicator::Eof => write!(f, "eof"),
+        }
     }
 }
 
@@ -405,6 +409,16 @@ impl std::fmt::Debug for ExprLoc {
     }
 }
 
+impl std::fmt::Display for ExprLoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.base)?;
+        for proj in &self.projections {
+            write!(f, "_{}", proj)?;
+        }
+        Ok(())
+    }
+}
+
 impl ExprLoc {
     fn is_prefix_of(&self, other: &Self) -> bool {
         self.base == other.base
@@ -476,6 +490,26 @@ impl std::fmt::Debug for ExprBase {
     }
 }
 
+impl std::fmt::Display for ExprBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExprBase::Stdin => write!(f, "stdin"),
+            ExprBase::Stdout => write!(f, "stdout"),
+            ExprBase::Stderr => write!(f, "stderr"),
+            ExprBase::Global(def_id) => compile_util::with_tcx(|tcx| {
+                let name = compile_util::def_id_to_value_symbol(*def_id, tcx).unwrap();
+                write!(f, "{}", name)
+            }),
+            ExprBase::Local(hir_id) => compile_util::with_tcx(|tcx| {
+                let node = tcx.hir_node(*hir_id);
+                let Node::Pat(pat) = node else { panic!() };
+                let PatKind::Binding(_, _, name, _) = pat.kind else { panic!() };
+                write!(f, "{}", name)
+            }),
+        }
+    }
+}
+
 impl ExprBase {
     #[allow(unused)]
     #[inline]
@@ -505,7 +539,16 @@ impl std::fmt::Debug for ExprProj {
     }
 }
 
-fn expr_to_path(mut expr: &Expr<'_>, tcx: TyCtxt<'_>) -> Option<ExprLoc> {
+impl std::fmt::Display for ExprProj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExprProj::Field(name) => write!(f, "{}", name),
+            ExprProj::Index => write!(f, "index"),
+        }
+    }
+}
+
+pub fn expr_to_path(mut expr: &Expr<'_>, tcx: TyCtxt<'_>) -> Option<ExprLoc> {
     let mut projections = vec![];
     loop {
         match expr.kind {
@@ -547,6 +590,7 @@ fn expr_to_path(mut expr: &Expr<'_>, tcx: TyCtxt<'_>) -> Option<ExprLoc> {
 #[derive(Debug, Default)]
 struct HirCtx<'a> {
     call_span_to_args: FxHashMap<Span, Vec<Option<&'a ExprLoc>>>,
+    span_to_loc: FxHashMap<Span, &'a ExprLoc>,
     error_handling_fns: FxHashSet<LocalDefId>,
     callee_to_callers: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     ptr_used_fns: FxHashSet<LocalDefId>,
@@ -594,6 +638,9 @@ impl<'tcx> Visitor<'tcx> for HirVisitor<'_, 'tcx> {
                 for arg in args {
                     let loc = expr_to_path(arg, self.tcx).map(|loc| &*self.arena.alloc(loc));
                     v.push(loc);
+                    if let Some(loc) = loc {
+                        self.ctx.span_to_loc.insert(arg.span, loc);
+                    }
                 }
                 if !v.is_empty() {
                     self.ctx.call_span_to_args.insert(expr.span, v);
@@ -631,8 +678,7 @@ impl<'tcx> Visitor<'tcx> for HirVisitor<'_, 'tcx> {
 }
 
 fn def_id_to_string(def_id: impl IntoQueryParam<DefId>) -> String {
-    ty::tls::with_opt(|tcx| {
-        let tcx = tcx.unwrap();
+    compile_util::with_tcx(|tcx| {
         let name = compile_util::def_id_to_value_symbol(def_id, tcx).unwrap();
         name.as_str().to_string()
     })

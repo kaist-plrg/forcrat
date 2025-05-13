@@ -56,10 +56,6 @@ pub(super) struct HirCtx {
     /// for each assignment, rhs span to lhs span
     pub(super) rhs_to_lhs: FxHashMap<Span, Span>,
 
-    /// function def_id to feof argument names
-    pub(super) feof_functions: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
-    /// function def_id to ferror argument names
-    pub(super) ferror_functions: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
     /// callee span to stream argument name
     pub(super) callee_span_to_stream_name: FxHashMap<Span, Symbol>,
     /// fn ptr call argument spans
@@ -280,13 +276,6 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     self.ctx
                         .callee_span_to_stream_name
                         .insert(path.span, arg_name);
-                    let funcs = match name {
-                        "feof" => &mut self.ctx.feof_functions,
-                        "ferror" => &mut self.ctx.ferror_functions,
-                        _ => return,
-                    };
-                    let curr_func = expr.hir_id.owner.def_id;
-                    funcs.entry(curr_func).or_default().insert(arg_name);
                 } else {
                     for arg in args {
                         self.ctx.fn_ptr_arg_spans.push(arg.span);

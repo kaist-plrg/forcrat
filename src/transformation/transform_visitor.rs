@@ -25,15 +25,20 @@ use super::*;
 use crate::{
     api_list::{self, Permission},
     ast_maker::*,
-    compile_util, file_analysis,
+    compile_util,
+    error_analysis::{ExprLoc, Indicator},
+    file_analysis,
     likely_lit::LikelyLit,
 };
 
 pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) tcx: TyCtxt<'tcx>,
     pub(super) type_arena: &'a TypeArena<'a>,
-    pub(super) analysis_res: &'a file_analysis::AnalysisResult,
+    pub(super) analysis_res: &'a file_analysis::AnalysisResult<'a>,
     pub(super) hir: &'a HirCtx,
+
+    pub(super) error_returning_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,
+    pub(super) error_taking_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,
 
     /// function parameter to HIR location
     pub(super) param_to_loc: &'a FxHashMap<Parameter, HirLoc>,
@@ -150,41 +155,31 @@ impl<'a> TransformVisitor<'_, 'a> {
         self.loc_to_pot.get(&HirLoc::Return(func)).copied()
     }
 
-    #[inline]
     fn indicator_check(&self, span: Span) -> IndicatorCheck<'_> {
-        let curr_func = self.hir.callee_span_to_hir_id[&span].owner.def_id;
-        let name = self.hir.callee_span_to_stream_name.get(&span).unwrap();
-        let eof = self
-            .hir
-            .feof_functions
-            .get(&curr_func)
-            .is_some_and(|s| s.contains(name));
-        let error = self
-            .hir
-            .ferror_functions
-            .get(&curr_func)
-            .is_some_and(|s| s.contains(name));
-        IndicatorCheck {
-            name: name.as_str(),
-            eof,
-            error,
+        if let Some(expr_loc) = self.analysis_res.span_to_expr_loc.get(&span) {
+            let name = Some(*expr_loc);
+            let func = self.current_fn.unwrap();
+            let mut eof = false;
+            let mut error = false;
+            if let Some(vars) = self.analysis_res.tracking_fns.get(&func) {
+                for (loc, indicator) in vars {
+                    if loc == expr_loc {
+                        match indicator {
+                            Indicator::Eof => eof = true,
+                            Indicator::Error => error = true,
+                        }
+                    }
+                }
+            }
+            IndicatorCheck { name, eof, error }
+        } else {
+            IndicatorCheck::default()
         }
     }
 
     #[inline]
-    fn indicator_check_std<'s>(&self, span: Span, name: &'s str) -> IndicatorCheck<'s> {
-        let curr_func = self.hir.callee_span_to_hir_id[&span].owner.def_id;
-        let eof = self
-            .hir
-            .feof_functions
-            .get(&curr_func)
-            .is_some_and(|s| s.iter().any(|n| n.as_str() == name));
-        let error = self
-            .hir
-            .ferror_functions
-            .get(&curr_func)
-            .is_some_and(|s| s.iter().any(|n| n.as_str() == name));
-        IndicatorCheck { name, eof, error }
+    fn indicator_check_std<'s>(&self, _name: &'s str) -> IndicatorCheck<'s> {
+        IndicatorCheck::default()
     }
 
     #[inline]
@@ -372,21 +367,47 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     };
                     item.generics.params.push(tparam);
                 }
+                if let Some(returns) = self.error_returning_fns.get(&def_id) {
+                    match &mut item.sig.decl.output {
+                        FnRetTy::Ty(ty) => {
+                            let mut new_ty = pprust::ty_to_string(ty);
+                            for _ in returns {
+                                new_ty.push_str(", i32");
+                            }
+                            let new_ty = ty!("({})", new_ty);
+                            self.replace_ty(ty, new_ty);
+                        }
+                        FnRetTy::Default(_) => {
+                            if returns.len() == 1 {
+                                let ty = ty!("i32");
+                                item.sig.decl.output = FnRetTy::Ty(P(ty));
+                            } else {
+                                let mut ty = "i32".to_string();
+                                for _ in 1..returns.len() {
+                                    ty.push_str(", i32");
+                                }
+                                let ty = ty!("({})", ty);
+                                item.sig.decl.output = FnRetTy::Ty(P(ty));
+                            }
+                            self.updated = true;
+                        }
+                    }
+                }
+                if let Some(params) = self.error_taking_fns.get(&def_id) {
+                    for (loc, indicator) in params {
+                        let param = param!("mut {}_{}: i32", loc, indicator);
+                        item.sig.decl.inputs.push(param);
+                        self.updated = true;
+                    }
+                }
                 if let Some(pot) = self.return_pot(def_id) {
                     let FnRetTy::Ty(ty) = &mut item.sig.decl.output else { panic!() };
                     self.replace_ty_with_pot(ty, pot);
                 }
-                if let Some(eofs) = self.hir.feof_functions.get(&def_id) {
+                if let Some(vars) = self.analysis_res.tracking_fns.get(&def_id) {
                     let stmts = &mut item.body.as_mut().unwrap().stmts;
-                    for eof in eofs {
-                        let stmt = stmt!("let mut {}_eof = 0;", eof);
-                        stmts.insert(0, stmt);
-                    }
-                }
-                if let Some(errors) = self.hir.ferror_functions.get(&def_id) {
-                    let stmts = &mut item.body.as_mut().unwrap().stmts;
-                    for error in errors {
-                        let stmt = stmt!("let mut {}_error = 0;", error);
+                    for (loc, indicator) in vars {
+                        let stmt = stmt!("let mut {}_{} = 0;", loc, indicator);
                         stmts.insert(0, stmt);
                     }
                 }
@@ -540,7 +561,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[0].span);
                             let new_expr = transform_fscanf(&stream, &args[1], &args[2..], ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -550,7 +571,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[0].span);
                             let new_expr = transform_fgetc(&stream, ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -559,7 +580,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 return;
                             }
                             let stream = StdExpr::stdin();
-                            let ic = self.indicator_check_std(callee.span, "stdin");
+                            let ic = self.indicator_check_std("stdin");
                             let new_expr = transform_fgetc(&stream, ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -569,7 +590,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
                             let stream = TypedExpr::new(&args[2], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[2].span);
                             let new_expr = transform_fgets(&stream, &args[0], &args[1], ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -579,7 +600,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                             let stream = TypedExpr::new(&args[3], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[3].span);
                             let new_expr =
                                 transform_fread(&stream, &args[0], &args[1], &args[2], ic);
                             self.replace_expr(expr, new_expr);
@@ -590,7 +611,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                             let stream = TypedExpr::new(&args[3], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[3].span);
                             let new_expr =
                                 transform_getdelim(&stream, &args[0], &args[1], &args[2], ic);
                             self.replace_expr(expr, new_expr);
@@ -601,7 +622,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
                             let stream = TypedExpr::new(&args[2], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[2].span);
                             let new_expr = transform_getline(&stream, &args[0], &args[1], ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -625,7 +646,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[0]) {
                                 return;
                             }
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[0].span);
                             let new_expr = expr!("{}", ic.clear());
                             self.replace_expr(expr, new_expr);
                         }
@@ -636,7 +657,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let stream = TypedExpr::new(&args[0], ty);
                             let retval_used = self.hir.retval_used_spans.contains(&expr_span);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[0].span);
                             let ctx = FprintfCtx {
                                 wide: false,
                                 retval_used,
@@ -659,7 +680,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let stream = StdExpr::stdout();
                             let retval_used = self.hir.retval_used_spans.contains(&expr_span);
-                            let ic = self.indicator_check_std(callee.span, "stdout");
+                            let ic = self.indicator_check_std("stdout");
                             let ctx = FprintfCtx {
                                 wide: false,
                                 retval_used,
@@ -682,7 +703,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let stream = StdExpr::stdout();
                             let retval_used = self.hir.retval_used_spans.contains(&expr_span);
-                            let ic = self.indicator_check_std(callee.span, "stdout");
+                            let ic = self.indicator_check_std("stdout");
                             let ctx = FprintfCtx {
                                 wide: true,
                                 retval_used,
@@ -698,7 +719,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                             let stream = TypedExpr::new(&args[1], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[1].span);
                             let new_expr = transform_fputc(&stream, &args[0], ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -707,7 +728,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             //     return;
                             // }
                             let stream = StdExpr::stdout();
-                            let ic = self.indicator_check_std(callee.span, "stdout");
+                            let ic = self.indicator_check_std("stdout");
                             let new_expr = transform_fputc(&stream, &args[0], ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -717,7 +738,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                             let stream = TypedExpr::new(&args[1], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[1].span);
                             let new_expr = transform_fputwc(&stream, &args[0], ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -727,7 +748,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
                             let stream = TypedExpr::new(&args[1], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[1].span);
                             let new_expr = transform_fputs(&stream, &args[0], ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -735,7 +756,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             // if self.is_stdout_unsupported {
                             //     return;
                             // }
-                            let ic = self.indicator_check_std(callee.span, "stdout");
+                            let ic = self.indicator_check_std("stdout");
                             let new_expr = transform_puts(&args[0], ic);
                             self.replace_expr(expr, new_expr);
                         }
@@ -745,7 +766,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
                             let stream = TypedExpr::new(&args[3], ty);
-                            let ic = self.indicator_check(callee.span);
+                            let ic = self.indicator_check(args[3].span);
                             let new_expr =
                                 transform_fwrite(&stream, &args[0], &args[1], &args[2], ic);
                             self.replace_expr(expr, new_expr);
@@ -759,7 +780,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             } else {
                                 let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                                 let stream = TypedExpr::new(&args[0], ty);
-                                let ic = self.indicator_check(callee.span);
+                                let ic = self.indicator_check(args[0].span);
                                 let new_expr = transform_fflush(&stream, ic);
                                 self.replace_expr(expr, new_expr);
                             }
@@ -2110,5 +2131,67 @@ fn transform_funlockfile<S: StreamExpr>(stream: &S, name: Symbol) -> Expr {
         expr!("{}.unlock().unwrap()", expr)
     } else {
         expr!("drop({}_guard)", name)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct IndicatorCheck<'a> {
+    name: Option<&'a ExprLoc>,
+    eof: bool,
+    error: bool,
+}
+
+impl IndicatorCheck<'_> {
+    #[inline]
+    fn has_check(&self) -> bool {
+        self.eof || self.error
+    }
+
+    #[inline]
+    fn error_handling(&self) -> String {
+        match (self.eof, self.error) {
+            (true, true) => {
+                format!(
+                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{
+    {0}_eof = 1;
+}} else {{
+    {0}_error = 1;
+}}",
+                    self.name.unwrap()
+                )
+            }
+            (true, false) => {
+                format!(
+                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{ {}_eof = 1; }}",
+                    self.name.unwrap()
+                )
+            }
+            (false, true) => {
+                format!(
+                    "if e.kind() != std::io::ErrorKind::UnexpectedEof {{ {}_error = 1; }}",
+                    self.name.unwrap()
+                )
+            }
+            (false, false) => "".to_string(),
+        }
+    }
+
+    #[inline]
+    fn error_handling_no_eof(&self) -> String {
+        if self.error {
+            format!("{}_error = 1;", self.name.unwrap())
+        } else {
+            "".to_string()
+        }
+    }
+
+    #[inline]
+    fn clear(&self) -> String {
+        match (self.eof, self.error) {
+            (true, true) => format!("{{ {0}_eof = 0; {0}_error = 0; }}", self.name.unwrap()),
+            (true, false) => format!("{{ {}_eof = 0; }}", self.name.unwrap()),
+            (false, true) => format!("{{ {}_error = 0; }}", self.name.unwrap()),
+            (false, false) => "()".to_string(),
+        }
     }
 }

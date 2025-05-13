@@ -45,6 +45,19 @@ macro_rules! ty_param {
     }};
 }
 
+pub fn parse_param(param: String) -> Param {
+    let item = item!("fn f({}) {{}}", param);
+    let ItemKind::Fn(box mut f) = item.kind else { panic!() };
+    f.sig.decl.inputs.pop().unwrap()
+}
+
+#[macro_export]
+macro_rules! param {
+    ($($arg:tt)*) => {{
+        parse_param(format!($($arg)*))
+    }};
+}
+
 #[inline]
 pub fn parse_stmt(stmt: String) -> Stmt {
     let parse_sess = new_parse_sess();

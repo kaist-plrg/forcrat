@@ -31,14 +31,14 @@ use crate::{
     bit_set::BitSet8,
     compile_util::{self, Pass},
     disjoint_set::DisjointSet,
-    error_analysis::{self, ExprLoc},
+    error_analysis::{self, ExprLoc, Indicator},
     likely_lit::LikelyLit,
     rustc_ast::visit::Visitor as _,
     rustc_index::bit_set::BitRelations,
 };
 
 #[derive(Debug)]
-pub struct AnalysisResult {
+pub struct AnalysisResult<'a> {
     pub locs: IndexVec<LocId, Loc>,
     pub loc_ind_map: FxHashMap<Loc, LocId>,
     pub permissions: IndexVec<LocId, BitSet8<Permission>>,
@@ -48,6 +48,10 @@ pub struct AnalysisResult {
     pub defined_apis: FxHashSet<LocalDefId>,
     pub unsupported_printf_spans: FxHashSet<Span>,
     pub fn_ptrs: FxHashSet<LocalDefId>,
+    pub tracking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub returning_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub taking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub span_to_expr_loc: FxHashMap<Span, &'a ExprLoc>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,7 +69,11 @@ impl Pass for FileAnalysis {
     }
 }
 
-pub fn analyze(arena: &Arena<ExprLoc>, verbose: bool, tcx: TyCtxt<'_>) -> AnalysisResult {
+pub fn analyze<'a>(
+    arena: &'a Arena<ExprLoc>,
+    verbose: bool,
+    tcx: TyCtxt<'_>,
+) -> AnalysisResult<'a> {
     let stolen = tcx.resolver_for_lowering().borrow();
     let (_, krate) = stolen.deref();
     let mut ast_visitor = AstVisitor::default();
@@ -294,6 +302,10 @@ pub fn analyze(arena: &Arena<ExprLoc>, verbose: bool, tcx: TyCtxt<'_>) -> Analys
         defined_apis,
         unsupported_printf_spans,
         fn_ptrs,
+        tracking_fns: error_analysis.tracking_fns,
+        returning_fns: error_analysis.returning_fns,
+        taking_fns: error_analysis.taking_fns,
+        span_to_expr_loc: error_analysis.span_to_loc,
     }
 }
 
