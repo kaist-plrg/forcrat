@@ -291,6 +291,28 @@ pub fn analyze<'a>(
         tracing::info!("{:?} unsupported", locs[*loc_id]);
     }
 
+    let mut tracking_fns: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+    let mut returning_fns: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+    let mut taking_fns: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+    let mut propagations = FxHashSet::default();
+
+    for (loc, res) in error_analysis.loc_results {
+        let loc_id = loc_ind_map[&loc];
+        if unsupported.contains(&loc_id) {
+            continue;
+        }
+        for (func, locs) in res.tracking_fns {
+            tracking_fns.entry(func).or_default().extend(locs);
+        }
+        for (func, locs) in res.returning_fns {
+            returning_fns.entry(func).or_default().extend(locs);
+        }
+        for (func, locs) in res.taking_fns {
+            taking_fns.entry(func).or_default().extend(locs);
+        }
+        propagations.extend(res.propagations);
+    }
+
     let fn_ptrs = analyzer.fn_ptrs;
 
     AnalysisResult {
@@ -303,11 +325,11 @@ pub fn analyze<'a>(
         defined_apis,
         unsupported_printf_spans,
         fn_ptrs,
-        tracking_fns: error_analysis.tracking_fns,
-        returning_fns: error_analysis.returning_fns,
-        taking_fns: error_analysis.taking_fns,
+        tracking_fns,
+        returning_fns,
+        taking_fns,
         span_to_expr_loc: error_analysis.span_to_loc,
-        propagations: error_analysis.propagations,
+        propagations,
     }
 }
 

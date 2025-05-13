@@ -34,41 +34,7 @@ impl Pass for ErrorAnalysis {
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let arena = Arena::new();
         let result = analyze(&arena, tcx);
-        println!("No source locs: {:#?}", result.no_source_locs);
-        println!("Tracking fns: {:#?}", result.tracking_fns);
-        println!("Returning fns: {:#?}", result.returning_fns);
-        println!("Taking fns: {:#?}", result.taking_fns);
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct AnalysisResult<'a> {
-    pub no_source_locs: Vec<Loc>,
-    pub tracking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
-    pub returning_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
-    pub taking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
-    pub span_to_loc: FxHashMap<Span, &'a ExprLoc>,
-    pub propagations: FxHashSet<ErrorPropagation<'a>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ErrorPropagation<'a> {
-    pub caller: FuncLoc<'a>,
-    pub callee: FuncLoc<'a>,
-}
-
-impl<'a> ErrorPropagation<'a> {
-    #[inline]
-    pub fn new(
-        caller_func: LocalDefId,
-        caller_loc: &'a ExprLoc,
-        callee_func: LocalDefId,
-        callee_loc: &'a ExprLoc,
-    ) -> Self {
-        Self {
-            caller: FuncLoc::new(caller_func, caller_loc),
-            callee: FuncLoc::new(callee_func, callee_loc),
-        }
+        println!("{:#?}", result);
     }
 }
 
@@ -94,6 +60,7 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
             let span = term.source_info.span;
             let func = *def_id;
             let loc = visitor.ctx.call_span_to_args[&span][0].as_ref().unwrap();
+
             let label = Label::new(func, bb, loc);
             let sink_result = analyze_sink(label, FxHashSet::default(), arena, &visitor.ctx, tcx);
 
@@ -102,14 +69,17 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
                 continue;
             }
 
-            result.add_tracking_fn(label.func_loc, indicator);
+            let mut loc_result = LocAnalysisResult::default();
+            loc_result.add_tracking_fn(label.func_loc, indicator);
 
             if sink_result.call_graph.is_empty() {
+                result.loc_results.push((hir_loc, loc_result));
                 continue;
             }
+
             for (caller, callees) in &sink_result.call_graph {
                 for callee in callees {
-                    result.propagations.insert(ErrorPropagation {
+                    loc_result.propagations.insert(ErrorPropagation {
                         caller: *caller,
                         callee: *callee,
                     });
@@ -138,7 +108,7 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
                     .collect();
                 for l in &transitive_call_graph[&label.func_loc] {
                     if source_reachables.contains(l) {
-                        result.add_returning_fn(*l, indicator);
+                        loc_result.add_returning_fn(*l, indicator);
                     }
                 }
             } else {
@@ -149,19 +119,21 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
                         if *caller != source && !source_reachables.contains(caller) {
                             continue;
                         }
-                        result.add_tracking_fn(*caller, indicator);
+                        loc_result.add_tracking_fn(*caller, indicator);
 
                         for l in &transitive_call_graph[caller] {
                             if *l == source || source_reachables.contains(l) {
-                                result.add_returning_fn(*l, indicator);
+                                loc_result.add_returning_fn(*l, indicator);
                             }
                             if *l == label.func_loc || sink_reachables.contains(l) {
-                                result.add_taking_fn(*l, indicator);
+                                loc_result.add_taking_fn(*l, indicator);
                             }
                         }
                     }
                 }
             }
+
+            result.loc_results.push((hir_loc, loc_result));
         }
     }
 
@@ -169,7 +141,43 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
     result
 }
 
-impl<'a> AnalysisResult<'a> {
+#[derive(Debug, Default)]
+pub struct AnalysisResult<'a> {
+    pub no_source_locs: Vec<Loc>,
+    pub span_to_loc: FxHashMap<Span, &'a ExprLoc>,
+    pub loc_results: Vec<(Loc, LocAnalysisResult<'a>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ErrorPropagation<'a> {
+    pub caller: FuncLoc<'a>,
+    pub callee: FuncLoc<'a>,
+}
+
+impl<'a> ErrorPropagation<'a> {
+    #[inline]
+    pub fn new(
+        caller_func: LocalDefId,
+        caller_loc: &'a ExprLoc,
+        callee_func: LocalDefId,
+        callee_loc: &'a ExprLoc,
+    ) -> Self {
+        Self {
+            caller: FuncLoc::new(caller_func, caller_loc),
+            callee: FuncLoc::new(callee_func, callee_loc),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LocAnalysisResult<'a> {
+    pub tracking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub returning_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub taking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
+    pub propagations: FxHashSet<ErrorPropagation<'a>>,
+}
+
+impl<'a> LocAnalysisResult<'a> {
     #[inline]
     fn add_tracking_fn(&mut self, func_loc: FuncLoc<'a>, indicator: Indicator) {
         self.tracking_fns

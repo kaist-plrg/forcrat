@@ -1223,7 +1223,7 @@ unsafe fn f() {
 }
 
 #[test]
-fn test_ferror_feof_return_orig() {
+fn test_ferror_feof_orig_return() {
     run_test(
         r#"
 unsafe fn h(mut x: libc::c_int) {}

@@ -665,7 +665,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[0]) {
                                 return;
                             }
-                            let name = self.hir.callee_span_to_stream_name[&callee.span];
+                            let name = self.analysis_res.span_to_expr_loc[&args[0].span];
                             let new_expr = expr!("{}_eof", name);
                             self.replace_expr(expr, new_expr);
                         }
@@ -673,7 +673,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[0]) {
                                 return;
                             }
-                            let name = self.hir.callee_span_to_stream_name[&callee.span];
+                            let name = self.analysis_res.span_to_expr_loc[&args[0].span];
                             let new_expr = expr!("{}_error", name);
                             self.replace_expr(expr, new_expr);
                         }
