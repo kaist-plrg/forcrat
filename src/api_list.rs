@@ -104,13 +104,15 @@ impl Idx for Origin {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ApiKind {
-    Open(Option<Origin>),
+    Open(Origin),
     PipeOpen,
     Operation(Option<Permission>),
     StdioOperation,
     Unsupported,
-    Ignore,
-    NotIO,
+    FileDescrOperation,
+    StringOperation,
+    NonPosixOpen,
+    NonPosix,
 }
 
 impl ApiKind {
@@ -130,8 +132,11 @@ impl ApiKind {
     }
 
     #[inline]
-    pub fn is_not_io(self) -> bool {
-        matches!(self, NotIO)
+    pub fn is_posix_io(self) -> bool {
+        match self {
+            Open(_) | PipeOpen | Operation(_) | StdioOperation | Unsupported => true,
+            FileDescrOperation | StringOperation | NonPosixOpen | NonPosix => false,
+        }
     }
 }
 
@@ -142,12 +147,12 @@ lazy_static! {
 pub static API_LIST: [(&str, ApiKind); 97] = [
     // stdio.h
     // Open (6)
-    ("fopen", Open(Some(File))),
-    ("fdopen", Open(Some(File))),
-    ("tmpfile", Open(Some(File))),
+    ("fopen", Open(File)),
+    ("fdopen", Open(File)),
+    ("tmpfile", Open(File)),
     ("popen", PipeOpen),
-    ("fmemopen", Open(Some(Buffer))),
-    ("open_memstream", Open(Some(Buffer))),
+    ("fmemopen", Open(Buffer)),
+    ("open_memstream", Open(Buffer)),
     // Close (2)
     ("fclose", Operation(Some(Close))),
     ("pclose", Operation(Some(Close))),
@@ -167,8 +172,8 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("getchar", StdioOperation), // unlocked
     ("gets", StdioOperation),    // removed
     // Read string (2)
-    ("sscanf", NotIO),
-    ("vsscanf", NotIO),
+    ("sscanf", StringOperation),
+    ("vsscanf", StringOperation),
     // Write (8)
     ("fprintf", Operation(Some(Write))),
     ("vfprintf", Unsupported),
@@ -184,13 +189,13 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("puts", StdioOperation),
     ("perror", StdioOperation),
     // Write fd (2)
-    ("dprintf", Ignore),
-    ("vdprintf", Ignore),
+    ("dprintf", FileDescrOperation),
+    ("vdprintf", FileDescrOperation),
     // Write string (4)
-    ("sprintf", NotIO),
-    ("vsprintf", NotIO),
-    ("snprintf", NotIO),
-    ("vsnprintf", NotIO),
+    ("sprintf", StringOperation),
+    ("vsprintf", StringOperation),
+    ("snprintf", StringOperation),
+    ("vsnprintf", StringOperation),
     // Positioning (7)
     ("fseek", Operation(Some(Seek))),
     ("fseeko", Operation(Some(Seek))),
@@ -215,25 +220,25 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("fileno", Operation(Some(AsRawFd))),
     // File system (6)
     ("rename", Unsupported),
-    ("renameat", Unsupported),
+    ("renameat", FileDescrOperation),
     ("remove", Unsupported),
     ("tmpnam", Unsupported),
     ("tempnam", Unsupported), // removed
     ("ctermid", Unsupported),
     // GNU libc / Linux
-    ("__fpending", Unsupported),
-    ("__freading", Unsupported),
-    ("__fwriting", Unsupported),
-    ("fpurge", Unsupported),
-    ("setmntent", Open(None)),
-    ("getmntent", Unsupported),
-    ("addmntent", Unsupported),
-    ("endmntent", Unsupported),
-    ("setlinebuf", Unsupported),
-    ("setbuffer", Unsupported),
+    ("__fpending", NonPosix),
+    ("__freading", NonPosix),
+    ("__fwriting", NonPosix),
+    ("fpurge", NonPosix),
+    ("setmntent", NonPosixOpen),
+    ("getmntent", NonPosix),
+    ("addmntent", NonPosix),
+    ("endmntent", NonPosix),
+    ("setlinebuf", NonPosix),
+    ("setbuffer", NonPosix),
     // wchar.h
     // Open (1)
-    ("open_wmemstream", Open(Some(Buffer))),
+    ("open_wmemstream", Open(Buffer)),
     // Read (6)
     ("fwscanf", Operation(Some(BufRead))),
     ("vfwscanf", Unsupported),
@@ -246,8 +251,8 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("vwscanf", Unsupported),
     ("getwchar", StdioOperation),
     // Read string (2)
-    ("swscanf", NotIO),
-    ("vswscanf", NotIO),
+    ("swscanf", StringOperation),
+    ("vswscanf", StringOperation),
     // Write (5)
     ("fwprintf", Operation(Some(Write))),
     ("vfwprintf", Unsupported),
@@ -259,8 +264,8 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("vwprintf", Unsupported),
     ("putwchar", StdioOperation),
     // Write string (2)
-    ("swprintf", NotIO),
-    ("vswprintf", NotIO),
+    ("swprintf", StringOperation),
+    ("vswprintf", StringOperation),
     // Orientation (1)
     ("fwide", Unsupported),
 ];

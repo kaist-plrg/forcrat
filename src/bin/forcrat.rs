@@ -78,7 +78,7 @@ fn main() {
             if show_api_names {
                 print!("total ");
                 for (name, api_kind) in API_LIST {
-                    if api_kind.is_not_io() {
+                    if !api_kind.is_posix_io() {
                         continue;
                     }
                     print!("{} ", name);
@@ -99,7 +99,7 @@ fn main() {
                 return;
             }
             for (name, api_kind) in API_LIST {
-                if api_kind.is_not_io() {
+                if !api_kind.is_posix_io() {
                     continue;
                 }
                 if distinguish_std_args {

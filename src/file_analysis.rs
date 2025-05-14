@@ -633,14 +633,14 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     match kind {
                         ApiKind::Open(origin) => {
                             let x = self.transfer_place(*destination, ctx);
-                            if let Some(origin) = origin {
-                                self.add_origin(x, origin);
-                            } else {
-                                if self.verbose {
-                                    println!("Unsupported open {:?}", def_id);
-                                }
-                                self.unsupported.add(x);
+                            self.add_origin(x, origin);
+                        }
+                        ApiKind::NonPosixOpen => {
+                            let x = self.transfer_place(*destination, ctx);
+                            if self.verbose {
+                                println!("Unsupported open {:?}", def_id);
                             }
+                            self.unsupported.add(x);
                         }
                         ApiKind::PipeOpen => {
                             let x = self.transfer_place(*destination, ctx);
@@ -676,7 +676,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 }
                             }
                         }
-                        ApiKind::Unsupported => {
+                        ApiKind::Unsupported | ApiKind::NonPosix => {
                             if self.verbose {
                                 println!("Unsupported api {:?}", def_id);
                             }
@@ -691,8 +691,8 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         }
                         ApiKind::Operation(None)
                         | ApiKind::StdioOperation
-                        | ApiKind::Ignore
-                        | ApiKind::NotIO => {}
+                        | ApiKind::FileDescrOperation
+                        | ApiKind::StringOperation => {}
                     }
                 } else if let Some(callee) = def_id.as_local() {
                     self.transfer_non_api_call(
