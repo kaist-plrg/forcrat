@@ -14,21 +14,21 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
     let mut width_args = vec![];
     loop {
         let res = parse_format(remaining);
-        for c in res.prefix {
-            match *c {
-                b'{' => format.push_str("{{"),
-                b'}' => format.push_str("}}"),
-                b'\n' => format.push_str("\\n"),
-                b'\r' => format.push_str("\\r"),
-                b'\t' => format.push_str("\\t"),
-                b'\\' => format.push_str("\\\\"),
-                b'\0' => {}
-                b'\"' => format.push_str("\\\""),
+        for c in String::from_utf8_lossy(res.prefix).chars() {
+            match c {
+                '{' => format.push_str("{{"),
+                '}' => format.push_str("}}"),
+                '\n' => format.push_str("\\n"),
+                '\r' => format.push_str("\\r"),
+                '\t' => format.push_str("\\t"),
+                '\\' => format.push_str("\\\\"),
+                '\0' => {}
+                '\"' => format.push_str("\\\""),
                 _ => {
-                    if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || *c == b' ' {
-                        format.push(*c as char);
+                    if c.is_ascii_alphanumeric() || c.is_ascii_graphic() || c == ' ' {
+                        format.push(c);
                     } else {
-                        write!(format, "\\u{{{:x}}}", *c).unwrap();
+                        write!(format, "\\u{{{:x}}}", c as u32).unwrap();
                     }
                 }
             }
