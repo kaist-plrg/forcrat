@@ -79,11 +79,6 @@ pub fn analyze<'a>(
     let (_, krate) = stolen.deref();
     let mut ast_visitor = AstVisitor::default();
     ast_visitor.visit_crate(krate);
-    let popen_read: FxHashMap<_, _> = ast_visitor
-        .popen_args
-        .into_iter()
-        .filter_map(|(span, arg)| is_popen_read(&arg).map(|r| (span, r)))
-        .collect();
     let mut fprintf_path_spans = FxHashMap::default();
     let mut unsupported_printf_spans = FxHashSet::default();
     for (call_span, arg) in ast_visitor.fprintf_args {
@@ -180,7 +175,6 @@ pub fn analyze<'a>(
     let mut analyzer = Analyzer {
         tcx,
         verbose,
-        popen_read,
         unsupported_printf_spans: &unsupported_printf_spans,
         loc_ind_map: &loc_ind_map,
         fn_ptrs: FxHashSet::default(),
@@ -333,30 +327,9 @@ pub fn analyze<'a>(
     }
 }
 
-pub fn is_popen_read(arg: &LikelyLit<'_>) -> Option<bool> {
-    match arg {
-        LikelyLit::Lit(lit) => match &lit.as_str()[..1] {
-            "r" => Some(true),
-            "w" => Some(false),
-            _ => panic!("{:?}", lit),
-        },
-        LikelyLit::If(_, t, f) => {
-            let t = is_popen_read(t);
-            let f = is_popen_read(f);
-            if t == f {
-                t
-            } else {
-                None
-            }
-        }
-        LikelyLit::Path(_, _) | LikelyLit::Other(_) => None,
-    }
-}
-
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     verbose: bool,
-    popen_read: FxHashMap<Span, bool>,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     unsupported_printf_spans: &'a FxHashSet<Span>,
     fn_ptrs: FxHashSet<LocalDefId>,
@@ -641,20 +614,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                                 println!("Unsupported open {:?}", def_id);
                             }
                             self.unsupported.add(x);
-                        }
-                        ApiKind::PipeOpen => {
-                            let x = self.transfer_place(*destination, ctx);
-                            if let Some(read) = self.popen_read.get(&term.source_info.span) {
-                                let origin = if *read {
-                                    Origin::PipeRead
-                                } else {
-                                    Origin::PipeWrite
-                                };
-                                self.add_origin(x, origin);
-                            } else {
-                                self.print_code("pipe", term.source_info.span);
-                                self.unsupported.add(x);
-                            }
                         }
                         ApiKind::Operation(Some(permission)) => {
                             let unsupported = self
@@ -1144,7 +1103,6 @@ struct AstVisitor<'ast> {
     static_span_to_lit: FxHashMap<Span, Symbol>,
 
     fprintf_args: Vec<(Span, LikelyLit<'ast>)>,
-    popen_args: Vec<(Span, LikelyLit<'ast>)>,
 }
 
 impl<'ast> rustc_ast::visit::Visitor<'ast> for AstVisitor<'ast> {
@@ -1176,10 +1134,6 @@ impl<'ast> rustc_ast::visit::Visitor<'ast> for AstVisitor<'ast> {
             "printf" => {
                 self.fprintf_args
                     .push((expr.span, LikelyLit::from_expr(&args[0])));
-            }
-            "popen" => {
-                self.popen_args
-                    .push((expr.span, LikelyLit::from_expr(&args[1])));
             }
             _ => {}
         }

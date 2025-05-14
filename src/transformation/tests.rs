@@ -173,7 +173,7 @@ unsafe fn f() {
     fgetc(f);
     pclose(f);
 }"#,
-        &["Read", "Command", "ChildStdout", "stdout", "drop"],
+        &["Read", "Command", "Child", "close", "drop"],
         &["FILE", "popen", "pclose"],
     );
 }
@@ -190,7 +190,7 @@ unsafe fn f() {
     fputs(b"echo hello\n\0" as *const u8 as *const libc::c_char, f);
     pclose(f);
 }"#,
-        &["Write", "Command", "ChildStdin", "stdin", "drop"],
+        &["Write", "Command", "Child", "close", "drop"],
         &["FILE", "popen", "pclose"],
     );
 }
@@ -1370,7 +1370,11 @@ unsafe fn f(mut x: libc::c_int) {
     }
     fgetc(stream);
     fgetc(stream);
-    fclose(stream);
+    if x != 0 {
+        fclose(stream);
+    } else {
+        pclose(stream);
+    }
 }"#,
         &["Box", "Read", "read_exact", "drop"],
         &["FILE", "fopen", "popen", "fgetc", "fclose"],
@@ -1429,7 +1433,11 @@ unsafe fn f(mut x: libc::c_int) {
     fgetc(stream);
     fileno(stream);
     fileno(stream);
-    fclose(stream);
+    if x != 0 {
+        fclose(stream);
+    } else {
+        pclose(stream);
+    }
 }"#,
         &["Box", "Read", "read_exact", "drop"],
         &["FILE", "fopen", "popen", "fgetc", "fileno", "fclose"],
@@ -1583,7 +1591,11 @@ unsafe fn f(mut x: libc::c_int) {
     let mut stream: *mut FILE = g(x);
     fgetc(stream);
     fgetc(stream);
-    fclose(stream);
+    if x != 0 {
+        fclose(stream);
+    } else {
+        pclose(stream);
+    }
 }"#,
         &["Read", "read_exact", "drop"],
         &["FILE", "fopen", "fgetc", "fclose"],

@@ -62,13 +62,29 @@ impl AsRawFd for std::io::Stdin { fn as_raw_fd(&self) -> i32 { std::os::unix::io
 impl AsRawFd for std::io::StdinLock<'_> { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
 impl AsRawFd for std::io::Stdout { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
 impl AsRawFd for std::io::Stderr { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
-impl AsRawFd for std::process::ChildStdin { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
-impl AsRawFd for std::process::ChildStdout { fn as_raw_fd(&self) -> i32 { std::os::unix::io::AsRawFd::as_raw_fd(self) } }
 impl<T: AsRawFd> AsRawFd for &T { fn as_raw_fd(&self) -> i32 { (*self).as_raw_fd() } }
 impl<T: AsRawFd> AsRawFd for &mut T { fn as_raw_fd(&self) -> i32 { (**self).as_raw_fd() } }
-impl<T: AsRawFd> AsRawFd for Box<T> { fn as_raw_fd(&self) -> i32 { (**self).as_raw_fd() } }
+impl<T: AsRawFd + ?Sized> AsRawFd for Box<T> { fn as_raw_fd(&self) -> i32 { (**self).as_raw_fd() } }
 impl<T: AsRawFd> AsRawFd for std::io::BufReader<T> { fn as_raw_fd(&self) -> i32 { self.get_ref().as_raw_fd() } }
 impl<T: AsRawFd + std::io::Write> AsRawFd for std::io::BufWriter<T> { fn as_raw_fd(&self) -> i32 { self.get_ref().as_raw_fd() } }
+struct Child(std::process::Child);
+impl std::io::Read for Child { fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> { self.0.stdout.as_mut().unwrap().read(buf) } }
+impl std::io::Write for Child {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.stdin.as_mut().unwrap().write(buf) }
+    fn flush(&mut self) -> std::io::Result<()> { self.0.stdin.as_mut().unwrap().flush() }
+}
+impl AsRawFd for Child {
+    fn as_raw_fd(&self) -> i32 { self.0.stdout.as_ref().map(|s| std::os::fd::AsRawFd::as_raw_fd(s)).or_else(|| self.0.stdin.as_ref().map(|s| std::os::fd::AsRawFd::as_raw_fd(s))).unwrap() }
+}
+trait Close { fn close(&mut self) -> i32; }
+impl Close for Child { fn close(&mut self) -> i32 { self.0.wait().ok().and_then(|e| e.code()).unwrap_or(-1) } }
+impl Close for std::fs::File { fn close(&mut self) -> i32 { 0 } }
+impl Close for std::io::Stdin { fn close(&mut self) -> i32 { 0 } }
+impl Close for std::io::Stdout { fn close(&mut self) -> i32 { 0 } }
+impl Close for std::io::Stderr { fn close(&mut self) -> i32 { 0 } }
+impl<T: Close + std::io::Read> Close for std::io::BufReader<T> { fn close(&mut self) -> i32 { self.get_mut().close() } }
+impl<T: Close + std::io::Write> Close for std::io::BufWriter<T> { fn close(&mut self) -> i32 { self.get_mut().close() } }
+impl<T: Close + ?Sized> Close for Box<T> { fn close(&mut self) -> i32 { self.as_mut().close() } }
 ".to_string();
         for bound in &self.bounds {
             writeln!(

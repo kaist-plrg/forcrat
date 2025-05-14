@@ -244,15 +244,7 @@ impl<'a> TransformVisitor<'_, 'a> {
             let rhs_ty = match name {
                 "fopen" | "tmpfile" => StreamType::Option(&FILE_TY),
                 "fdopen" => FILE_TY,
-                "popen" => {
-                    if rhs_str.contains("child.stdin") {
-                        StreamType::Option(&StreamType::ChildStdin)
-                    } else if rhs_str.contains("child.stdout") {
-                        StreamType::Option(&StreamType::ChildStdout)
-                    } else {
-                        panic!("{}", rhs_str)
-                    }
-                }
+                "popen" => StreamType::Option(&CHILD_TY),
                 _ => *self.return_pot(*def_id).unwrap().ty,
             };
             let new_rhs = convert_expr(*lhs_pot.ty, rhs_ty, &rhs_str, consume, is_non_local);
@@ -595,13 +587,22 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let new_expr = transform_popen(&args[0], &args[1]);
                             self.replace_expr(expr, new_expr);
                         }
-                        "fclose" | "pclose" => {
+                        "fclose" => {
                             if self.is_unsupported(&args[0]) {
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
                             let is_non_local = self.is_non_local(args[0].span);
                             let new_expr = transform_fclose(&args[0], *ty, is_non_local);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "pclose" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let is_non_local = self.is_non_local(args[0].span);
+                            let new_expr = transform_pclose(&args[0], *ty, is_non_local);
                             self.replace_expr(expr, new_expr);
                         }
                         "fscanf" => {
@@ -1402,7 +1403,7 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
         command
     );
     let mode = LikelyLit::from_expr(mode);
-    match file_analysis::is_popen_read(&mode) {
+    match is_popen_read(&mode) {
         Some(read) => {
             let field = if read { "stdout" } else { "stdin" };
             expr!(
@@ -1413,7 +1414,7 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
                 .{1}(std::process::Stdio::piped())
                 .spawn()
                 .ok()
-                .and_then(|child| child.{1})"#,
+                .map(|c| crate::Child(c))"#,
                 command,
                 field
             )
@@ -1445,6 +1446,37 @@ fn transform_fclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Ex
         }
         _ => expr!("{{ drop({}); 0 }}", stream),
     }
+}
+
+fn transform_pclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Expr {
+    let stream = pprust::expr_to_string(stream);
+    let x = match ty {
+        StreamType::Ref(_) | StreamType::Ptr(_) => panic!(),
+        StreamType::Option(_) => {
+            if is_non_local {
+                format!("({}).take().unwrap()", stream)
+            } else {
+                format!("({}).unwrap()", stream)
+            }
+        }
+        StreamType::ManuallyDrop(StreamType::Option(_)) => format!(
+            "std::mem::ManuallyDrop::take(&mut ({})).take().unwrap()",
+            stream
+        ),
+        StreamType::ManuallyDrop(_) => {
+            format!("std::mem::ManuallyDrop::take(&mut ({}))", stream)
+        }
+        _ => stream,
+    };
+    expr!(
+        "{{
+    let mut __x = {};
+    let __v = crate::Close::close(&mut __x);
+    drop(__x);
+    __v
+}}",
+        x
+    )
 }
 
 fn transform_fscanf<S: StreamExpr, E: Deref<Target = Expr>>(
@@ -2323,5 +2355,25 @@ impl IndicatorCheck<'_> {
             (false, true) => format!("{{ {}_error = 0; }}", self.name.unwrap()),
             (false, false) => "()".to_string(),
         }
+    }
+}
+
+fn is_popen_read(arg: &LikelyLit<'_>) -> Option<bool> {
+    match arg {
+        LikelyLit::Lit(lit) => match &lit.as_str()[..1] {
+            "r" => Some(true),
+            "w" => Some(false),
+            _ => panic!("{:?}", lit),
+        },
+        LikelyLit::If(_, t, f) => {
+            let t = is_popen_read(t);
+            let f = is_popen_read(f);
+            if t == f {
+                t
+            } else {
+                None
+            }
+        }
+        LikelyLit::Path(_, _) | LikelyLit::Other(_) => None,
     }
 }

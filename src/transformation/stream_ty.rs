@@ -109,6 +109,9 @@ impl<'a> TypeArena<'a> {
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
             }
+            if permissions.contains(Permission::Close) && origins.contains(Origin::Pipe) {
+                traits.insert(StreamTrait::Close);
+            }
             let ty = self.alloc(StreamType::Impl(TraitBound(traits)));
             self.option(ty)
         } else if origins.is_empty() {
@@ -135,9 +138,7 @@ impl<'a> TypeArena<'a> {
                         &FILE_TY
                     }
                 }
-                Origin::PipeRead => &CHILD_STDOUT_TY,
-                Origin::PipeWrite => &CHILD_STDIN_TY,
-                Origin::PipeDyn => todo!(),
+                Origin::Pipe => &CHILD_TY,
                 Origin::Buffer => todo!(),
             };
             if permissions.contains(Permission::Close)
@@ -160,6 +161,9 @@ impl<'a> TypeArena<'a> {
             }
             if traits.contains(StreamTrait::BufRead) {
                 traits.remove(StreamTrait::Read);
+            }
+            if permissions.contains(Permission::Close) && origins.contains(Origin::Pipe) {
+                traits.insert(StreamTrait::Close);
             }
             let ty = self.alloc(StreamType::Dyn(TraitBound(traits)));
             let ty = if permissions.contains(Permission::Close) {
@@ -188,8 +192,7 @@ pub(super) enum StreamType<'a> {
     Stdin,
     Stdout,
     Stderr,
-    ChildStdin,
-    ChildStdout,
+    Child,
     Option(&'a StreamType<'a>),
     BufWriter(&'a StreamType<'a>),
     BufReader(&'a StreamType<'a>),
@@ -205,8 +208,7 @@ pub(super) static STDIN_TY: StreamType<'static> = StreamType::Stdin;
 pub(super) static STDOUT_TY: StreamType<'static> = StreamType::Stdout;
 pub(super) static STDERR_TY: StreamType<'static> = StreamType::Stderr;
 pub(super) static FILE_TY: StreamType<'static> = StreamType::File;
-pub(super) static CHILD_STDIN_TY: StreamType<'static> = StreamType::ChildStdin;
-pub(super) static CHILD_STDOUT_TY: StreamType<'static> = StreamType::ChildStdout;
+pub(super) static CHILD_TY: StreamType<'static> = StreamType::Child;
 
 impl std::fmt::Display for StreamType<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -215,8 +217,7 @@ impl std::fmt::Display for StreamType<'_> {
             Self::Stdin => write!(f, "std::io::Stdin"),
             Self::Stdout => write!(f, "std::io::Stdout"),
             Self::Stderr => write!(f, "std::io::Stderr"),
-            Self::ChildStdin => write!(f, "std::process::ChildStdin"),
-            Self::ChildStdout => write!(f, "std::process::ChildStdout"),
+            Self::Child => write!(f, "crate::Child"),
             Self::Option(t) => write!(f, "Option<{}>", t),
             Self::BufWriter(t) => write!(f, "std::io::BufWriter<{}>", t),
             Self::BufReader(t) => write!(f, "std::io::BufReader<{}>", t),
@@ -243,8 +244,7 @@ impl StreamType<'_> {
             | Self::Stdin
             | Self::Stdout
             | Self::Stderr
-            | Self::ChildStdin
-            | Self::ChildStdout
+            | Self::Child
             | Self::BufWriter(_)
             | Self::BufReader(_)
             | Self::Box(_)
@@ -258,13 +258,9 @@ impl StreamType<'_> {
 
     pub(super) fn contains_impl(self) -> bool {
         match self {
-            Self::File
-            | Self::Stdin
-            | Self::Stdout
-            | Self::Stderr
-            | Self::ChildStdin
-            | Self::ChildStdout
-            | Self::Dyn(_) => false,
+            Self::File | Self::Stdin | Self::Stdout | Self::Stderr | Self::Child | Self::Dyn(_) => {
+                false
+            }
             Self::Impl(_) => true,
             Self::Option(t)
             | Self::BufWriter(t)
@@ -282,8 +278,7 @@ impl StreamType<'_> {
             | Self::Stdin
             | Self::Stdout
             | Self::Stderr
-            | Self::ChildStdin
-            | Self::ChildStdout
+            | Self::Child
             | Self::Impl(_) => None,
             Self::Option(t)
             | Self::BufWriter(t)
@@ -377,11 +372,7 @@ pub(super) fn convert_expr(
             let converted = convert_expr(*to, from, expr, consume, is_non_local);
             format!("std::mem::ManuallyDrop::new({})", converted)
         }
-        (
-            Impl(_),
-            File | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_)
-            | Box(Dyn(_)),
-        ) => {
+        (Impl(_), File | Stdout | Stderr | Child | BufWriter(_) | BufReader(_) | Box(Dyn(_))) => {
             if consume {
                 expr.to_string()
             } else {
@@ -390,8 +381,8 @@ pub(super) fn convert_expr(
         }
         (
             Impl(_),
-            Ref(File) | Ref(Stdout) | Ref(Stderr) | Ref(ChildStdin) | Ref(ChildStdout)
-            | Ref(BufWriter(_)) | Ref(BufReader(_)),
+            Ref(File) | Ref(Stdout) | Ref(Stderr) | Ref(Child) | Ref(BufWriter(_))
+            | Ref(BufReader(_)),
         ) => expr.to_string(),
         (Impl(traits), Stdin) => {
             if traits.contains(StreamTrait::BufRead) {
@@ -433,7 +424,7 @@ pub(super) fn convert_expr(
         }
         (
             Box(Dyn(traits)),
-            File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+            File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_),
         ) => {
             assert!(consume);
             match from {
@@ -465,19 +456,13 @@ pub(super) fn convert_expr(
         }
         (
             Ref(Dyn(_)),
-            Ref(
-                File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_)
-                | BufReader(_),
-            ),
+            Ref(File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_)),
         ) => {
             format!("&mut *({})", expr)
         }
         (
             Ptr(Dyn(_)),
-            Ref(
-                File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_)
-                | BufReader(_),
-            ),
+            Ref(File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_)),
         ) => {
             format!("&mut *({}) as *mut _", expr)
         }
@@ -489,7 +474,7 @@ pub(super) fn convert_expr(
         }
         (
             Ref(Dyn(traits)),
-            File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+            File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_),
         ) => {
             if consume {
                 let expr = convert_expr(Box(&Dyn(*traits)), from, expr, true, is_non_local);
@@ -500,7 +485,7 @@ pub(super) fn convert_expr(
         }
         (
             Ptr(Dyn(traits)),
-            File | Stdin | Stdout | Stderr | ChildStdin | ChildStdout | BufWriter(_) | BufReader(_),
+            File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_),
         ) => {
             let expr = convert_expr(Ref(&Dyn(*traits)), from, expr, consume, is_non_local);
             format!("({}) as *mut _", expr)
@@ -619,6 +604,7 @@ pub(super) enum StreamTrait {
     Write = 2,
     Seek = 3,
     AsRawFd = 4,
+    Close = 5,
 }
 
 impl std::fmt::Display for StreamTrait {
@@ -629,12 +615,13 @@ impl std::fmt::Display for StreamTrait {
             Self::Write => write!(f, "std::io::Write"),
             Self::Seek => write!(f, "std::io::Seek"),
             Self::AsRawFd => write!(f, "crate::AsRawFd"),
+            Self::Close => write!(f, "crate::Close"),
         }
     }
 }
 
 impl StreamTrait {
-    const NUM: usize = 5;
+    const NUM: usize = 6;
 
     pub(super) fn from_permission(p: Permission) -> Option<Self> {
         match p {
@@ -654,6 +641,7 @@ impl StreamTrait {
             Self::Write => "Write",
             Self::Seek => "Seek",
             Self::AsRawFd => "AsRawFd",
+            Self::Close => "Close",
         }
     }
 }

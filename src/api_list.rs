@@ -77,9 +77,7 @@ pub enum Origin {
     Stdout = 1,
     Stderr = 2,
     File = 3,
-    PipeRead = 4,
-    PipeWrite = 5,
-    PipeDyn = 6,
+    Pipe = 4,
     Buffer = 7,
 }
 
@@ -105,7 +103,6 @@ impl Idx for Origin {
 #[derive(Debug, Clone, Copy)]
 pub enum ApiKind {
     Open(Origin),
-    PipeOpen,
     Operation(Option<Permission>),
     StdioOperation,
     Unsupported,
@@ -134,7 +131,7 @@ impl ApiKind {
     #[inline]
     pub fn is_posix_io(self) -> bool {
         match self {
-            Open(_) | PipeOpen | Operation(_) | StdioOperation | Unsupported => true,
+            Open(_) | Operation(_) | StdioOperation | Unsupported => true,
             FileDescrOperation | StringOperation | NonPosixOpen | NonPosix => false,
         }
     }
@@ -150,7 +147,7 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("fopen", Open(File)),
     ("fdopen", Open(File)),
     ("tmpfile", Open(File)),
-    ("popen", PipeOpen),
+    ("popen", Open(Pipe)),
     ("fmemopen", Open(Buffer)),
     ("open_memstream", Open(Buffer)),
     // Close (2)
