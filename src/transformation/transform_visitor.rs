@@ -1950,9 +1950,9 @@ fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) 
         expr!(
             "{{
     use std::io::Write;
-    let c = {};
-    match ({}).write_all(&[c as u8]) {{
-        Ok(_) => c,
+    let c = ({}) as u8;
+    match ({}).write_all(&[c]) {{
+        Ok(_) => c as i32,
         Err(e) => {{
             {}
             libc::EOF
@@ -1967,8 +1967,8 @@ fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) 
         expr!(
             "{{
     use std::io::Write;
-    let c = {};
-    ({}).write_all(&[c as u8]).map_or(libc::EOF, |_| c)
+    let c = ({}) as u8;
+    ({}).write_all(&[c]).map_or(libc::EOF, |_| c as i32)
 }}",
             c,
             stream_str
