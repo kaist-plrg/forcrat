@@ -1916,12 +1916,12 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
     use std::io::Write;
     let string_to_print = format!(\"{}\", {}{});
     match write!({}, \"{{}}\", string_to_print) {{
-        Ok(_) => {{}}
+        Ok(_) => string_to_print.len() as i32,
         Err(e) => {{
             {}
+            -1
         }}
     }}
-    string_to_print.len() as i32
 }}",
                 rsfmt.format,
                 new_args,
@@ -1934,8 +1934,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
                 "{{
     use std::io::Write;
     let string_to_print = format!(\"{}\", {}{});
-    write!({}, \"{{}}\", string_to_print);
-    string_to_print.len() as i32
+    write!({}, \"{{}}\", string_to_print).map_or(-1, |_| string_to_print.len() as i32);
 }}",
                 rsfmt.format,
                 new_args,
