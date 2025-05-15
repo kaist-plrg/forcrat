@@ -1423,34 +1423,9 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
     }
 }
 
-fn transform_fclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Expr {
+fn take_stream(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> String {
     let stream = pprust::expr_to_string(stream);
     match ty {
-        StreamType::Ref(_) | StreamType::Ptr(_) => panic!(),
-        StreamType::Option(_) => {
-            if is_non_local {
-                expr!("{{ drop(({}).take().unwrap()); 0 }}", stream)
-            } else {
-                expr!("{{ drop(({}).unwrap()); 0 }}", stream)
-            }
-        }
-        StreamType::ManuallyDrop(StreamType::Option(_)) => expr!(
-            "{{ drop(std::mem::ManuallyDrop::take(&mut ({})).take().unwrap()); 0 }}",
-            stream
-        ),
-        StreamType::ManuallyDrop(_) => {
-            expr!(
-                "{{ drop(std::mem::ManuallyDrop::take(&mut ({}))); 0 }}",
-                stream
-            )
-        }
-        _ => expr!("{{ drop({}); 0 }}", stream),
-    }
-}
-
-fn transform_pclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Expr {
-    let stream = pprust::expr_to_string(stream);
-    let x = match ty {
         StreamType::Ref(_) | StreamType::Ptr(_) => panic!(),
         StreamType::Option(_) => {
             if is_non_local {
@@ -1467,7 +1442,30 @@ fn transform_pclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Ex
             format!("std::mem::ManuallyDrop::take(&mut ({}))", stream)
         }
         _ => stream,
+    }
+}
+
+fn transform_fclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Expr {
+    let stream = take_stream(stream, ty, is_non_local);
+    let v = if ty.can_flush() {
+        "std::io::Write::flush(&mut __x).map_or(-1, |_| 0)"
+    } else {
+        "0"
     };
+    expr!(
+        "{{
+    let mut __x = {};
+    let __v = {};
+    drop(__x);
+    __v
+}}",
+        stream,
+        v,
+    )
+}
+
+fn transform_pclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Expr {
+    let stream = take_stream(stream, ty, is_non_local);
     expr!(
         "{{
     let mut __x = {};
@@ -1475,7 +1473,7 @@ fn transform_pclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Ex
     drop(__x);
     __v
 }}",
-        x
+        stream,
     )
 }
 
@@ -1934,7 +1932,7 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
                 "{{
     use std::io::Write;
     let string_to_print = format!(\"{}\", {}{});
-    write!({}, \"{{}}\", string_to_print).map_or(-1, |_| string_to_print.len() as i32);
+    write!({}, \"{{}}\", string_to_print).map_or(-1, |_| string_to_print.len() as i32)
 }}",
                 rsfmt.format,
                 new_args,

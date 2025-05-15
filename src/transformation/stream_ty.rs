@@ -290,6 +290,19 @@ impl StreamType<'_> {
             Self::Dyn(traits) => Some(traits),
         }
     }
+
+    pub(super) fn can_flush(self) -> bool {
+        match self {
+            Self::File | Self::Stdout | Self::Stderr | Self::BufWriter(_) => true,
+            Self::Stdin | Self::Child | Self::BufReader(_) => false,
+            Self::Option(t)
+            | Self::Ptr(t)
+            | Self::Ref(t)
+            | Self::Box(t)
+            | Self::ManuallyDrop(t) => t.can_flush(),
+            Self::Dyn(traits) | Self::Impl(traits) => traits.contains(StreamTrait::Write),
+        }
+    }
 }
 
 pub(super) fn convert_expr(
