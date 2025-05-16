@@ -383,6 +383,7 @@ impl Pass for Transformation {
                 _ => continue,
             };
             let loc_id = analysis_res.loc_ind_map[&loc];
+            hir_loc_to_loc_id.insert(*hir_loc, loc_id);
             let permissions = analysis_res.permissions[loc_id];
             let origins = analysis_res.origins[loc_id];
             let pot = Pot {

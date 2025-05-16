@@ -155,7 +155,7 @@ pub fn analyze<'a>(
         fn_ptrs: FxHashSet::default(),
         permission_graph,
         origin_graph,
-        unsupported: UnsupportedTracker::new(&arena),
+        unsupported: UnsupportedTracker::new(&arena, locs.len()),
     };
 
     for loc in &error_analysis.no_source_locs {
@@ -253,6 +253,15 @@ pub fn analyze<'a>(
             }
             analyzer.unsupported.add(i);
         }
+    }
+
+    let stdout = analyzer.loc_ind_map[&Loc::Stdout];
+    if analyzer.unsupported.unsupported.contains(&stdout) {
+        analyzer.unsupported.unsupport_stdout(stdout);
+    }
+    let stderr = analyzer.loc_ind_map[&Loc::Stderr];
+    if analyzer.unsupported.unsupported.contains(&stderr) {
+        analyzer.unsupported.unsupport_stderr(stderr);
     }
 
     let unsupported = analyzer.unsupported.compute_all();
@@ -710,9 +719,18 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 self.origin_graph.add_edge(rhs, lhs);
             }
         }
+
         let stdout = self.loc_ind_map[&Loc::Stdout];
         let stderr = self.loc_ind_map[&Loc::Stderr];
-        if lhs != stdout && rhs != stdout && lhs != stderr && rhs != stderr {
+        if lhs == stdout {
+            self.unsupported.stdout_locs.insert(rhs);
+        } else if rhs == stdout {
+            self.unsupported.stdout_locs.insert(lhs);
+        } else if lhs == stderr {
+            self.unsupported.stderr_locs.insert(rhs);
+        } else if rhs == stderr {
+            self.unsupported.stderr_locs.insert(lhs);
+        } else {
             self.unsupported.union(lhs, rhs);
         }
     }
@@ -1013,14 +1031,20 @@ struct UnsupportedTracker<'a> {
     arena: &'a Arena<DisjointSet<'a, LocId>>,
     locs: FxHashMap<LocId, &'a DisjointSet<'a, LocId>>,
     unsupported: FxHashSet<LocId>,
+
+    stdout_locs: MixedBitSet<LocId>,
+    stderr_locs: MixedBitSet<LocId>,
 }
 
 impl<'a> UnsupportedTracker<'a> {
-    fn new(arena: &'a Arena<DisjointSet<'a, LocId>>) -> Self {
+    fn new(arena: &'a Arena<DisjointSet<'a, LocId>>, len: usize) -> Self {
         Self {
             arena,
             locs: FxHashMap::default(),
             unsupported: FxHashSet::default(),
+
+            stdout_locs: MixedBitSet::new_empty(len),
+            stderr_locs: MixedBitSet::new_empty(len),
         }
     }
 
@@ -1043,6 +1067,20 @@ impl<'a> UnsupportedTracker<'a> {
             e.insert(self.arena.alloc(DisjointSet::new(loc)));
         }
         self.unsupported.insert(loc);
+    }
+
+    fn unsupport_stdout(&mut self, stdout: LocId) {
+        let v: Vec<_> = self.stdout_locs.iter().collect();
+        for loc in v {
+            self.union(stdout, loc);
+        }
+    }
+
+    fn unsupport_stderr(&mut self, stderr: LocId) {
+        let v: Vec<_> = self.stderr_locs.iter().collect();
+        for loc in v {
+            self.union(stderr, loc);
+        }
     }
 
     fn compute_all(&self) -> FxHashSet<LocId> {
