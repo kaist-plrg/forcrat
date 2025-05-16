@@ -71,6 +71,7 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) current_fns: Vec<LocalDefId>,
     pub(super) bounds: Vec<TraitBound>,
     pub(super) guards: FxHashSet<Symbol>,
+    pub(super) foreign_statics: FxHashSet<&'static str>,
 }
 
 fn remove_cast(expr: &Expr) -> &Expr {
@@ -353,6 +354,45 @@ impl<'a> TransformVisitor<'_, 'a> {
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
+    fn visit_crate(&mut self, c: &mut Crate) {
+        mut_visit::walk_crate(self, c);
+
+        if !self.foreign_statics.is_empty() {
+            let foreign_mod = c
+                .items
+                .iter_mut()
+                .find_map(|item| {
+                    if let ItemKind::ForeignMod(foreign_mod) = &mut item.kind {
+                        Some(foreign_mod)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            for name in self.foreign_statics.drain() {
+                if foreign_mod
+                    .items
+                    .iter()
+                    .any(|item| item.ident.as_str() == name)
+                {
+                    continue;
+                }
+                let item = item!("static mut {}: *mut FILE;", name);
+                let ItemKind::Static(static_item) = item.kind else { panic!() };
+                let foreign_item = ForeignItem {
+                    attrs: item.attrs,
+                    id: item.id,
+                    span: item.span,
+                    vis: item.vis,
+                    ident: item.ident,
+                    kind: ForeignItemKind::Static(static_item),
+                    tokens: item.tokens,
+                };
+                foreign_mod.items.push(P(foreign_item));
+            }
+        }
+    }
+
     fn visit_item(&mut self, item: &mut P<Item>) {
         if self.api_ident_spans.contains(&item.ident.span) {
             return;
@@ -740,14 +780,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         "fprintf" => {
                             if self.is_unsupported(&args[0]) {
                                 let origins = self.bound_expr_origins(&args[0]);
-                                if let Some(new_expr) = transform_unsupported(
+                                if let Some(new_expr) = self.transform_unsupported(
                                     "fprintf",
                                     orig_name,
                                     &[],
                                     &args[0],
                                     &args[1..],
-                                    self.is_stdout_unsupported,
-                                    self.is_stderr_unsupported,
                                     origins,
                                 ) {
                                     self.replace_expr(expr, new_expr);
@@ -802,14 +840,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         "vfprintf" => {
                             if self.is_unsupported(&args[0]) {
                                 let origins = self.bound_expr_origins(&args[0]);
-                                if let Some(new_expr) = transform_unsupported(
+                                if let Some(new_expr) = self.transform_unsupported(
                                     "vfprintf",
                                     orig_name,
                                     &[],
                                     &args[0],
                                     &args[1..],
-                                    self.is_stdout_unsupported,
-                                    self.is_stderr_unsupported,
                                     origins,
                                 ) {
                                     self.replace_expr(expr, new_expr);
@@ -834,14 +870,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         "fputc" | "putc" => {
                             if self.is_unsupported(&args[1]) {
                                 let origins = self.bound_expr_origins(&args[1]);
-                                if let Some(new_expr) = transform_unsupported(
+                                if let Some(new_expr) = self.transform_unsupported(
                                     "fputc",
                                     orig_name,
                                     &args[0..1],
                                     &args[1],
                                     &[],
-                                    self.is_stdout_unsupported,
-                                    self.is_stderr_unsupported,
                                     origins,
                                 ) {
                                     self.replace_expr(expr, new_expr);
@@ -866,14 +900,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         "fputwc" | "putwc" => {
                             if self.is_unsupported(&args[1]) {
                                 let origins = self.bound_expr_origins(&args[1]);
-                                if let Some(new_expr) = transform_unsupported(
+                                if let Some(new_expr) = self.transform_unsupported(
                                     "fputwc",
                                     orig_name,
                                     &args[0..1],
                                     &args[1],
                                     &[],
-                                    self.is_stdout_unsupported,
-                                    self.is_stderr_unsupported,
                                     origins,
                                 ) {
                                     self.replace_expr(expr, new_expr);
@@ -889,14 +921,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         "fputs" => {
                             if self.is_unsupported(&args[1]) {
                                 let origins = self.bound_expr_origins(&args[1]);
-                                if let Some(new_expr) = transform_unsupported(
+                                if let Some(new_expr) = self.transform_unsupported(
                                     "fputs",
                                     orig_name,
                                     &args[0..1],
                                     &args[1],
                                     &[],
-                                    self.is_stdout_unsupported,
-                                    self.is_stderr_unsupported,
                                     origins,
                                 ) {
                                     self.replace_expr(expr, new_expr);
@@ -927,14 +957,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         "fwrite" => {
                             if self.is_unsupported(&args[3]) {
                                 let origins = self.bound_expr_origins(&args[3]);
-                                if let Some(new_expr) = transform_unsupported(
+                                if let Some(new_expr) = self.transform_unsupported(
                                     "fwrite",
                                     orig_name,
                                     &args[0..3],
                                     &args[3],
                                     &[],
-                                    self.is_stdout_unsupported,
-                                    self.is_stderr_unsupported,
                                     origins,
                                 ) {
                                     self.replace_expr(expr, new_expr);
@@ -951,14 +979,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         "fflush" => {
                             if self.is_unsupported(&args[0]) {
                                 let origins = self.bound_expr_origins(&args[0]);
-                                if let Some(new_expr) = transform_unsupported(
+                                if let Some(new_expr) = self.transform_unsupported(
                                     "fflush",
                                     orig_name,
                                     &args[..0],
                                     &args[0],
                                     &[],
-                                    self.is_stdout_unsupported,
-                                    self.is_stderr_unsupported,
                                     origins,
                                 ) {
                                     self.replace_expr(expr, new_expr);
@@ -2090,48 +2116,52 @@ fn transform_funlockfile<S: StreamExpr>(stream: &S, name: Symbol) -> Expr {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn transform_unsupported<E: Deref<Target = Expr>>(
-    rs_name: &str,
-    c_name: &str,
-    before_args: &[E],
-    stream: &Expr,
-    after_args: &[E],
-    is_stdout_unsupported: bool,
-    is_stderr_unsupported: bool,
-    origins: Option<BitSet8<Origin>>,
-) -> Option<Expr> {
-    let stdout = origins.is_none_or(|o| o.contains(Origin::Stdout)) && !is_stdout_unsupported;
-    let stderr = origins.is_none_or(|o| o.contains(Origin::Stderr)) && !is_stderr_unsupported;
-    if !stdout && !stderr {
-        return None;
+impl TransformVisitor<'_, '_> {
+    fn transform_unsupported<E: Deref<Target = Expr>>(
+        &mut self,
+        rs_name: &str,
+        c_name: &str,
+        before_args: &[E],
+        stream: &Expr,
+        after_args: &[E],
+        origins: Option<BitSet8<Origin>>,
+    ) -> Option<Expr> {
+        let stdout =
+            origins.is_none_or(|o| o.contains(Origin::Stdout)) && !self.is_stdout_unsupported;
+        let stderr =
+            origins.is_none_or(|o| o.contains(Origin::Stderr)) && !self.is_stderr_unsupported;
+        if !stdout && !stderr {
+            return None;
+        }
+        let stream = pprust::expr_to_string(stream);
+        let mut new_expr = String::new();
+        if stdout {
+            self.foreign_statics.insert("stdout");
+            write!(
+                new_expr,
+                "if {} == stdout {{ crate::stdio::{}(",
+                stream, rs_name
+            )
+            .unwrap();
+            write_args(&mut new_expr, before_args, "std::io::stdout()", after_args);
+            new_expr.push_str(").0 } else ");
+        }
+        if stderr {
+            self.foreign_statics.insert("stderr");
+            write!(
+                new_expr,
+                "if {} == stderr {{ crate::stdio::{}(",
+                stream, rs_name
+            )
+            .unwrap();
+            write_args(&mut new_expr, before_args, "std::io::stderr()", after_args);
+            new_expr.push_str(").0 } else ");
+        }
+        write!(new_expr, "{{ {}(", c_name).unwrap();
+        write_args(&mut new_expr, before_args, &stream, after_args);
+        new_expr.push_str(") }");
+        Some(expr!("{}", new_expr))
     }
-    let stream = pprust::expr_to_string(stream);
-    let mut new_expr = String::new();
-    if stdout {
-        write!(
-            new_expr,
-            "if {} == stdout {{ crate::stdio::{}(",
-            stream, rs_name
-        )
-        .unwrap();
-        write_args(&mut new_expr, before_args, "std::io::stdout()", after_args);
-        new_expr.push_str(").0 } else ");
-    }
-    if stderr {
-        write!(
-            new_expr,
-            "if {} == stderr {{ crate::stdio::{}(",
-            stream, rs_name
-        )
-        .unwrap();
-        write_args(&mut new_expr, before_args, "std::io::stderr()", after_args);
-        new_expr.push_str(").0 } else ");
-    }
-    write!(new_expr, "{{ {}(", c_name).unwrap();
-    write_args(&mut new_expr, before_args, &stream, after_args);
-    new_expr.push_str(") }");
-    Some(expr!("{}", new_expr))
 }
 
 fn write_args<E: Deref<Target = Expr>>(

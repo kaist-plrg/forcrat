@@ -505,6 +505,7 @@ impl Pass for Transformation {
                 current_fns: vec![],
                 bounds: vec![],
                 guards: FxHashSet::default(),
+                foreign_statics: FxHashSet::default(),
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
