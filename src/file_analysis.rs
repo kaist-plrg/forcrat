@@ -46,7 +46,6 @@ pub struct AnalysisResult<'a> {
     pub unsupported: FxHashSet<LocId>,
     pub static_span_to_lit: FxHashMap<Span, Symbol>,
     pub defined_apis: FxHashSet<LocalDefId>,
-    pub unsupported_printf_spans: FxHashSet<Span>,
     pub fn_ptrs: FxHashSet<LocalDefId>,
     pub tracking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
     pub returning_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
@@ -79,19 +78,6 @@ pub fn analyze<'a>(
     let (_, krate) = stolen.deref();
     let mut ast_visitor = AstVisitor::default();
     ast_visitor.visit_crate(krate);
-    let mut fprintf_path_spans = FxHashMap::default();
-    let mut unsupported_printf_spans = FxHashSet::default();
-    for (call_span, arg) in ast_visitor.fprintf_args {
-        match arg {
-            LikelyLit::Lit(_) => {}
-            LikelyLit::Path(_, path_span) => {
-                fprintf_path_spans.insert(call_span, path_span);
-            }
-            LikelyLit::If(_, _, _) | LikelyLit::Other(_) => {
-                unsupported_printf_spans.insert(call_span);
-            }
-        }
-    }
     let static_span_to_lit = ast_visitor.static_span_to_lit;
     drop(stolen);
 
@@ -99,16 +85,6 @@ pub fn analyze<'a>(
 
     let mut visitor = HirVisitor::new(tcx);
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-    for (call_span, path_span) in fprintf_path_spans {
-        let def_id = some_or!(visitor.bound_span_to_def_id.get(&path_span), {
-            unsupported_printf_spans.insert(call_span);
-            continue;
-        });
-        let static_span = visitor.def_id_to_binding_span[def_id];
-        if !static_span_to_lit.contains_key(&static_span) {
-            unsupported_printf_spans.insert(call_span);
-        }
-    }
 
     let mut defined_apis = FxHashSet::default();
     let mut worklist = visitor.defined_apis;
@@ -175,7 +151,6 @@ pub fn analyze<'a>(
     let mut analyzer = Analyzer {
         tcx,
         verbose,
-        unsupported_printf_spans: &unsupported_printf_spans,
         loc_ind_map: &loc_ind_map,
         fn_ptrs: FxHashSet::default(),
         permission_graph,
@@ -317,7 +292,6 @@ pub fn analyze<'a>(
         unsupported,
         static_span_to_lit,
         defined_apis,
-        unsupported_printf_spans,
         fn_ptrs,
         tracking_fns,
         returning_fns,
@@ -331,7 +305,6 @@ struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     verbose: bool,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
-    unsupported_printf_spans: &'a FxHashSet<Span>,
     fn_ptrs: FxHashSet<LocalDefId>,
     permission_graph: Graph<LocId, Permission>,
     origin_graph: Graph<LocId, Origin>,
@@ -616,21 +589,11 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             self.unsupported.add(x);
                         }
                         ApiKind::Operation(Some(permission)) => {
-                            let unsupported = self
-                                .unsupported_printf_spans
-                                .contains(&term.source_info.span);
-                            if unsupported {
-                                self.print_code("printf", term.source_info.span);
-                            }
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if compile_util::contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(&arg.node, ctx);
-                                    if unsupported {
-                                        self.unsupported.add(x);
-                                    } else {
-                                        self.add_permission(x, permission);
-                                    }
+                                    self.add_permission(x, permission);
                                     break;
                                 }
                             }
@@ -1098,15 +1061,13 @@ impl<'a> UnsupportedTracker<'a> {
 }
 
 #[derive(Default)]
-struct AstVisitor<'ast> {
+struct AstVisitor {
     /// static ident span to its literal
     static_span_to_lit: FxHashMap<Span, Symbol>,
-
-    fprintf_args: Vec<(Span, LikelyLit<'ast>)>,
 }
 
-impl<'ast> rustc_ast::visit::Visitor<'ast> for AstVisitor<'ast> {
-    fn visit_item(&mut self, item: &'ast rustc_ast::Item) {
+impl rustc_ast::visit::Visitor<'_> for AstVisitor {
+    fn visit_item(&mut self, item: &rustc_ast::Item) {
         rustc_ast::visit::walk_item(self, item);
 
         let rustc_ast::ItemKind::Static(box rustc_ast::StaticItem {
@@ -1119,31 +1080,10 @@ impl<'ast> rustc_ast::visit::Visitor<'ast> for AstVisitor<'ast> {
             self.static_span_to_lit.insert(item.ident.span, lit);
         }
     }
-
-    fn visit_expr(&mut self, expr: &'ast rustc_ast::Expr) {
-        rustc_ast::visit::walk_expr(self, expr);
-
-        use rustc_ast::ExprKind;
-        let ExprKind::Call(callee, args) = &expr.kind else { return };
-        let ExprKind::Path(_, path) = &callee.kind else { return };
-        match path.segments.last().unwrap().ident.name.as_str() {
-            "fprintf" => {
-                self.fprintf_args
-                    .push((expr.span, LikelyLit::from_expr(&args[1])));
-            }
-            "printf" => {
-                self.fprintf_args
-                    .push((expr.span, LikelyLit::from_expr(&args[0])));
-            }
-            _ => {}
-        }
-    }
 }
 
 struct HirVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    bound_span_to_def_id: FxHashMap<Span, LocalDefId>,
-    def_id_to_binding_span: FxHashMap<LocalDefId, Span>,
     defined_apis: Vec<LocalDefId>,
     dependencies: FxHashMap<LocalDefId, Vec<LocalDefId>>,
 }
@@ -1153,8 +1093,6 @@ impl<'tcx> HirVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
-            bound_span_to_def_id: FxHashMap::default(),
-            def_id_to_binding_span: FxHashMap::default(),
             defined_apis: vec![],
             dependencies: FxHashMap::default(),
         }
@@ -1171,18 +1109,11 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
         intravisit::walk_item(self, item);
 
-        match item.kind {
-            ItemKind::Fn { .. } => {
-                let def_id = item.owner_id.def_id;
-                if is_def_id_api(def_id, self.tcx) {
-                    self.defined_apis.push(def_id);
-                }
+        if matches!(item.kind, ItemKind::Fn { .. }) {
+            let def_id = item.owner_id.def_id;
+            if is_def_id_api(def_id, self.tcx) {
+                self.defined_apis.push(def_id);
             }
-            ItemKind::Static(_, _, _) => {
-                let loc = item.owner_id.def_id;
-                self.def_id_to_binding_span.insert(loc, item.ident.span);
-            }
-            _ => {}
         }
     }
 
@@ -1191,17 +1122,11 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
         let Res::Def(kind, def_id) = path.res else { return };
         let def_id = some_or!(def_id.as_local(), return);
-        match kind {
-            DefKind::Fn => {
-                self.dependencies
-                    .entry(hir_id.owner.def_id)
-                    .or_default()
-                    .push(def_id);
-            }
-            DefKind::Static { .. } => {
-                self.bound_span_to_def_id.insert(path.span, def_id);
-            }
-            _ => {}
+        if kind == DefKind::Fn {
+            self.dependencies
+                .entry(hir_id.owner.def_id)
+                .or_default()
+                .push(def_id);
         }
     }
 }

@@ -48,7 +48,9 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
                 }
             }
             if let Some(width) = cs.width {
-                if !minus {
+                if minus {
+                    fmt.insert(0, '<');
+                } else {
                     fmt.insert(0, '>');
                 }
                 match width {

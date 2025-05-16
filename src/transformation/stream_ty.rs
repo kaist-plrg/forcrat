@@ -217,7 +217,7 @@ impl std::fmt::Display for StreamType<'_> {
             Self::Stdin => write!(f, "std::io::Stdin"),
             Self::Stdout => write!(f, "std::io::Stdout"),
             Self::Stderr => write!(f, "std::io::Stderr"),
-            Self::Child => write!(f, "crate::Child"),
+            Self::Child => write!(f, "crate::stdio::Child"),
             Self::Option(t) => write!(f, "Option<{}>", t),
             Self::BufWriter(t) => write!(f, "std::io::BufWriter<{}>", t),
             Self::BufReader(t) => write!(f, "std::io::BufReader<{}>", t),
@@ -229,7 +229,7 @@ impl std::fmt::Display for StreamType<'_> {
                 if traits.count() == 1 {
                     write!(f, "dyn {}", traits)
                 } else {
-                    write!(f, "dyn crate::{}", traits.trait_name())
+                    write!(f, "dyn crate::stdio::{}", traits.trait_name())
                 }
             }
             Self::Impl(traits) => write!(f, "impl {}", traits),
@@ -627,8 +627,8 @@ impl std::fmt::Display for StreamTrait {
             Self::BufRead => write!(f, "std::io::BufRead"),
             Self::Write => write!(f, "std::io::Write"),
             Self::Seek => write!(f, "std::io::Seek"),
-            Self::AsRawFd => write!(f, "crate::AsRawFd"),
-            Self::Close => write!(f, "crate::Close"),
+            Self::AsRawFd => write!(f, "crate::stdio::AsRawFd"),
+            Self::Close => write!(f, "crate::stdio::Close"),
         }
     }
 }

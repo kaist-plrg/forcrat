@@ -99,16 +99,26 @@ impl<'a> TransformVisitor<'_, 'a> {
         ctx: FprintfCtx<'_>,
     ) -> Expr {
         match LikelyLit::from_expr(fmt) {
-            LikelyLit::Lit(fmt) => transform_fprintf_lit(stream, fmt, args, ctx),
-            LikelyLit::If(_, _, _) => todo!("{:?}", fmt.span),
+            LikelyLit::Lit(fmt) => return transform_fprintf_lit(stream, fmt, args, ctx),
             LikelyLit::Path(_, span) => {
                 let loc = self.hir.bound_span_to_loc[&span];
                 let static_span = self.hir.loc_to_binding_span[&loc];
-                let fmt = self.analysis_res.static_span_to_lit[&static_span];
-                transform_fprintf_lit(stream, fmt, args, ctx)
+                if let Some(fmt) = self.analysis_res.static_span_to_lit.get(&static_span) {
+                    return transform_fprintf_lit(stream, *fmt, args, ctx);
+                }
             }
-            LikelyLit::Other(e) => todo!("{:?}", e),
+            _ => {}
         }
+        let stream_str = stream.borrow_for(StreamTrait::Write);
+        let fmt = pprust::expr_to_string(fmt);
+        let mut s = format!("crate::stdio::fprintf({}, {}", stream_str, fmt);
+        for arg in args {
+            let arg = pprust::expr_to_string(arg);
+            s.push_str(", ");
+            s.push_str(&arg);
+        }
+        s.push(')');
+        ctx.ic.update_error_no_eof(s)
     }
 
     #[inline]
@@ -718,14 +728,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "printf" => {
-                            // if self.is_stdout_unsupported {
-                            //     return;
-                            // }
-                            if self
-                                .analysis_res
-                                .unsupported_printf_spans
-                                .contains(&expr_span)
-                            {
+                            if self.is_stdout_unsupported {
                                 return;
                             }
                             let stream = StdExpr::stdout();
@@ -741,14 +744,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "wprintf" => {
-                            // if self.is_stdout_unsupported {
-                            //     return;
-                            // }
-                            if self
-                                .analysis_res
-                                .unsupported_printf_spans
-                                .contains(&expr_span)
-                            {
+                            if self.is_stdout_unsupported {
                                 return;
                             }
                             let stream = StdExpr::stdout();
@@ -1254,7 +1250,7 @@ impl OpenMode {
 
     fn make_expr(self, path: &Expr, mode: &Expr) -> Expr {
         let path = pprust::expr_to_string(path);
-        let path = format!(
+        let path_str = format!(
             "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap()",
             path
         );
@@ -1267,10 +1263,10 @@ impl OpenMode {
                             .write(true)
                             .open({})
                             .ok()",
-                        path,
+                        path_str,
                     )
                 } else {
-                    expr!("std::fs::File::open({}).ok()", path)
+                    expr!("std::fs::File::open({}).ok()", path_str)
                 }
             }
             Self::Write(plus) => {
@@ -1283,10 +1279,10 @@ impl OpenMode {
                             .read(true)
                             .open({})
                             .ok()",
-                        path,
+                        path_str,
                     )
                 } else {
-                    expr!("std::fs::File::create({}).ok()", path)
+                    expr!("std::fs::File::create({}).ok()", path_str)
                 }
             }
             Self::Append(plus) => {
@@ -1298,7 +1294,7 @@ impl OpenMode {
                             .read(true)
                             .open({})
                             .ok()",
-                        path,
+                        path_str,
                     )
                 } else {
                     expr!(
@@ -1307,50 +1303,13 @@ impl OpenMode {
                             .create(true)
                             .open({})
                             .ok()",
-                        path,
+                        path_str,
                     )
                 }
             }
             Self::Unknown => {
                 expr!(
-                    r#"{{
-    let pathname = {};
-    let mode = std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap();
-    let (prefix, suffix) = mode.split_at(1);
-    match prefix {{
-        "r" => {{
-            if suffix.contains('+') {{
-                std::fs::OpenOptions::new().read(true).write(true).open(pathname)
-            }} else {{
-                std::fs::File::open(pathname)
-            }}
-        }}
-        "w" => {{
-            if suffix.contains('+') {{
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .read(true)
-                    .open(pathname)
-            }} else {{
-                std::fs::File::create(pathname)
-            }}
-        }}
-        "a" => {{
-            if suffix.contains('+') {{
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .read(true)
-                    .open(pathname)
-            }} else {{
-                std::fs::OpenOptions::new().append(true).create(true).open(pathname)
-            }}
-        }}
-        _ => panic!(),
-    }}.ok()
-}}"#,
+                    "crate::stdio::fopen({}, {})",
                     path,
                     pprust::expr_to_string(mode),
                 )
@@ -1414,7 +1373,7 @@ fn transform_popen(command: &Expr, mode: &Expr) -> Expr {
                 .{1}(std::process::Stdio::piped())
                 .spawn()
                 .ok()
-                .map(|c| crate::Child(c))"#,
+                .map(|c| crate::stdio::Child(c))"#,
                 command,
                 field
             )
@@ -1469,7 +1428,7 @@ fn transform_pclose(stream: &Expr, ty: StreamType<'_>, is_non_local: bool) -> Ex
     expr!(
         "{{
     let mut __x = {};
-    let __v = crate::Close::close(&mut __x);
+    let __v = crate::stdio::Close::close(&mut __x);
     drop(__x);
     __v
 }}",
@@ -1618,32 +1577,7 @@ if !c.is_ascii_whitespace() {
 #[inline]
 fn transform_fgetc<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Read);
-    if ic.has_check() {
-        expr!(
-            "{{
-    use std::io::Read;
-    let mut ___buf = [0];
-    match ({}).read_exact(&mut ___buf) {{
-        Ok(_) => ___buf[0] as _,
-        Err(e) => {{
-            {}
-            libc::EOF
-        }}
-    }}
-}}",
-            stream_str,
-            ic.error_handling(),
-        )
-    } else {
-        expr!(
-            "{{
-    use std::io::Read;
-    let mut ___buf = [0];
-    ({}).read_exact(&mut ___buf).map_or(libc::EOF, |_| ___buf[0] as _)
-}}",
-            stream_str
-        )
-    }
+    ic.update_error(format!("crate::stdio::fgetc({})", stream_str))
 }
 
 #[inline]
@@ -1651,46 +1585,7 @@ fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr, ic: IndicatorC
     let stream_str = stream.borrow_for(StreamTrait::BufRead);
     let s = pprust::expr_to_string(s);
     let n = pprust::expr_to_string(n);
-    let handling = ic.error_handling();
-    expr!(
-        "{{
-    use std::io::BufRead;
-    let mut stream = {};
-    let s = {};
-    let n = ({}) as usize;
-    let ___buf: &mut [u8] = std::slice::from_raw_parts_mut(s as _, n);
-    let mut ___pos = 0;
-    while ___pos < n - 1 {{
-        let available = match stream.fill_buf() {{
-            Ok(___buf) => ___buf,
-            Err(e) => {{
-                {}
-                ___pos = 0;
-                break
-            }}
-        }};
-        if available.is_empty() {{
-            break;
-        }}
-        ___buf[___pos] = available[0];
-        stream.consume(1);
-        ___pos += 1;
-        if ___buf[___pos - 1] == b'\\n' {{
-            break;
-        }}
-    }}
-    if ___pos == 0 {{
-        std::ptr::null_mut()
-    }} else {{
-        ___buf[___pos] = 0;
-        s
-    }}
-}}",
-        stream_str,
-        s,
-        n,
-        handling
-    )
+    ic.update_error(format!("crate::stdio::fgets({}, {}, {})", s, n, stream_str))
 }
 
 #[inline]
@@ -1705,45 +1600,10 @@ fn transform_getdelim<S: StreamExpr>(
     let lineptr = pprust::expr_to_string(lineptr);
     let n = pprust::expr_to_string(n);
     let delimiter = pprust::expr_to_string(delimiter);
-    let handling = ic.error_handling();
-    expr!(
-        "{{
-    use std::io::BufRead;
-    let mut stream = {};
-    let lineptr = {};
-    let n = {};
-    let mut buf = vec![];
-    match stream.read_until(({}) as _, &mut buf) {{
-        Ok(_) => {{
-            let len = buf.len();
-            if len == 0 {{
-                -1
-            }} else {{
-                buf.push(0);
-                if (*lineptr).is_null() {{
-                    *lineptr = libc::malloc(buf.len() as _) as _;
-                    *n = buf.len() as _;
-                }} else if buf.len() > *n as _ {{
-                    *lineptr = libc::realloc(*lineptr as _, buf.len() as _) as _;
-                    *n = buf.len() as _;
-                }}
-                let ptr: &mut [u8] = std::slice::from_raw_parts_mut(*lineptr as _, buf.len());
-                ptr.copy_from_slice(&buf);
-                len as _
-            }}
-        }}
-        Err(e) => {{
-            {}
-            -1
-        }}
-    }}
-}}",
-        stream_str,
-        lineptr,
-        n,
-        delimiter,
-        handling
-    )
+    ic.update_error(format!(
+        "crate::stdio::getdelim({}, {}, {}, {})",
+        lineptr, n, delimiter, stream_str
+    ))
 }
 
 #[inline]
@@ -1756,44 +1616,10 @@ fn transform_getline<S: StreamExpr>(
     let stream_str = stream.borrow_for(StreamTrait::BufRead);
     let lineptr = pprust::expr_to_string(lineptr);
     let n = pprust::expr_to_string(n);
-    let handling = ic.error_handling();
-    expr!(
-        "{{
-    use std::io::BufRead;
-    let mut stream = {};
-    let lineptr = {};
-    let n = {};
-    let mut buf = vec![];
-    match stream.read_until(b'\\n', &mut buf) {{
-        Ok(_) => {{
-            let len = buf.len();
-            if len == 0 {{
-                -1
-            }} else {{
-                buf.push(0);
-                if (*lineptr).is_null() {{
-                    *lineptr = libc::malloc(buf.len() as _) as _;
-                    *n = buf.len() as _;
-                }} else if buf.len() > *n as _ {{
-                    *lineptr = libc::realloc(*lineptr as _, buf.len() as _) as _;
-                    *n = buf.len() as _;
-                }}
-                let ptr: &mut [u8] = std::slice::from_raw_parts_mut(*lineptr as _, buf.len());
-                ptr.copy_from_slice(&buf);
-                len as _
-            }}
-        }}
-        Err(e) => {{
-            {}
-            -1
-        }}
-    }}
-}}",
-        stream_str,
-        lineptr,
-        n,
-        handling
-    )
+    ic.update_error(format!(
+        "crate::stdio::getline({}, {}, {})",
+        lineptr, n, stream_str
+    ))
 }
 
 #[inline]
@@ -1808,29 +1634,10 @@ fn transform_fread<S: StreamExpr>(
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
-    let handling = ic.error_handling();
-    expr!(
-        "{{
-    use std::io::Read;
-    let mut stream = {};
-    let size = {};
-    let ptr: &mut [u8] = std::slice::from_raw_parts_mut(({}) as _, (size * ({})) as usize);
-    let mut i = 0;
-    for data in ptr.chunks_mut(size as usize) {{
-        if let Err(e) = stream.read_exact(data) {{
-            {}
-            break;
-        }}
-        i += 1;
-    }}
-    i
-}}",
-        stream_str,
-        size,
-        ptr,
-        nitems,
-        handling
-    )
+    ic.update_error(format!(
+        "crate::stdio::fread({}, {}, {}, {})",
+        ptr, size, nitems, stream_str
+    ))
 }
 
 fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
@@ -1975,101 +1782,21 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
 fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let c = pprust::expr_to_string(c);
-    if ic.has_check() {
-        expr!(
-            "{{
-    use std::io::Write;
-    let c = ({}) as u8;
-    match ({}).write_all(&[c]) {{
-        Ok(_) => c as i32,
-        Err(e) => {{
-            {}
-            libc::EOF
-        }}
-    }}
-}}",
-            c,
-            stream_str,
-            ic.error_handling_no_eof(),
-        )
-    } else {
-        expr!(
-            "{{
-    use std::io::Write;
-    let c = ({}) as u8;
-    ({}).write_all(&[c]).map_or(libc::EOF, |_| c as i32)
-}}",
-            c,
-            stream_str
-        )
-    }
+    ic.update_error_no_eof(format!("crate::stdio::fputc({}, {})", c, stream_str))
 }
 
 #[inline]
 fn transform_fputwc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let c = pprust::expr_to_string(c);
-    if ic.has_check() {
-        expr!(
-            "{{
-    use std::io::Write;
-    let c = {};
-    match write!({}, \"{{}}\", std::char::from_u32(c as _).unwrap()) {{
-        Ok(_) => c,
-        Err(e) => {{
-            {}
-            libc::EOF
-        }}
-    }}
-}}",
-            c,
-            stream_str,
-            ic.error_handling_no_eof(),
-        )
-    } else {
-        expr!(
-            "{{
-    use std::io::Write;
-    let c = {};
-    write!({}, \"{{}}\", std::char::from_u32(c as _).unwrap()).map_or(libc::EOF, |_| c)
-}}",
-            c,
-            stream_str
-        )
-    }
+    ic.update_error_no_eof(format!("crate::stdio::fputwc({}, {})", c, stream_str))
 }
 
 #[inline]
 fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let s = pprust::expr_to_string(s);
-    if ic.has_check() {
-        expr!(
-            "{{
-    use std::io::Write;
-    match ({}).write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes()) {{
-        Ok(_) => 0,
-        Err(e) => {{
-            {}
-            libc::EOF
-        }}
-    }}
-}}",
-            stream_str,
-            s,
-            ic.error_handling_no_eof(),
-        )
-    } else {
-        expr!(
-            "{{
-    use std::io::Write;
-    ({}).write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
-        .map_or(libc::EOF, |_| 0)
-}}",
-            stream_str,
-            s
-        )
-    }
+    ic.update_error(format!("crate::stdio::fputs({}, {})", s, stream_str))
 }
 
 #[inline]
@@ -2084,94 +1811,22 @@ fn transform_fwrite<S: StreamExpr>(
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
-    let handling = ic.error_handling_no_eof();
-    expr!(
-        "{{
-    use std::io::Write;
-    let mut stream = {};
-    let size = {};
-    let ptr: &[u8] = std::slice::from_raw_parts({} as _, (size * ({})) as usize);
-    let mut i = 0;
-    for data in ptr.chunks(size as usize) {{
-        if let Err(e) = stream.write_all(data) {{
-            {}
-            break;
-        }}
-        i += 1;
-    }}
-    i
-}}",
-        stream_str,
-        size,
-        ptr,
-        nitems,
-        handling
-    )
+    ic.update_error(format!(
+        "crate::stdio::fwrite({}, {}, {}, {})",
+        ptr, size, nitems, stream_str
+    ))
 }
 
 #[inline]
 fn transform_fflush<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
-    if ic.has_check() {
-        expr!(
-            "{{
-    use std::io::Write;
-    match ({}).flush() {{
-        Ok(_) => 0,
-        Err(e) => {{
-            {}
-            libc::EOF
-        }}
-    }}
-}}",
-            stream_str,
-            ic.error_handling_no_eof(),
-        )
-    } else {
-        expr!(
-            "{{
-    use std::io::Write;
-    ({}).flush().map_or(libc::EOF, |_| 0)
-}}",
-            stream_str
-        )
-    }
+    ic.update_error(format!("crate::stdio::fflush({})", stream_str))
 }
 
 #[inline]
 fn transform_puts(s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let s = pprust::expr_to_string(s);
-    if ic.has_check() {
-        expr!(
-            r#"{{
-    use std::io::Write;
-    let mut stream = std::io::stdout();
-    match stream
-        .write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
-        .and_then(|_| stream.write_all(b"\n")) {{
-        Ok(_) => 0,
-        Err(e) => {{
-            {}
-            libc::EOF
-        }}
-    }}
-}}"#,
-            s,
-            ic.error_handling_no_eof(),
-        )
-    } else {
-        expr!(
-            r#"{{
-    use std::io::Write;
-    let mut stream = std::io::stdout();
-    stream
-        .write_all(std::ffi::CStr::from_ptr(({}) as _).to_bytes())
-        .and_then(|_| stream.write_all(b"\n"))
-        .map_or(libc::EOF, |_| 0)
-}}"#,
-            s
-        )
-    }
+    ic.update_error(format!("crate::stdio::puts({})", s))
 }
 
 #[inline]
@@ -2199,20 +1854,7 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
         }
         LikelyLit::If(_, _, _) => todo!(),
         LikelyLit::Path(path, _) => {
-            expr!(
-                "{{
-    use std::io::Seek;
-    ({}).seek(match {} {{
-        0 => std::io::SeekFrom::Start(({2}) as _),
-        1 => std::io::SeekFrom::Current(({2}) as _),
-        2 => std::io::SeekFrom::End(({2}) as _),
-        _ => panic!(),
-    }}).map_or(-1, |_| 0)
-}}",
-                stream,
-                path,
-                off
-            )
+            expr!("crate::stdio::fseek({}, {}, {})", stream, path, off)
         }
         LikelyLit::Other(_) => todo!(),
     }
@@ -2221,37 +1863,19 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
 #[inline]
 fn transform_ftell<S: StreamExpr>(stream: &S) -> Expr {
     let stream = stream.borrow_for(StreamTrait::Seek);
-    expr!(
-        "{{
-    use std::io::Seek;
-    ({}).stream_position().map_or(-1, |p| p as i64)
-}}",
-        stream
-    )
+    expr!("crate::stdio::ftell({})", stream)
 }
 
 #[inline]
 fn transform_rewind<S: StreamExpr>(stream: &S) -> Expr {
     let stream = stream.borrow_for(StreamTrait::Seek);
-    expr!(
-        "{{
-    use std::io::Seek;
-    ({}).rewind();
-}}",
-        stream
-    )
+    expr!("crate::stdio::rewind({})", stream)
 }
 
 #[inline]
 fn transform_fileno<S: StreamExpr>(stream: &S) -> Expr {
     let stream = stream.borrow_for(StreamTrait::AsRawFd);
-    expr!(
-        "{{
-    use crate::AsRawFd;
-    ({}).as_raw_fd()
-}}",
-        stream
-    )
+    expr!("crate::stdio::AsRawFd::as_raw_fd({})", stream)
 }
 
 #[inline]
@@ -2335,12 +1959,52 @@ impl IndicatorCheck<'_> {
         }
     }
 
+    fn update_error(&self, e: String) -> Expr {
+        match (self.eof, self.error) {
+            (true, true) => {
+                expr!(
+                    "{{ let (___v, ___error, ___eof) = {}; {1}_eof = ___eof; {1}_error = ___error; ___v }}",
+                    e,
+                    self.name.unwrap()
+                )
+            }
+            (true, false) => {
+                expr!(
+                    "{{ let (___v, _, ___eof) = {}; {}_eof = ___eof; ___v }}",
+                    e,
+                    self.name.unwrap()
+                )
+            }
+            (false, true) => {
+                expr!(
+                    "{{ let (___v, ___error, _) = {}; {}_error = ___error; ___v }}",
+                    e,
+                    self.name.unwrap()
+                )
+            }
+            (false, false) => expr!("{}.0", e),
+        }
+    }
+
     #[inline]
     fn error_handling_no_eof(&self) -> String {
         if self.error {
             format!("{}_error = 1;", self.name.unwrap())
         } else {
             "".to_string()
+        }
+    }
+
+    #[inline]
+    fn update_error_no_eof(&self, e: String) -> Expr {
+        if self.error {
+            expr!(
+                "{{ let (___v, ___error) = {}; {}_error = ___error; ___v }}",
+                e,
+                self.name.unwrap()
+            )
+        } else {
+            expr!("{}.0", e)
         }
     }
 
