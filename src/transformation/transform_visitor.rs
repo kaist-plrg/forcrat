@@ -1952,6 +1952,8 @@ fn transform_flockfile<S: StreamExpr>(stream: &S, name: Symbol) -> (Expr, bool) 
     let (expr, is_file) = expr_to_lock(stream);
     if is_file {
         (expr!("{}.lock().unwrap()", expr), false)
+    } else if stream.ty().get_dyn_bound().is_some() {
+        (expr!("{}_guard = (&**({})).lock()", name, expr), true)
     } else {
         (expr!("{}_guard = {}.lock()", name, expr), true)
     }

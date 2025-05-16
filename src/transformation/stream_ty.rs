@@ -106,13 +106,23 @@ impl<'a> TypeArena<'a> {
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
             }
+            if traits.contains(StreamTrait::BufRead) {
+                traits.remove(StreamTrait::Read);
+            }
             if permissions.contains(Permission::Close) && origins.contains(Origin::Pipe) {
                 traits.insert(StreamTrait::Close);
             }
             let ty = self.alloc(StreamType::Impl(TraitBound(traits)));
             self.option(ty)
         } else if origins.is_empty() {
-            self.option(&FILE_TY)
+            let ty = if !permissions.contains(Permission::Lock) {
+                &FILE_TY
+            } else if permissions.contains(Permission::Read) {
+                &STDIN_TY
+            } else {
+                &STDOUT_TY
+            };
+            self.option(ty)
         } else if origins.count() == 1 {
             let origin = origins.iter().next().unwrap();
             let ty = match origin {
@@ -162,6 +172,9 @@ impl<'a> TypeArena<'a> {
             }
             if permissions.contains(Permission::Close) && origins.contains(Origin::Pipe) {
                 traits.insert(StreamTrait::Close);
+            }
+            if permissions.contains(Permission::Lock) {
+                traits.insert(StreamTrait::Lock);
             }
             let ty = self.alloc(StreamType::Dyn(TraitBound(traits)));
             let ty = if permissions.contains(Permission::Close) {
@@ -483,6 +496,9 @@ pub(super) fn convert_expr(
         (Ptr(Dyn(to)), Ref(Box(Dyn(from)))) if to == from => {
             format!("&mut *({}) as *mut _", expr)
         }
+        (Ptr(Dyn(_)), Ptr(Dyn(_))) => {
+            format!("&mut *({}) as *mut _", expr)
+        }
         (
             Ref(Dyn(traits)),
             File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_),
@@ -616,6 +632,7 @@ pub(super) enum StreamTrait {
     Seek = 3,
     AsRawFd = 4,
     Close = 5,
+    Lock = 6,
 }
 
 impl std::fmt::Display for StreamTrait {
@@ -627,12 +644,13 @@ impl std::fmt::Display for StreamTrait {
             Self::Seek => write!(f, "std::io::Seek"),
             Self::AsRawFd => write!(f, "crate::stdio::AsRawFd"),
             Self::Close => write!(f, "crate::stdio::Close"),
+            Self::Lock => write!(f, "crate::stdio::Lock"),
         }
     }
 }
 
 impl StreamTrait {
-    const NUM: usize = 6;
+    const NUM: usize = 7;
 
     pub(super) fn from_permission(p: Permission) -> Option<Self> {
         match p {
@@ -653,6 +671,7 @@ impl StreamTrait {
             Self::Seek => "Seek",
             Self::AsRawFd => "AsRawFd",
             Self::Close => "Close",
+            Self::Lock => "Lock",
         }
     }
 }

@@ -2222,6 +2222,22 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_flockfile_box() {
+    run_test(
+        r#"
+unsafe fn f(mut x: libc::c_int) {
+    let mut stream: *mut FILE = if x != 0 { stdout } else { stderr };
+    flockfile(stream);
+    fputc('a' as i32, stream);
+    fputc('b' as i32, stream);
+    funlockfile(stream);
+}"#,
+        &["crate::stdio::fputc", "lock", "drop"],
+        &["flockfile", "funlockfile"],
+    );
+}
+
+#[test]
 fn test_union_struct() {
     run_test(
         r#"
