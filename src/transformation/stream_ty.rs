@@ -27,21 +27,18 @@ pub(super) struct LocCtx<'tcx> {
     pub is_generic: bool,
     pub is_union: bool,
     pub is_non_local_assign: bool,
+    pub is_param_without_assign: bool,
     pub ty: rustc_middle::ty::Ty<'tcx>,
 }
 
 impl<'tcx> LocCtx<'tcx> {
     #[inline]
-    pub(super) fn new(
-        is_generic: bool,
-        is_union: bool,
-        is_non_local_assign: bool,
-        ty: rustc_middle::ty::Ty<'tcx>,
-    ) -> Self {
+    pub(super) fn new(ty: rustc_middle::ty::Ty<'tcx>) -> Self {
         Self {
-            is_generic,
-            is_union,
-            is_non_local_assign,
+            is_generic: false,
+            is_union: false,
+            is_non_local_assign: false,
+            is_param_without_assign: false,
             ty,
         }
     }
@@ -145,7 +142,8 @@ impl<'a> TypeArena<'a> {
                 || ((origins.contains(Origin::Stdin)
                     || origins.contains(Origin::Stdout)
                     || origins.contains(Origin::Stderr))
-                    && !ctx.is_non_local_assign)
+                    && !ctx.is_non_local_assign
+                    && !ctx.is_param_without_assign)
             {
                 self.option(ty)
             } else {

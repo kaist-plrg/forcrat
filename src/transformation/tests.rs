@@ -2546,6 +2546,31 @@ unsafe fn f() {
 }
 
 #[test]
+fn test_fn_ptr_stdout() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+static mut h: Option::<unsafe extern "C" fn(*mut FILE) -> ()> = None;
+unsafe extern "C" fn g(mut stream: *mut FILE) {
+    fputc('a' as i32, stream);
+    fputc('b' as i32, stream);
+}
+unsafe fn f(mut s: *mut s) {
+    h = Some(g as unsafe extern "C" fn(*mut FILE) -> ());
+    (*s).stream = stdout;
+    h.unwrap()((*s).stream);
+    h.unwrap()((*s).stream);
+}"#,
+        &["crate::stdio::fputc", "Stdout"],
+        &["FILE"],
+    );
+}
+
+#[test]
 fn test_return_old_static() {
     run_test(
         r#"

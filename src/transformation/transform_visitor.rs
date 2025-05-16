@@ -362,8 +362,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
                 let loc = self.hir.binding_span_to_loc[&ident_span];
                 let pot = some_or!(self.loc_to_pot.get(&loc), return);
-                self.replace_ty_with_pot(&mut item.ty, *pot);
-                self.convert_rhs(body, *pot, true);
+                if let Some(index) = pot.file_param_index {
+                    // When the variable type is Option<fn(..) -> ..>
+                    self.replace_fn_ptr_param_type(&mut item.ty, *pot, index);
+                } else {
+                    self.replace_ty_with_pot(&mut item.ty, *pot);
+                    self.convert_rhs(body, *pot, true);
+                }
             }
             ItemKind::Fn(box item) => {
                 let HirLoc::Global(def_id) = self.hir.binding_span_to_loc[&ident_span] else {

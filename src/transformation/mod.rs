@@ -212,6 +212,7 @@ impl Pass for Transformation {
 
                             let body = tcx.optimized_mir(*def_id);
                             let ty = body.local_decls[*local].ty;
+                            let mut is_param_without_assign = false;
 
                             if (1..=sig.decl.inputs.len()).contains(&local.as_usize()) {
                                 // if this local is a parameter
@@ -232,9 +233,16 @@ impl Pass for Transformation {
                                 {
                                     non_generic_params.insert(param);
                                 }
+
+                                if !hir_ctx.is_loc_used_in_assign(locs[0]) {
+                                    is_param_without_assign = true;
+                                }
                             }
 
-                            (locs, LocCtx::new(false, false, is_static_return, ty))
+                            let mut ctx = LocCtx::new(ty);
+                            ctx.is_non_local_assign = is_static_return;
+                            ctx.is_param_without_assign |= is_param_without_assign;
+                            (locs, ctx)
                         }
                         hir::ItemKind::Static(_, _, _) => {
                             if *local != mir::Local::ZERO {
@@ -242,10 +250,7 @@ impl Pass for Transformation {
                             }
                             let body = tcx.mir_for_ctfe(*def_id);
                             let ty = body.local_decls[*local].ty;
-                            (
-                                vec![HirLoc::Global(*def_id)],
-                                LocCtx::new(false, false, false, ty),
-                            )
+                            (vec![HirLoc::Global(*def_id)], LocCtx::new(ty))
                         }
                         _ => panic!(),
                     }
@@ -254,11 +259,9 @@ impl Pass for Transformation {
                     let hir::Node::Item(item) = tcx.hir_node_by_def_id(*def_id) else { panic!() };
                     let adt_def = tcx.adt_def(*def_id);
                     let ty = adt_def.variant(FIRST_VARIANT).fields[*field].ty(tcx, List::empty());
-                    let is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _));
-                    (
-                        vec![HirLoc::Field(*def_id, *field)],
-                        LocCtx::new(false, is_union, false, ty),
-                    )
+                    let mut ctx = LocCtx::new(ty);
+                    ctx.is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _));
+                    (vec![HirLoc::Field(*def_id, *field)], ctx)
                 }
                 _ => continue,
             };
@@ -340,6 +343,10 @@ impl Pass for Transformation {
                     if !non_generic_params.contains(param) {
                         ctx.is_generic = true;
                     }
+                }
+
+                if file_param_index(ctx.ty, tcx).is_some() {
+                    ctx.is_param_without_assign = true;
                 }
 
                 let ty = type_arena.make_ty(permissions, origins, ctx, tcx);
