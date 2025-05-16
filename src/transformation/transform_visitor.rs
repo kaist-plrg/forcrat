@@ -23,11 +23,12 @@ use rustc_span::{def_id::LocalDefId, symbol::Ident, Span, Symbol};
 
 use super::*;
 use crate::{
-    api_list::{self, Permission},
+    api_list::{self, Origin, Permission},
     ast_maker::*,
+    bit_set::BitSet8,
     compile_util,
     error_analysis::{ErrorPropagation, ExprLoc, Indicator},
-    file_analysis,
+    file_analysis::{self, LocId},
     likely_lit::LikelyLit,
 };
 
@@ -39,6 +40,8 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
 
     pub(super) error_returning_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,
     pub(super) error_taking_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,
+
+    pub(super) hir_loc_to_loc_id: &'a FxHashMap<HirLoc, LocId>,
 
     /// function parameter to HIR location
     pub(super) param_to_loc: &'a FxHashMap<Parameter, HirLoc>,
@@ -148,6 +151,25 @@ impl<'a> TransformVisitor<'_, 'a> {
             }
             ExprKind::Paren(e) => self.bound_pot(expr.span).or_else(|| self.bound_expr_pot(e)),
             _ => self.bound_pot(expr.span),
+        }
+    }
+
+    #[inline]
+    fn bound_origins(&self, span: Span) -> Option<BitSet8<Origin>> {
+        let hir_loc = self.hir.bound_span_to_loc.get(&span)?;
+        let loc_id = self.hir_loc_to_loc_id.get(hir_loc)?;
+        Some(self.analysis_res.origins[*loc_id])
+    }
+
+    fn bound_expr_origins(&self, expr: &Expr) -> Option<BitSet8<Origin>> {
+        match &expr.kind {
+            ExprKind::Index(e, _, _)
+            | ExprKind::AddrOf(BorrowKind::Ref, Mutability::Mut, e)
+            | ExprKind::Unary(UnOp::Deref, e) => self.bound_expr_origins(e),
+            ExprKind::Paren(e) => self
+                .bound_origins(expr.span)
+                .or_else(|| self.bound_expr_origins(e)),
+            _ => self.bound_origins(expr.span),
         }
     }
 
@@ -717,6 +739,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "fprintf" => {
                             if self.is_unsupported(&args[0]) {
+                                let origins = self.bound_expr_origins(&args[0]).unwrap();
+                                if let Some(new_expr) = transform_unsupported(
+                                    "fprintf",
+                                    &[],
+                                    &args[0],
+                                    &args[1..],
+                                    origins,
+                                ) {
+                                    self.replace_expr(expr, new_expr);
+                                }
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -766,6 +798,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "vfprintf" => {
                             if self.is_unsupported(&args[0]) {
+                                let origins = self.bound_expr_origins(&args[0]).unwrap();
+                                if let Some(new_expr) = transform_unsupported(
+                                    "vfprintf",
+                                    &[],
+                                    &args[0],
+                                    &args[1..],
+                                    origins,
+                                ) {
+                                    self.replace_expr(expr, new_expr);
+                                }
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -785,6 +827,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "fputc" | "putc" => {
                             if self.is_unsupported(&args[1]) {
+                                let origins = self.bound_expr_origins(&args[1]).unwrap();
+                                if let Some(new_expr) = transform_unsupported(
+                                    "fputc",
+                                    &args[0..1],
+                                    &args[1],
+                                    &[],
+                                    origins,
+                                ) {
+                                    self.replace_expr(expr, new_expr);
+                                }
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
@@ -804,6 +856,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "fputwc" | "putwc" => {
                             if self.is_unsupported(&args[1]) {
+                                let origins = self.bound_expr_origins(&args[1]).unwrap();
+                                if let Some(new_expr) = transform_unsupported(
+                                    "fputwc",
+                                    &args[0..1],
+                                    &args[1],
+                                    &[],
+                                    origins,
+                                ) {
+                                    self.replace_expr(expr, new_expr);
+                                }
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
@@ -814,6 +876,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "fputs" => {
                             if self.is_unsupported(&args[1]) {
+                                let origins = self.bound_expr_origins(&args[1]).unwrap();
+                                if let Some(new_expr) = transform_unsupported(
+                                    "fputs",
+                                    &args[0..1],
+                                    &args[1],
+                                    &[],
+                                    origins,
+                                ) {
+                                    self.replace_expr(expr, new_expr);
+                                }
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[1]).unwrap().ty;
@@ -836,6 +908,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "fwrite" => {
                             if self.is_unsupported(&args[3]) {
+                                let origins = self.bound_expr_origins(&args[3]).unwrap();
+                                if let Some(new_expr) = transform_unsupported(
+                                    "fwrite",
+                                    &args[0..3],
+                                    &args[3],
+                                    &[],
+                                    origins,
+                                ) {
+                                    self.replace_expr(expr, new_expr);
+                                }
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
@@ -847,6 +929,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "fflush" => {
                             if self.is_unsupported(&args[0]) {
+                                let origins = self.bound_expr_origins(&args[0]).unwrap();
+                                if let Some(new_expr) = transform_unsupported(
+                                    "fflush",
+                                    &args[..0],
+                                    &args[0],
+                                    &[],
+                                    origins,
+                                ) {
+                                    self.replace_expr(expr, new_expr);
+                                }
                                 return;
                             }
                             if matches!(remove_cast(&args[0]).kind, ExprKind::Lit(_)) {
@@ -1971,6 +2063,61 @@ fn transform_funlockfile<S: StreamExpr>(stream: &S, name: Symbol) -> Expr {
         expr!("{}.unlock().unwrap()", expr)
     } else {
         expr!("drop({}_guard)", name)
+    }
+}
+
+fn transform_unsupported<E: Deref<Target = Expr>>(
+    name: &str,
+    before_args: &[E],
+    stream: &Expr,
+    after_args: &[E],
+    origins: BitSet8<Origin>,
+) -> Option<Expr> {
+    if !origins.contains(Origin::Stdout) && !origins.contains(Origin::Stderr) {
+        return None;
+    }
+    let stream = pprust::expr_to_string(stream);
+    let mut new_expr = String::new();
+    if origins.contains(Origin::Stdout) {
+        write!(
+            new_expr,
+            "if {} == stdout {{ crate::stdio::{}(",
+            stream, name
+        )
+        .unwrap();
+        write_args(&mut new_expr, before_args, "std::io::stdout()", after_args);
+        new_expr.push_str(").0 } else ");
+    }
+    if origins.contains(Origin::Stderr) {
+        write!(
+            new_expr,
+            "if {} == stderr {{ crate::stdio::{}(",
+            stream, name
+        )
+        .unwrap();
+        write_args(&mut new_expr, before_args, "std::io::stderr()", after_args);
+        new_expr.push_str(").0 } else ");
+    }
+    write!(new_expr, "{{ {}(", name).unwrap();
+    write_args(&mut new_expr, before_args, &stream, after_args);
+    new_expr.push_str(") }");
+    Some(expr!("{}", new_expr))
+}
+
+fn write_args<E: Deref<Target = Expr>>(
+    new_expr: &mut String,
+    before_args: &[E],
+    stream: &str,
+    after_args: &[E],
+) {
+    for arg in before_args {
+        let arg = pprust::expr_to_string(arg);
+        write!(new_expr, "{}, ", arg).unwrap();
+    }
+    new_expr.push_str(stream);
+    for arg in after_args {
+        let arg = pprust::expr_to_string(arg);
+        write!(new_expr, ", {}", arg).unwrap();
     }
 }
 

@@ -188,6 +188,7 @@ impl Pass for Transformation {
         let mut hir_loc_to_param = FxHashMap::default();
         let mut non_generic_params = FxHashSet::default();
         let mut loc_id_to_hir_locs = IndexVec::from_raw(vec![None; analysis_res.locs.len()]);
+        let mut hir_loc_to_loc_id = FxHashMap::default();
         for (loc_id, loc) in analysis_res.locs.iter_enumerated() {
             let (hir_locs, ctx) = match loc {
                 Loc::Var(def_id, local) => {
@@ -265,6 +266,9 @@ impl Pass for Transformation {
                 }
                 _ => continue,
             };
+            for hir_loc in &hir_locs {
+                hir_loc_to_loc_id.insert(*hir_loc, loc_id);
+            }
             loc_id_to_hir_locs[loc_id] = Some((hir_locs, ctx));
         }
 
@@ -480,6 +484,8 @@ impl Pass for Transformation {
 
                 error_returning_fns: &error_returning_fns,
                 error_taking_fns: &error_taking_fns,
+
+                hir_loc_to_loc_id: &hir_loc_to_loc_id,
 
                 param_to_loc: &param_to_hir_loc,
                 loc_to_pot: &hir_loc_to_pot,
