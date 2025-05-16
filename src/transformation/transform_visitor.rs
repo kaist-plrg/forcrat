@@ -759,6 +759,25 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 self.transform_fprintf(&stream, &args[0], &args[1..], ctx);
                             self.replace_expr(expr, new_expr);
                         }
+                        "vfprintf" => {
+                            if self.is_unsupported(&args[0]) {
+                                return;
+                            }
+                            let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
+                            let stream = TypedExpr::new(&args[0], ty);
+                            let ic = self.indicator_check(args[0].span);
+                            let new_expr = transform_vfprintf(&stream, &args[1], &args[2], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "vprintf" => {
+                            if self.is_stdout_unsupported {
+                                return;
+                            }
+                            let stream = StdExpr::stdout();
+                            let ic = self.indicator_check_std("stdout");
+                            let new_expr = transform_vfprintf(&stream, &args[0], &args[1], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
                         "fputc" | "putc" => {
                             if self.is_unsupported(&args[1]) {
                                 return;
@@ -804,6 +823,10 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             // }
                             let ic = self.indicator_check_std("stdout");
                             let new_expr = transform_puts(&args[0], ic);
+                            self.replace_expr(expr, new_expr);
+                        }
+                        "perror" => {
+                            let new_expr = transform_perror(&args[0]);
                             self.replace_expr(expr, new_expr);
                         }
                         "fwrite" => {
@@ -1779,6 +1802,22 @@ fn transform_fprintf_lit<S: StreamExpr, E: Deref<Target = Expr>>(
 }
 
 #[inline]
+fn transform_vfprintf<S: StreamExpr>(
+    stream: &S,
+    fmt: &Expr,
+    args: &Expr,
+    ic: IndicatorCheck<'_>,
+) -> Expr {
+    let stream_str = stream.borrow_for(StreamTrait::Write);
+    let fmt = pprust::expr_to_string(fmt);
+    let args = pprust::expr_to_string(args);
+    ic.update_error_no_eof(format!(
+        "crate::stdio::vfprintf({}, {}, {})",
+        stream_str, fmt, args
+    ))
+}
+
+#[inline]
 fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let c = pprust::expr_to_string(c);
@@ -1796,7 +1835,7 @@ fn transform_fputwc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>)
 fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let s = pprust::expr_to_string(s);
-    ic.update_error(format!("crate::stdio::fputs({}, {})", s, stream_str))
+    ic.update_error_no_eof(format!("crate::stdio::fputs({}, {})", s, stream_str))
 }
 
 #[inline]
@@ -1811,7 +1850,7 @@ fn transform_fwrite<S: StreamExpr>(
     let ptr = pprust::expr_to_string(ptr);
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
-    ic.update_error(format!(
+    ic.update_error_no_eof(format!(
         "crate::stdio::fwrite({}, {}, {}, {})",
         ptr, size, nitems, stream_str
     ))
@@ -1820,13 +1859,19 @@ fn transform_fwrite<S: StreamExpr>(
 #[inline]
 fn transform_fflush<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
-    ic.update_error(format!("crate::stdio::fflush({})", stream_str))
+    ic.update_error_no_eof(format!("crate::stdio::fflush({})", stream_str))
 }
 
 #[inline]
 fn transform_puts(s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let s = pprust::expr_to_string(s);
-    ic.update_error(format!("crate::stdio::puts({})", s))
+    ic.update_error_no_eof(format!("crate::stdio::puts({})", s))
+}
+
+#[inline]
+fn transform_perror(s: &Expr) -> Expr {
+    let s = pprust::expr_to_string(s);
+    expr!("crate::stdio::perror({})", s)
 }
 
 #[inline]
@@ -1854,7 +1899,7 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
         }
         LikelyLit::If(_, _, _) => todo!(),
         LikelyLit::Path(path, _) => {
-            expr!("crate::stdio::fseek({}, {}, {})", stream, path, off)
+            expr!("crate::stdio::fseek({}, {}, {})", stream, off, path)
         }
         LikelyLit::Other(_) => todo!(),
     }

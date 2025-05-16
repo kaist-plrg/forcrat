@@ -408,6 +408,38 @@ unsafe fn f(mut stream: *mut FILE) {
 }
 
 #[test]
+fn test_vfprintf() {
+    run_test(
+        r#"
+unsafe extern "C" fn f(
+    mut stream: *mut FILE,
+    mut fmt: *const libc::c_char,
+    mut args: ...
+) {
+    let mut args_0: ::std::ffi::VaListImpl;
+    args_0 = args.clone();
+    vfprintf(stream, fmt, args_0.as_va_list());
+}"#,
+        &["crate::stdio::vfprintf", "TT", "Write"],
+        &["FILE"],
+    );
+}
+
+#[test]
+fn test_vprintf() {
+    run_test(
+        r#"
+unsafe extern "C" fn f(mut fmt: *const libc::c_char, mut args: ...) {
+    let mut args_0: ::std::ffi::VaListImpl;
+    args_0 = args.clone();
+    vprintf(fmt, args_0.as_va_list());
+}"#,
+        &["crate::stdio::vfprintf", "std::io::stdout"],
+        &[],
+    );
+}
+
+#[test]
 fn test_printf_static() {
     run_test(
         r#"
@@ -533,6 +565,18 @@ unsafe fn f() {
 }"#,
         &["write!"],
         &["printf"],
+    );
+}
+
+#[test]
+fn test_perror() {
+    run_test(
+        r#"
+unsafe fn f() {
+    perror(b"a\0" as *const u8 as *const libc::c_char);
+}"#,
+        &["crate::stdio::perror"],
+        &[],
     );
 }
 

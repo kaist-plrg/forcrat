@@ -165,7 +165,7 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("getdelim", Operation(Some(BufRead))),
     // Read stdin (5)
     ("scanf", StdioOperation),
-    ("vscanf", Unsupported),
+    ("vscanf", StdioOperation),
     ("getchar", StdioOperation), // unlocked
     ("gets", StdioOperation),    // removed
     // Read string (2)
@@ -173,7 +173,7 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("vsscanf", StringOperation),
     // Write (8)
     ("fprintf", Operation(Some(Write))),
-    ("vfprintf", Unsupported),
+    ("vfprintf", Operation(Some(Write))),
     ("putc", Operation(Some(Write))), // unlocked
     ("fputc", Operation(Some(Write))),
     ("fputs", Operation(Some(Write))),
@@ -181,7 +181,7 @@ pub static API_LIST: [(&str, ApiKind); 97] = [
     ("fflush", Operation(Some(Write))),
     // Write stdout/stderr (6)
     ("printf", StdioOperation),
-    ("vprintf", Unsupported),
+    ("vprintf", StdioOperation),
     ("putchar", StdioOperation), // unlocked
     ("puts", StdioOperation),
     ("perror", StdioOperation),
