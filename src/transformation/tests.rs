@@ -32,7 +32,7 @@ fn run_test(s: &str, includes: &[&str], excludes: &[&str]) {
 fn test_stdin() {
     run_test(
         "unsafe fn f() { fgetc(stdin); }",
-        &["crate::stdio::fgetc", "std::io::stdin"],
+        &["crate::stdio::rs_fgetc", "std::io::stdin"],
         &[],
     );
 }
@@ -41,7 +41,7 @@ fn test_stdin() {
 fn test_stdout() {
     run_test(
         "unsafe fn f() { fputc('a' as i32, stdout); }",
-        &["crate::stdio::fputc", "std::io::stdout"],
+        &["crate::stdio::rs_fputc", "std::io::stdout"],
         &[],
     );
 }
@@ -55,7 +55,7 @@ unsafe fn f() {
     fputc('a' as i32, stream);
     fputc('b' as i32, stream);
 }",
-        &["crate::stdio::fputc", "std::io::stdout"],
+        &["crate::stdio::rs_fputc", "std::io::stdout"],
         &["FILE"],
     );
 }
@@ -70,7 +70,7 @@ unsafe fn f() {
     fputc('a' as i32, stream);
     fputc('b' as i32, stream);
 }",
-        &["crate::stdio::fputc", "std::io::stdout"],
+        &["crate::stdio::rs_fputc", "std::io::stdout"],
         &["FILE"],
     );
 }
@@ -79,7 +79,7 @@ unsafe fn f() {
 fn test_stderr() {
     run_test(
         "unsafe fn f() { fputc('a' as i32, stderr); }",
-        &["crate::stdio::fputc", "std::io::stderr"],
+        &["crate::stdio::rs_fputc", "std::io::stderr"],
         &[],
     );
 }
@@ -96,7 +96,7 @@ unsafe fn f() {
     fgetc(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "drop"],
+        &["crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -118,7 +118,7 @@ unsafe fn f() {
     );
     fclose(stream);
 }"#,
-        &["crate::stdio::fgets", "drop"],
+        &["crate::stdio::rs_fgets", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -135,7 +135,7 @@ unsafe fn f() {
     fputc('a' as i32, stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fputc", "drop"],
+        &["crate::stdio::rs_fputc", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -152,7 +152,7 @@ unsafe fn f() {
     rewind(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::rewind", "drop"],
+        &["crate::stdio::rs_rewind", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -268,7 +268,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fgetc(stream);
     return fgetc(stream);
 }",
-        &["crate::stdio::fgetc", "TT", "Read"],
+        &["crate::stdio::rs_fgetc", "TT", "Read"],
         &["FILE"],
     );
 }
@@ -281,7 +281,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     getc(stream);
     return getc(stream);
 }",
-        &["crate::stdio::fgetc", "TT", "Read"],
+        &["crate::stdio::rs_fgetc", "TT", "Read"],
         &["FILE"],
     );
 }
@@ -294,7 +294,7 @@ unsafe fn f() -> libc::c_int {
     getchar();
     return getchar();
 }",
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["getchar"],
     );
 }
@@ -317,7 +317,7 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }",
-        &["crate::stdio::fgets", "TT", "Read"],
+        &["crate::stdio::rs_fgets", "TT", "Read"],
         &["FILE"],
     );
 }
@@ -340,7 +340,7 @@ unsafe fn f() {
         stdin,
     );
 }",
-        &["crate::stdio::fgets", "lock"],
+        &["crate::stdio::rs_fgets", "lock"],
         &["FILE"],
     );
 }
@@ -365,7 +365,7 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }",
-        &["crate::stdio::fread", "TT", "Read"],
+        &["crate::stdio::rs_fread", "TT", "Read"],
         &["FILE"],
     );
 }
@@ -390,7 +390,7 @@ unsafe fn f() {
         stdin,
     );
 }",
-        &["crate::stdio::fread"],
+        &["crate::stdio::rs_fread"],
         &[],
     );
 }
@@ -420,7 +420,7 @@ unsafe extern "C" fn f(
     args_0 = args.clone();
     vfprintf(stream, fmt, args_0.as_va_list());
 }"#,
-        &["crate::stdio::vfprintf", "TT", "Write"],
+        &["crate::stdio::rs_vfprintf", "TT", "Write"],
         &["FILE"],
     );
 }
@@ -434,7 +434,7 @@ unsafe extern "C" fn f(mut fmt: *const libc::c_char, mut args: ...) {
     args_0 = args.clone();
     vprintf(fmt, args_0.as_va_list());
 }"#,
-        &["crate::stdio::vfprintf", "std::io::stdout"],
+        &["crate::stdio::rs_vfprintf", "std::io::stdout"],
         &[],
     );
 }
@@ -489,7 +489,7 @@ unsafe fn f(mut s2: *const libc::c_char) {
     fprintf(stdout, s1, 0 as libc::c_int);
     fprintf(stderr, s2, 0 as libc::c_int);
 }"#,
-        &["write!", "crate::stdio::fprintf"],
+        &["write!", "crate::stdio::rs_fprintf"],
         &[],
     );
 }
@@ -503,7 +503,7 @@ unsafe fn f(mut s2: *const libc::c_char) {
     printf(s1, 0 as libc::c_int);
     printf(s2, 0 as libc::c_int);
 }"#,
-        &["write!", "crate::stdio::fprintf"],
+        &["write!", "crate::stdio::rs_fprintf"],
         &[],
     );
 }
@@ -575,7 +575,7 @@ fn test_perror() {
 unsafe fn f() {
     perror(b"a\0" as *const u8 as *const libc::c_char);
 }"#,
-        &["crate::stdio::perror"],
+        &["crate::stdio::rs_perror"],
         &[],
     );
 }
@@ -588,7 +588,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fputc('a' as i32, stream);
     return fputc('b' as i32, stream);
 }",
-        &["crate::stdio::fputc", "TT", "Write"],
+        &["crate::stdio::rs_fputc", "TT", "Write"],
         &["FILE"],
     );
 }
@@ -601,7 +601,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     putc('a' as i32, stream);
     return putc('b' as i32, stream);
 }",
-        &["crate::stdio::fputc", "TT", "Write"],
+        &["crate::stdio::rs_fputc", "TT", "Write"],
         &["FILE"],
     );
 }
@@ -614,7 +614,7 @@ unsafe fn f() -> libc::c_int {
     putchar('a' as i32);
     return putchar('b' as i32);
 }",
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["putchar"],
     );
 }
@@ -627,7 +627,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fputs(b"a\0" as *const u8 as *const libc::c_char, stream);
     return fputs(b"b\0" as *const u8 as *const libc::c_char, stream);
 }"#,
-        &["crate::stdio::fputs", "TT", "Write"],
+        &["crate::stdio::rs_fputs", "TT", "Write"],
         &["FILE"],
     );
 }
@@ -640,7 +640,7 @@ unsafe fn f() -> libc::c_int {
     puts(b"a\0" as *const u8 as *const libc::c_char);
     return puts(b"b\0" as *const u8 as *const libc::c_char);
 }"#,
-        &["crate::stdio::puts"],
+        &["crate::stdio::rs_puts"],
         &[],
     );
 }
@@ -663,7 +663,7 @@ unsafe fn f(mut stream: *mut FILE) {
         stream,
     );
 }"#,
-        &["crate::stdio::fwrite", "TT", "Write"],
+        &["crate::stdio::rs_fwrite", "TT", "Write"],
         &["FILE"],
     );
 }
@@ -686,7 +686,7 @@ unsafe fn f() {
         stdout,
     );
 }"#,
-        &["crate::stdio::fwrite"],
+        &["crate::stdio::rs_fwrite"],
         &[],
     );
 }
@@ -699,7 +699,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_int {
     fflush(stream);
     return fflush(stream);
 }",
-        &["crate::stdio::fflush", "TT", "Write"],
+        &["crate::stdio::rs_fflush", "TT", "Write"],
         &["FILE"],
     );
 }
@@ -712,7 +712,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_long {
     ftell(stream);
     return ftell(stream);
 }",
-        &["crate::stdio::ftell", "TT", "Seek"],
+        &["crate::stdio::rs_ftell", "TT", "Seek"],
         &["FILE"],
     );
 }
@@ -725,7 +725,7 @@ unsafe fn f(mut stream: *mut FILE) -> libc::c_long {
     ftello(stream);
     return ftello(stream);
 }",
-        &["crate::stdio::ftell", "TT", "Seek"],
+        &["crate::stdio::rs_ftell", "TT", "Seek"],
         &["FILE", "ftello"],
     );
 }
@@ -738,7 +738,7 @@ unsafe fn f(mut stream: *mut FILE) {
     rewind(stream);
     rewind(stream);
 }",
-        &["crate::stdio::rewind", "TT", "Seek"],
+        &["crate::stdio::rs_rewind", "TT", "Seek"],
         &["FILE"],
     );
 }
@@ -816,7 +816,7 @@ unsafe fn f() {
     g(stream2);
     fclose(stream2);
 }"#,
-        &["AsRawFd", "as_raw_fd", "crate::stdio::fgetc"],
+        &["AsRawFd", "as_raw_fd", "crate::stdio::rs_fgetc"],
         &["FILE", "fileno"],
     );
 }
@@ -845,7 +845,7 @@ fn test_second_arg() {
 unsafe fn f(mut c: libc::c_int, mut stream: *mut FILE) {
     fputc(c, stream);
 }",
-        &["Write", "TT", "crate::stdio::fputc"],
+        &["Write", "TT", "crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -859,7 +859,7 @@ unsafe fn f(mut stream: *mut FILE) {
     fputc('a' as i32, stream);
     putchar('a' as i32);
 }",
-        &["crate::stdio::fputc", "FILE"],
+        &["crate::stdio::rs_fputc", "FILE"],
         &[],
     );
 }
@@ -873,7 +873,7 @@ unsafe fn f(mut p: *mut libc::c_void) {
     fputc('a' as i32, stream);
     putchar('a' as i32);
 }",
-        &["crate::stdio::fputc", "FILE"],
+        &["crate::stdio::rs_fputc", "FILE"],
         &[],
     );
 }
@@ -893,7 +893,7 @@ unsafe fn f() {
     putchar('a' as i32);
     fclose(stream);
 }"#,
-        &["crate::stdio::fputc", "FILE"],
+        &["crate::stdio::rs_fputc", "FILE"],
         &[],
     );
 }
@@ -914,7 +914,7 @@ unsafe fn f() {
     putchar('a' as i32);
     fclose(stream);
 }"#,
-        &["crate::stdio::fputc", "FILE"],
+        &["crate::stdio::rs_fputc", "FILE"],
         &[],
     );
 }
@@ -931,7 +931,7 @@ unsafe fn f(mut p: *mut libc::c_void) {
     fputc('a' as i32, stream);
     putchar('a' as i32);
 }"#,
-        &["crate::stdio::fputc", "FILE"],
+        &["crate::stdio::rs_fputc", "FILE"],
         &[],
     );
 }
@@ -946,7 +946,7 @@ unsafe fn f(mut p: *mut libc::c_void) {
     fputc('a' as i32, stream);
     putchar('a' as i32);
 }"#,
-        &["crate::stdio::fputc", "FILE"],
+        &["crate::stdio::rs_fputc", "FILE"],
         &[],
     );
 }
@@ -972,7 +972,7 @@ unsafe fn f(mut p: *mut libc::c_void) {
     fclose(s.stream);
     fgetc(stdin);
 }"#,
-        &["crate::stdio::fgetc", "FILE"],
+        &["crate::stdio::rs_fgetc", "FILE"],
         &[],
     );
 }
@@ -986,7 +986,7 @@ unsafe fn f(mut p: *mut libc::c_void) -> *mut FILE {
     let mut stream: *mut FILE = p as *mut FILE;
     return stream;
 }"#,
-        &["crate::stdio::fgetc", "FILE"],
+        &["crate::stdio::rs_fgetc", "FILE"],
         &[],
     );
 }
@@ -1002,7 +1002,7 @@ unsafe fn f(mut stream: *mut FILE) {
     }
     fputc('a' as i32, stream);
 }"#,
-        &["crate::stdio::fgetc", "FILE"],
+        &["crate::stdio::rs_fgetc", "FILE"],
         &[],
     );
 }
@@ -1018,7 +1018,7 @@ unsafe extern "C" fn f(mut x: libc::c_int, mut args: ...) {
     fputc(x, stream);
     fputc(x, stdout);
 }"#,
-        &["crate::stdio::fputc", "FILE"],
+        &["crate::stdio::rs_fputc", "FILE"],
         &[],
     );
 }
@@ -1038,7 +1038,7 @@ unsafe fn f() {
     fclose(stream);
     fgetc(stdin);
 }"#,
-        &["crate::stdio::fgetc", "FILE"],
+        &["crate::stdio::rs_fgetc", "FILE"],
         &[],
     );
 }
@@ -1063,7 +1063,7 @@ unsafe fn f() {
     fgetc(s.f);
     fclose(s.f);
 }"#,
-        &["File", "open", "crate::stdio::fgetc", "drop"],
+        &["File", "open", "crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -1092,7 +1092,7 @@ unsafe fn f() {
     g(&mut s);
     fclose(stream);
 }"#,
-        &["File", "open", "crate::stdio::fgetc", "drop"],
+        &["File", "open", "crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -1123,7 +1123,7 @@ unsafe fn f() {
     g(&mut s);
     fclose(stream);
 }"#,
-        &["File", "open", "crate::stdio::fgetc", "drop"],
+        &["File", "open", "crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -1140,7 +1140,7 @@ unsafe fn f(mut stream: *mut FILE) {
     g(stream);
     g(stream);
 }"#,
-        &["crate::stdio::fputc", "TT", "Write"],
+        &["crate::stdio::rs_fputc", "TT", "Write"],
         &["FILE"],
     );
 }
@@ -1157,7 +1157,7 @@ unsafe fn f() {
     g(stdout);
     g(stdout);
 }"#,
-        &["crate::stdio::fputc", "TT", "Write"],
+        &["crate::stdio::rs_fputc", "TT", "Write"],
         &["FILE"],
     );
 }
@@ -1177,7 +1177,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "stream_error ="],
+        &["crate::stdio::rs_fgetc", "stream_error ="],
         &["FILE", "ferror"],
     );
 }
@@ -1197,7 +1197,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "stream_eof ="],
+        &["crate::stdio::rs_fgetc", "stream_eof ="],
         &["FILE", "feof"],
     );
 }
@@ -1224,7 +1224,7 @@ unsafe fn f() {
     fclose(stream);
 }"#,
         &[
-            "crate::stdio::fgetc",
+            "crate::stdio::rs_fgetc",
             "stream_error =",
             "return stream_error",
         ],
@@ -1256,7 +1256,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "stream_error =", "stream_eof ="],
+        &["crate::stdio::rs_fgetc", "stream_error =", "stream_eof ="],
         &["FILE", "ferror", "feof"],
     );
 }
@@ -1288,7 +1288,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "stream_error =", "stream_eof ="],
+        &["crate::stdio::rs_fgetc", "stream_error =", "stream_eof ="],
         &["FILE", "ferror", "feof"],
     );
 }
@@ -1311,7 +1311,11 @@ unsafe fn f() {
     g(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "stream_error =", "stream_error: i32"],
+        &[
+            "crate::stdio::rs_fgetc",
+            "stream_error =",
+            "stream_error: i32",
+        ],
         &["FILE", "ferror"],
     );
 }
@@ -1337,7 +1341,7 @@ unsafe fn f() {
     fclose(stream);
 }"#,
         &[
-            "crate::stdio::fgetc",
+            "crate::stdio::rs_fgetc",
             "stream_error =",
             "stream_eof =",
             "stream_error: i32",
@@ -1361,7 +1365,7 @@ unsafe fn f() {
     fgetc(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "drop"],
+        &["crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fclose"],
     );
 }
@@ -1379,7 +1383,12 @@ unsafe fn f() {
     fputc(c, stream);
     fclose(stream);
 }"#,
-        &["File", "crate::stdio::fgetc", "crate::stdio::fputc", "drop"],
+        &[
+            "File",
+            "crate::stdio::rs_fgetc",
+            "crate::stdio::rs_fputc",
+            "drop",
+        ],
         &["FILE", "fclose"],
     );
 }
@@ -1409,7 +1418,7 @@ unsafe fn f(mut x: libc::c_int) {
         pclose(stream);
     }
 }"#,
-        &["Box", "crate::stdio::fgetc", "drop"],
+        &["Box", "crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "popen", "fclose"],
     );
 }
@@ -1472,7 +1481,7 @@ unsafe fn f(mut x: libc::c_int) {
         pclose(stream);
     }
 }"#,
-        &["Box", "crate::stdio::fgetc", "drop"],
+        &["Box", "crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "popen", "fileno", "fclose"],
     );
 }
@@ -1486,7 +1495,7 @@ unsafe fn f(mut x: libc::c_int) {
     fputc('a' as i32, stream);
     fputc('a' as i32, stream);
 }"#,
-        &["Box", "crate::stdio::fputc"],
+        &["Box", "crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1501,7 +1510,7 @@ unsafe fn f(mut mode: *const libc::c_char) {
     fgetc(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "crate::stdio::fopen", "drop"],
+        &["crate::stdio::rs_fgetc", "crate::stdio::rs_fopen", "drop"],
         &["FILE", "fclose"],
     );
 }
@@ -1516,7 +1525,7 @@ unsafe fn f() {
     fputc('a' as i32, stream);
     fclose(stream);
 }"#,
-        &["tempfile", "crate::stdio::fputc", "drop"],
+        &["tempfile", "crate::stdio::rs_fputc", "drop"],
         &["FILE", "tmpfile", "fclose"],
     );
 }
@@ -1535,7 +1544,7 @@ unsafe fn f() {
     fgetc(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "drop"],
+        &["crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fdopen", "fclose"],
     );
 }
@@ -1575,7 +1584,7 @@ unsafe fn f() {
     fgetc((*s).stream);
     fclose((*s).stream);
 }"#,
-        &["crate::stdio::fgetc", "drop"],
+        &["crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -1597,7 +1606,7 @@ unsafe fn f() {
     fgetc(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "drop"],
+        &["crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -1630,7 +1639,7 @@ unsafe fn f(mut x: libc::c_int) {
         pclose(stream);
     }
 }"#,
-        &["crate::stdio::fgetc", "drop"],
+        &["crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fopen", "fclose"],
     );
 }
@@ -1669,7 +1678,7 @@ unsafe fn f() {
     fputc('a' as i32, stream);
     fputc('b' as i32, stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1686,7 +1695,7 @@ unsafe fn f() {
     stream = stdout;
     fputc('a' as i32, stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1715,7 +1724,7 @@ unsafe fn f() {
     fputc('b' as i32, (*s).stream);
     fclose((*s).stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1738,7 +1747,7 @@ unsafe fn f() {
     fputc('a' as i32, s.stream);
     fputc('b' as i32, s.stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1767,7 +1776,7 @@ unsafe fn f() {
     fputc('b' as i32, (*s).stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1798,7 +1807,7 @@ unsafe fn f() {
     fputc('a' as i32, s.stream);
     fputc('b' as i32, s.stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1829,7 +1838,7 @@ unsafe fn f() {
     fputc('a' as i32, s.stream);
     fputc('b' as i32, s.stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1862,7 +1871,7 @@ unsafe fn f(mut x: libc::c_int) {
     fgetc(s.stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["FILE"],
     );
 }
@@ -1884,7 +1893,7 @@ unsafe fn f(mut x: libc::c_int, mut s: *const s) {
     fputc('a' as i32, stream);
     fputc('b' as i32, stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["FILE"],
     );
 }
@@ -1918,7 +1927,7 @@ unsafe fn f(mut x: libc::c_int) {
     fgetc(t.stream);
     fclose(t.stream);
 }"#,
-        &["crate::stdio::fgetc", "Copy", "Clone"],
+        &["crate::stdio::rs_fgetc", "Copy", "Clone"],
         &["FILE"],
     );
 }
@@ -1957,7 +1966,7 @@ unsafe fn f(mut x: libc::c_int) {
     fgetc((*r.t).s.stream);
     fclose((*r.t).s.stream);
 }"#,
-        &["crate::stdio::fgetc", "Copy", "Clone"],
+        &["crate::stdio::rs_fgetc", "Copy", "Clone"],
         &["FILE"],
     );
 }
@@ -1990,7 +1999,7 @@ unsafe fn f(mut x: libc::c_int) {
     fgetc(s.stream);
     fclose(s.stream);
 }"#,
-        &["crate::stdio::fgetc", "BitfieldStruct"],
+        &["crate::stdio::rs_fgetc", "BitfieldStruct"],
         &["FILE", "Copy", "Clone"],
     );
 }
@@ -2016,7 +2025,7 @@ unsafe fn f(mut x: libc::c_int) {
     fgetc(u.stream);
     fclose(u.stream);
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["FILE"],
     );
 }
@@ -2033,7 +2042,7 @@ unsafe fn f() {
     fgetc(stream);
     fgetc(stream);
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["FILE"],
     );
 }
@@ -2062,7 +2071,7 @@ unsafe fn f() {
         ),
     );
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["FILE"],
     );
 }
@@ -2082,7 +2091,7 @@ unsafe fn f() {
     g(0 as *mut FILE);
     g(stdin);
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["FILE"],
     );
 }
@@ -2103,7 +2112,7 @@ unsafe fn f() {
     stream0 = stdin;
     g(0 as *mut FILE);
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["FILE"],
     );
 }
@@ -2125,7 +2134,7 @@ unsafe fn f() {
     fgetc(stream0);
     g(stream0);
 }"#,
-        &["crate::stdio::fgetc", "drop"],
+        &["crate::stdio::rs_fgetc", "drop"],
         &["FILE", "fclose"],
     );
 }
@@ -2161,8 +2170,8 @@ unsafe fn f(mut x: libc::c_int) {
         &[
             "BufRead",
             "consume",
-            "crate::stdio::fputc",
-            "crate::stdio::fopen",
+            "crate::stdio::rs_fputc",
+            "crate::stdio::rs_fopen",
         ],
         &["FILE", "fscanf", "fclose"],
     );
@@ -2182,7 +2191,7 @@ unsafe fn f(mut p: *mut libc::c_void) {
     let mut stream: *mut FILE = p as *mut FILE;
     h.unwrap()(p as *mut FILE);
 }"#,
-        &["crate::stdio::fgetc", "FILE"],
+        &["crate::stdio::rs_fgetc", "FILE"],
         &["getchar"],
     );
 }
@@ -2203,7 +2212,7 @@ unsafe fn f() {
     fclose(stream);
     getchar();
 }"#,
-        &["crate::stdio::fgetc", "FILE"],
+        &["crate::stdio::rs_fgetc", "FILE"],
         &["getchar"],
     );
 }
@@ -2223,7 +2232,7 @@ unsafe fn f() {
     funlockfile(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fputc", "lock", "unlock"],
+        &["crate::stdio::rs_fputc", "lock", "unlock"],
         &["flockfile", "funlockfile"],
     );
 }
@@ -2238,7 +2247,7 @@ unsafe fn f() {
     fputc('b' as i32, stderr);
     funlockfile(stderr);
 }"#,
-        &["crate::stdio::fputc", "lock", "drop"],
+        &["crate::stdio::rs_fputc", "lock", "drop"],
         &["flockfile", "funlockfile"],
     );
 }
@@ -2254,7 +2263,7 @@ unsafe fn f(mut x: libc::c_int) {
     fputc('b' as i32, stream);
     funlockfile(stream);
 }"#,
-        &["crate::stdio::fputc", "lock", "drop"],
+        &["crate::stdio::rs_fputc", "lock", "drop"],
         &["flockfile", "funlockfile"],
     );
 }
@@ -2288,7 +2297,7 @@ unsafe fn f() {
     fgetc(u.y.stream);
     fclose(u.y.stream);
 }"#,
-        &["crate::stdio::fgetc", "File", "ManuallyDrop"],
+        &["crate::stdio::rs_fgetc", "File", "ManuallyDrop"],
         &["FILE"],
     );
 }
@@ -2303,7 +2312,7 @@ unsafe fn f() {
     fflush(stream[0 as libc::c_int as usize]);
     putchar('a' as i32);
 }"#,
-        &["crate::stdio::fputc", "FILE", "fflush"],
+        &["crate::stdio::rs_fputc", "FILE", "fflush"],
         &["putchar"],
     );
 }
@@ -2331,7 +2340,7 @@ unsafe fn f() {
     fgetc(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc", "drop", "File"],
+        &["crate::stdio::rs_fgetc", "drop", "File"],
         &["fopen", "fclose", "FILE"],
     );
 }
@@ -2359,7 +2368,7 @@ unsafe fn f(mut fmt: *const libc::c_char) {
     fclose(stream);
     putchar('a' as i32);
 }"#,
-        &["crate::stdio::fputc", "fopen", "fclose", "FILE"],
+        &["crate::stdio::rs_fputc", "fopen", "fclose", "FILE"],
         &["putchar"],
     );
 }
@@ -2387,7 +2396,7 @@ unsafe fn f() {
     g(Some(h1 as unsafe extern "C" fn(*mut FILE) -> ()));
     g(Some(h2 as unsafe extern "C" fn(*mut FILE) -> ()));
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["fopen", "fclose", "FILE", "TT"],
     );
 }
@@ -2436,7 +2445,7 @@ unsafe fn f() {
         1 as libc::c_int,
     );
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["fopen", "fclose", "FILE", "TT"],
     );
 }
@@ -2487,7 +2496,7 @@ unsafe fn f() {
     (s.func).unwrap()(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["fopen", "fclose", "FILE"],
     );
 }
@@ -2516,7 +2525,7 @@ unsafe fn f() {
     g(stream, Some(h as unsafe extern "C" fn(*mut FILE) -> ()));
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["fopen", "fclose", "FILE"],
     );
 }
@@ -2549,7 +2558,7 @@ unsafe fn e() {
     f(stream);
     fclose(stream);
 }"#,
-        &["crate::stdio::fgetc"],
+        &["crate::stdio::rs_fgetc"],
         &["fopen", "fclose", "FILE"],
     );
 }
@@ -2578,7 +2587,7 @@ unsafe fn f() {
     g(stream, Some(h1 as unsafe extern "C" fn(*mut FILE) -> ()));
     fclose(stream);
 }"#,
-        &["crate::stdio::fputc"],
+        &["crate::stdio::rs_fputc"],
         &["fopen", "fclose", "FILE"],
     );
 }
@@ -2603,7 +2612,7 @@ unsafe fn f(mut s: *mut s) {
     h.unwrap()((*s).stream);
     h.unwrap()((*s).stream);
 }"#,
-        &["crate::stdio::fputc", "Stdout"],
+        &["crate::stdio::rs_fputc", "Stdout"],
         &["FILE"],
     );
 }

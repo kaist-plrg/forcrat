@@ -113,7 +113,7 @@ impl<'a> TransformVisitor<'_, 'a> {
         }
         let stream_str = stream.borrow_for(StreamTrait::Write);
         let fmt = pprust::expr_to_string(fmt);
-        let mut s = format!("crate::stdio::fprintf({}, {}", stream_str, fmt);
+        let mut s = format!("crate::stdio::rs_fprintf({}, {}", stream_str, fmt);
         for arg in args {
             let arg = pprust::expr_to_string(arg);
             s.push_str(", ");
@@ -781,7 +781,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[0]) {
                                 let origins = self.bound_expr_origins(&args[0]);
                                 if let Some(new_expr) = self.transform_unsupported(
-                                    "fprintf",
+                                    "rs_fprintf",
                                     orig_name,
                                     &[],
                                     &args[0],
@@ -841,7 +841,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[0]) {
                                 let origins = self.bound_expr_origins(&args[0]);
                                 if let Some(new_expr) = self.transform_unsupported(
-                                    "vfprintf",
+                                    "rs_vfprintf",
                                     orig_name,
                                     &[],
                                     &args[0],
@@ -871,7 +871,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[1]) {
                                 let origins = self.bound_expr_origins(&args[1]);
                                 if let Some(new_expr) = self.transform_unsupported(
-                                    "fputc",
+                                    "rs_fputc",
                                     orig_name,
                                     &args[0..1],
                                     &args[1],
@@ -901,7 +901,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[1]) {
                                 let origins = self.bound_expr_origins(&args[1]);
                                 if let Some(new_expr) = self.transform_unsupported(
-                                    "fputwc",
+                                    "rs_fputwc",
                                     orig_name,
                                     &args[0..1],
                                     &args[1],
@@ -922,7 +922,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[1]) {
                                 let origins = self.bound_expr_origins(&args[1]);
                                 if let Some(new_expr) = self.transform_unsupported(
-                                    "fputs",
+                                    "rs_fputs",
                                     orig_name,
                                     &args[0..1],
                                     &args[1],
@@ -958,7 +958,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[3]) {
                                 let origins = self.bound_expr_origins(&args[3]);
                                 if let Some(new_expr) = self.transform_unsupported(
-                                    "fwrite",
+                                    "rs_fwrite",
                                     orig_name,
                                     &args[0..3],
                                     &args[3],
@@ -980,7 +980,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             if self.is_unsupported(&args[0]) {
                                 let origins = self.bound_expr_origins(&args[0]);
                                 if let Some(new_expr) = self.transform_unsupported(
-                                    "fflush",
+                                    "rs_fflush",
                                     orig_name,
                                     &args[..0],
                                     &args[0],
@@ -1479,7 +1479,7 @@ impl OpenMode {
             }
             Self::Unknown => {
                 expr!(
-                    "crate::stdio::fopen({}, {})",
+                    "crate::stdio::rs_fopen({}, {})",
                     path,
                     pprust::expr_to_string(mode),
                 )
@@ -1747,7 +1747,7 @@ if !c.is_ascii_whitespace() {
 #[inline]
 fn transform_fgetc<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Read);
-    ic.update_error(format!("crate::stdio::fgetc({})", stream_str))
+    ic.update_error(format!("crate::stdio::rs_fgetc({})", stream_str))
 }
 
 #[inline]
@@ -1755,7 +1755,10 @@ fn transform_fgets<S: StreamExpr>(stream: &S, s: &Expr, n: &Expr, ic: IndicatorC
     let stream_str = stream.borrow_for(StreamTrait::BufRead);
     let s = pprust::expr_to_string(s);
     let n = pprust::expr_to_string(n);
-    ic.update_error(format!("crate::stdio::fgets({}, {}, {})", s, n, stream_str))
+    ic.update_error(format!(
+        "crate::stdio::rs_fgets({}, {}, {})",
+        s, n, stream_str
+    ))
 }
 
 #[inline]
@@ -1771,7 +1774,7 @@ fn transform_getdelim<S: StreamExpr>(
     let n = pprust::expr_to_string(n);
     let delimiter = pprust::expr_to_string(delimiter);
     ic.update_error(format!(
-        "crate::stdio::getdelim({}, {}, {}, {})",
+        "crate::stdio::rs_getdelim({}, {}, {}, {})",
         lineptr, n, delimiter, stream_str
     ))
 }
@@ -1787,7 +1790,7 @@ fn transform_getline<S: StreamExpr>(
     let lineptr = pprust::expr_to_string(lineptr);
     let n = pprust::expr_to_string(n);
     ic.update_error(format!(
-        "crate::stdio::getline({}, {}, {})",
+        "crate::stdio::rs_getline({}, {}, {})",
         lineptr, n, stream_str
     ))
 }
@@ -1805,7 +1808,7 @@ fn transform_fread<S: StreamExpr>(
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
     ic.update_error(format!(
-        "crate::stdio::fread({}, {}, {}, {})",
+        "crate::stdio::rs_fread({}, {}, {}, {})",
         ptr, size, nitems, stream_str
     ))
 }
@@ -1959,7 +1962,7 @@ fn transform_vfprintf<S: StreamExpr>(
     let fmt = pprust::expr_to_string(fmt);
     let args = pprust::expr_to_string(args);
     ic.update_error_no_eof(format!(
-        "crate::stdio::vfprintf({}, {}, {})",
+        "crate::stdio::rs_vfprintf({}, {}, {})",
         stream_str, fmt, args
     ))
 }
@@ -1968,21 +1971,21 @@ fn transform_vfprintf<S: StreamExpr>(
 fn transform_fputc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let c = pprust::expr_to_string(c);
-    ic.update_error_no_eof(format!("crate::stdio::fputc({}, {})", c, stream_str))
+    ic.update_error_no_eof(format!("crate::stdio::rs_fputc({}, {})", c, stream_str))
 }
 
 #[inline]
 fn transform_fputwc<S: StreamExpr>(stream: &S, c: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let c = pprust::expr_to_string(c);
-    ic.update_error_no_eof(format!("crate::stdio::fputwc({}, {})", c, stream_str))
+    ic.update_error_no_eof(format!("crate::stdio::rs_fputwc({}, {})", c, stream_str))
 }
 
 #[inline]
 fn transform_fputs<S: StreamExpr>(stream: &S, s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
     let s = pprust::expr_to_string(s);
-    ic.update_error_no_eof(format!("crate::stdio::fputs({}, {})", s, stream_str))
+    ic.update_error_no_eof(format!("crate::stdio::rs_fputs({}, {})", s, stream_str))
 }
 
 #[inline]
@@ -1998,7 +2001,7 @@ fn transform_fwrite<S: StreamExpr>(
     let size = pprust::expr_to_string(size);
     let nitems = pprust::expr_to_string(nitems);
     ic.update_error_no_eof(format!(
-        "crate::stdio::fwrite({}, {}, {}, {})",
+        "crate::stdio::rs_fwrite({}, {}, {}, {})",
         ptr, size, nitems, stream_str
     ))
 }
@@ -2006,19 +2009,19 @@ fn transform_fwrite<S: StreamExpr>(
 #[inline]
 fn transform_fflush<S: StreamExpr>(stream: &S, ic: IndicatorCheck<'_>) -> Expr {
     let stream_str = stream.borrow_for(StreamTrait::Write);
-    ic.update_error_no_eof(format!("crate::stdio::fflush({})", stream_str))
+    ic.update_error_no_eof(format!("crate::stdio::rs_fflush({})", stream_str))
 }
 
 #[inline]
 fn transform_puts(s: &Expr, ic: IndicatorCheck<'_>) -> Expr {
     let s = pprust::expr_to_string(s);
-    ic.update_error_no_eof(format!("crate::stdio::puts({})", s))
+    ic.update_error_no_eof(format!("crate::stdio::rs_puts({})", s))
 }
 
 #[inline]
 fn transform_perror(s: &Expr) -> Expr {
     let s = pprust::expr_to_string(s);
-    expr!("crate::stdio::perror({})", s)
+    expr!("crate::stdio::rs_perror({})", s)
 }
 
 #[inline]
@@ -2046,7 +2049,7 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
         }
         LikelyLit::If(_, _, _) => todo!(),
         LikelyLit::Path(path, _) => {
-            expr!("crate::stdio::fseek({}, {}, {})", stream, off, path)
+            expr!("crate::stdio::rs_fseek({}, {}, {})", stream, off, path)
         }
         LikelyLit::Other(_) => todo!(),
     }
@@ -2055,13 +2058,13 @@ fn transform_fseek<S: StreamExpr>(stream: &S, off: &Expr, whence: &Expr) -> Expr
 #[inline]
 fn transform_ftell<S: StreamExpr>(stream: &S) -> Expr {
     let stream = stream.borrow_for(StreamTrait::Seek);
-    expr!("crate::stdio::ftell({})", stream)
+    expr!("crate::stdio::rs_ftell({})", stream)
 }
 
 #[inline]
 fn transform_rewind<S: StreamExpr>(stream: &S) -> Expr {
     let stream = stream.borrow_for(StreamTrait::Seek);
-    expr!("crate::stdio::rewind({})", stream)
+    expr!("crate::stdio::rs_rewind({})", stream)
 }
 
 #[inline]
