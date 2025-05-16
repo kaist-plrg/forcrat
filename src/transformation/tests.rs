@@ -1868,6 +1868,28 @@ unsafe fn f(mut x: libc::c_int) {
 }
 
 #[test]
+fn test_assign_if_field() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+struct s {
+    stream: *mut FILE,
+}
+unsafe fn g(mut s: *mut s) {
+    (*s).stream = stdout;
+}
+unsafe fn f(mut x: libc::c_int, mut s: *const s) {
+    let mut stream: *mut FILE = if x != 0 { (*s).stream } else { stdout };
+    fputc('a' as i32, stream);
+    fputc('b' as i32, stream);
+}"#,
+        &["crate::stdio::fputc"],
+        &["FILE"],
+    );
+}
+
+#[test]
 fn test_copy() {
     run_test(
         r#"

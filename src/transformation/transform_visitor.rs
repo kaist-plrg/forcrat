@@ -1941,8 +1941,13 @@ fn expr_to_lock<S: StreamExpr>(stream: &S) -> (String, bool) {
     } else {
         (ty, "")
     };
+    let (ty, deref) = if let StreamType::Ptr(ty) = ty {
+        (*ty, "*")
+    } else {
+        (ty, "")
+    };
     (
-        format!("({}){}{}", stream.expr(), unwrap, get_ref),
+        format!("({}({}){}{})", deref, stream.expr(), unwrap, get_ref),
         ty == StreamType::File,
     )
 }
@@ -1953,7 +1958,7 @@ fn transform_flockfile<S: StreamExpr>(stream: &S, name: Symbol) -> (Expr, bool) 
     if is_file {
         (expr!("{}.lock().unwrap()", expr), false)
     } else if stream.ty().get_dyn_bound().is_some() {
-        (expr!("{}_guard = (&**({})).lock()", name, expr), true)
+        (expr!("{}_guard = (&*{}).lock()", name, expr), true)
     } else {
         (expr!("{}_guard = {}.lock()", name, expr), true)
     }

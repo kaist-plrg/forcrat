@@ -51,8 +51,8 @@ pub(super) struct HirCtx {
     /// bound occurrence span to location
     pub(super) bound_span_to_loc: FxHashMap<Span, HirLoc>,
 
-    /// for each assignment, lhs span to rhs span
-    pub(super) lhs_to_rhs: FxHashMap<Span, Span>,
+    /// for each assignment, lhs span to rhs spans
+    pub(super) lhs_to_rhs: FxHashMap<Span, Vec<Span>>,
     /// for each assignment, rhs span to lhs span
     pub(super) rhs_to_lhs: FxHashMap<Span, Span>,
 
@@ -94,10 +94,13 @@ impl HirCtx {
             self.loc_to_bound_spans.get(&lhs),
             return Box::new(std::iter::empty())
         );
-        Box::new(spans.iter().filter_map(|span| {
-            let rhs = self.lhs_to_rhs.get(span)?;
-            self.bound_span_to_loc.get(rhs).copied()
-        }))
+        Box::new(
+            spans
+                .iter()
+                .filter_map(|span| self.lhs_to_rhs.get(span))
+                .flatten()
+                .filter_map(|rhs| self.bound_span_to_loc.get(rhs).copied()),
+        )
     }
 }
 
@@ -121,10 +124,37 @@ impl HirVisitor<'_> {
         self.ctx.bound_span_to_loc.insert(span, loc);
     }
 
-    fn add_assignment(&mut self, lhs: Span, rhs: Span) {
-        self.ctx.lhs_to_rhs.insert(lhs, rhs);
-        self.ctx.rhs_to_lhs.insert(rhs, lhs);
+    fn add_assignment(&mut self, lhs: Span, rhs: &hir::Expr<'_>) {
+        self.ctx.lhs_to_rhs.entry(lhs).or_default().push(rhs.span);
+        self.ctx.rhs_to_lhs.insert(rhs.span, lhs);
+        self.add_if_assignment(lhs, rhs);
     }
+
+    fn add_if_assignment(&mut self, lhs: Span, rhs: &hir::Expr<'_>) {
+        if let hir::ExprKind::If(_, t, Some(f)) = remove_drop_temps(rhs).kind {
+            let hir::ExprKind::Block(t, _) = remove_drop_temps(t).kind else { panic!() };
+            let t = t.expr.unwrap();
+            self.ctx.lhs_to_rhs.entry(lhs).or_default().push(t.span);
+            self.ctx.rhs_to_lhs.insert(t.span, lhs);
+
+            match remove_drop_temps(f).kind {
+                hir::ExprKind::Block(f, _) => {
+                    let f = f.expr.unwrap();
+                    self.ctx.lhs_to_rhs.entry(lhs).or_default().push(f.span);
+                    self.ctx.rhs_to_lhs.insert(f.span, lhs);
+                }
+                hir::ExprKind::If(_, _, _) => self.add_if_assignment(lhs, f),
+                _ => panic!("{:?}", f.span),
+            }
+        }
+    }
+}
+
+fn remove_drop_temps<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
+    if let hir::ExprKind::DropTemps(e) = expr.kind {
+        return remove_drop_temps(e);
+    }
+    expr
 }
 
 impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
@@ -143,7 +173,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 let body = self.tcx.hir_body(body_id);
                 self.add_binding(loc, item.ident.span);
                 self.add_bound(loc, item.ident.span);
-                self.add_assignment(item.ident.span, body.value.span);
+                self.add_assignment(item.ident.span, body.value);
             }
             hir::ItemKind::Fn { .. } => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
@@ -177,7 +207,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         intravisit::walk_local(self, local);
 
         if let Some(init) = local.init {
-            self.add_assignment(local.pat.span, init.span);
+            self.add_assignment(local.pat.span, init);
         }
 
         if let hir::PatKind::Binding(_, hir_id, _, _) = local.pat.kind {
@@ -206,7 +236,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                 self.add_bound(loc, expr.span);
             }
             hir::ExprKind::Assign(lhs, rhs, _) => {
-                self.add_assignment(lhs.span, rhs.span);
+                self.add_assignment(lhs.span, rhs);
             }
             hir::ExprKind::Struct(_, fields, _) => {
                 let (adt_def, def_id) = some_or!(adt_of_expr(expr, self.tcx), return);
@@ -214,7 +244,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     let i = some_or!(find_field(field.ident.name, adt_def), continue);
                     let loc = HirLoc::Field(def_id, i);
                     self.add_bound(loc, field.ident.span);
-                    self.add_assignment(field.ident.span, field.expr.span);
+                    self.add_assignment(field.ident.span, field.expr);
                 }
             }
             hir::ExprKind::Call(callee, args) => {

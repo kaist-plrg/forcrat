@@ -355,7 +355,7 @@ pub(super) fn convert_expr(
         }
         (Ptr(to), Option(from)) if to == from => {
             format!(
-                "({}).as_mut().map_or(std::ptr::null_mut(), |mut r| r as *mut _)",
+                "({}).as_ref().map_or(std::ptr::null_mut(), |r| r as *const _ as *mut _)",
                 expr
             )
         }
@@ -497,6 +497,12 @@ pub(super) fn convert_expr(
             format!("&mut *({}) as *mut _", expr)
         }
         (Ptr(Dyn(_)), Ptr(Dyn(_))) => {
+            format!("&mut *({}) as *mut _", expr)
+        }
+        (
+            Ptr(Dyn(_)),
+            Ptr(File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_)),
+        ) => {
             format!("&mut *({}) as *mut _", expr)
         }
         (
