@@ -112,6 +112,7 @@ impl<'a> TypeArena<'a> {
             if permissions.contains(Permission::Close) && origins.contains(Origin::Pipe) {
                 traits.insert(StreamTrait::Close);
             }
+            traits.insert(StreamTrait::AsRawFd);
             let ty = self.alloc(StreamType::Impl(TraitBound(traits)));
             self.option(ty)
         } else if origins.is_empty() {
@@ -164,9 +165,7 @@ impl<'a> TypeArena<'a> {
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
             }
-            if traits.is_empty() {
-                traits.insert(StreamTrait::AsRawFd);
-            }
+            traits.insert(StreamTrait::AsRawFd);
             if traits.contains(StreamTrait::BufRead) {
                 traits.remove(StreamTrait::Read);
             }
@@ -312,6 +311,58 @@ impl StreamType<'_> {
             | Self::Box(t)
             | Self::ManuallyDrop(t) => t.can_flush(),
             Self::Dyn(traits) | Self::Impl(traits) => traits.contains(StreamTrait::Write),
+        }
+    }
+
+    pub(super) fn must_stdout(self) -> bool {
+        match self {
+            Self::File
+            | Self::Stdin
+            | Self::Stderr
+            | Self::Child
+            | Self::Dyn(_)
+            | Self::Impl(_) => false,
+            Self::Stdout => true,
+            Self::BufWriter(t)
+            | Self::BufReader(t)
+            | Self::Option(t)
+            | Self::Ptr(t)
+            | Self::Ref(t)
+            | Self::Box(t)
+            | Self::ManuallyDrop(t) => t.must_stdout(),
+        }
+    }
+
+    pub(super) fn must_stderr(self) -> bool {
+        match self {
+            Self::File
+            | Self::Stdin
+            | Self::Stdout
+            | Self::Child
+            | Self::Dyn(_)
+            | Self::Impl(_) => false,
+            Self::Stderr => true,
+            Self::BufWriter(t)
+            | Self::BufReader(t)
+            | Self::Option(t)
+            | Self::Ptr(t)
+            | Self::Ref(t)
+            | Self::Box(t)
+            | Self::ManuallyDrop(t) => t.must_stderr(),
+        }
+    }
+
+    pub(super) fn may_std(self) -> bool {
+        match self {
+            Self::File | Self::Child => false,
+            Self::Stdin | Self::Stdout | Self::Stderr | Self::Dyn(_) | Self::Impl(_) => true,
+            Self::BufWriter(t)
+            | Self::BufReader(t)
+            | Self::Option(t)
+            | Self::Ptr(t)
+            | Self::Ref(t)
+            | Self::Box(t)
+            | Self::ManuallyDrop(t) => t.may_std(),
         }
     }
 }

@@ -52,6 +52,8 @@ pub struct AnalysisResult<'a> {
     pub taking_fns: FxHashMap<LocalDefId, FxHashSet<(&'a ExprLoc, Indicator)>>,
     pub span_to_expr_loc: FxHashMap<Span, &'a ExprLoc>,
     pub propagations: FxHashSet<ErrorPropagation<'a>>,
+    pub unsupported_stdout_errors: bool,
+    pub unsupported_stderr_errors: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,10 +275,18 @@ pub fn analyze<'a>(
     let mut returning_fns: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
     let mut taking_fns: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
     let mut propagations = FxHashSet::default();
+    let mut unsupported_stdout_errors = false;
+    let mut unsupported_stderr_errors = false;
 
     for (loc, res) in error_analysis.loc_results {
         let loc_id = loc_ind_map[&loc];
         if unsupported.contains(&loc_id) {
+            if origins[loc_id].contains(Origin::Stdout) {
+                unsupported_stdout_errors = true;
+            }
+            if origins[loc_id].contains(Origin::Stderr) {
+                unsupported_stderr_errors = true;
+            }
             continue;
         }
         for (func, locs) in res.tracking_fns {
@@ -289,6 +299,16 @@ pub fn analyze<'a>(
             taking_fns.entry(func).or_default().extend(locs);
         }
         propagations.extend(res.propagations);
+    }
+
+    for loc in &error_analysis.no_source_locs {
+        let loc_id = loc_ind_map[loc];
+        if origins[loc_id].contains(Origin::Stdout) {
+            unsupported_stdout_errors = true;
+        }
+        if origins[loc_id].contains(Origin::Stderr) {
+            unsupported_stderr_errors = true;
+        }
     }
 
     let fn_ptrs = analyzer.fn_ptrs;
@@ -307,6 +327,8 @@ pub fn analyze<'a>(
         taking_fns,
         span_to_expr_loc: error_analysis.span_to_loc,
         propagations,
+        unsupported_stdout_errors,
+        unsupported_stderr_errors,
     }
 }
 
