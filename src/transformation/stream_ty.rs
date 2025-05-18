@@ -46,12 +46,16 @@ impl<'tcx> LocCtx<'tcx> {
 
 pub(super) struct TypeArena<'a> {
     arena: &'a Arena<StreamType<'a>>,
+    std_write_error: bool,
 }
 
 impl<'a> TypeArena<'a> {
     #[inline]
-    pub(super) fn new(arena: &'a Arena<StreamType<'a>>) -> Self {
-        Self { arena }
+    pub(super) fn new(arena: &'a Arena<StreamType<'a>>, std_write_error: bool) -> Self {
+        Self {
+            arena,
+            std_write_error,
+        }
     }
 
     #[inline]
@@ -112,7 +116,9 @@ impl<'a> TypeArena<'a> {
             if permissions.contains(Permission::Close) && origins.contains(Origin::Pipe) {
                 traits.insert(StreamTrait::Close);
             }
-            traits.insert(StreamTrait::AsRawFd);
+            if self.std_write_error && traits.contains(StreamTrait::Write) {
+                traits.insert(StreamTrait::AsRawFd);
+            }
             let ty = self.alloc(StreamType::Impl(TraitBound(traits)));
             self.option(ty)
         } else if origins.is_empty() {
@@ -165,7 +171,9 @@ impl<'a> TypeArena<'a> {
             for p in permissions.iter() {
                 traits.insert(some_or!(StreamTrait::from_permission(p), continue));
             }
-            traits.insert(StreamTrait::AsRawFd);
+            if traits.is_empty() || self.std_write_error && traits.contains(StreamTrait::Write) {
+                traits.insert(StreamTrait::AsRawFd);
+            }
             if traits.contains(StreamTrait::BufRead) {
                 traits.remove(StreamTrait::Read);
             }
