@@ -68,11 +68,17 @@ impl TransformationResult {
         let mut m = "mod stdio {".to_string();
         m.push_str(LIB);
         for bound in &self.bounds {
+            write!(m, " pub trait {} : {}", bound.trait_name(), bound,).unwrap();
+            for other in &self.bounds {
+                if bound != other && bound.superset(other) {
+                    write!(m, " + {}", other.trait_name()).unwrap();
+                }
+            }
             write!(
                 m,
-                " pub trait {0} : {1} {{}} impl<T: {1}> {0} for T {{}}",
+                " {{}} impl<T: {}> {} for T {{}}",
+                bound,
                 bound.trait_name(),
-                bound
             )
             .unwrap();
         }
