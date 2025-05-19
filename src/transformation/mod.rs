@@ -257,6 +257,7 @@ impl Pass for Transformation {
                             let mut ctx = LocCtx::new(ty);
                             ctx.is_non_local_assign = is_static_return;
                             ctx.is_param_without_assign |= is_param_without_assign;
+                            ctx.is_recursive = hir_ctx.recursive_fns.contains(def_id);
                             (locs, ctx)
                         }
                         hir::ItemKind::Static(_, _, _) => {

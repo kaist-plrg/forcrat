@@ -416,6 +416,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     } else if let StreamType::Option(StreamType::Impl(bound)) = pot.ty {
                         self.replace_ty(&mut param.ty, ty!("Option<TT{}>", i));
                         tparams.push((i, *bound));
+                    } else if let StreamType::Option(StreamType::Ptr(StreamType::Impl(bound))) =
+                        pot.ty
+                    {
+                        self.replace_ty(&mut param.ty, ty!("Option<*mut TT{}>", i));
+                        tparams.push((i, *bound));
                     } else {
                         self.replace_ty_with_pot(&mut param.ty, pot);
                     }

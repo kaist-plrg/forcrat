@@ -28,6 +28,7 @@ pub(super) struct LocCtx<'tcx> {
     pub is_union: bool,
     pub is_non_local_assign: bool,
     pub is_param_without_assign: bool,
+    pub is_recursive: bool,
     pub ty: rustc_middle::ty::Ty<'tcx>,
 }
 
@@ -39,6 +40,7 @@ impl<'tcx> LocCtx<'tcx> {
             is_union: false,
             is_non_local_assign: false,
             is_param_without_assign: false,
+            is_recursive: false,
             ty,
         }
     }
@@ -119,7 +121,10 @@ impl<'a> TypeArena<'a> {
             if self.std_write_error && traits.contains(StreamTrait::Write) {
                 traits.insert(StreamTrait::AsRawFd);
             }
-            let ty = self.alloc(StreamType::Impl(TraitBound(traits)));
+            let mut ty = self.alloc(StreamType::Impl(TraitBound(traits)));
+            if ctx.is_recursive {
+                ty = self.ptr(ty);
+            }
             self.option(ty)
         } else if origins.is_empty() {
             let ty = if !permissions.contains(Permission::Lock) {

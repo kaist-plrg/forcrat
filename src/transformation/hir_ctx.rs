@@ -62,11 +62,12 @@ pub(super) struct HirCtx {
     pub(super) fn_ptr_arg_spans: Vec<Span>,
     /// fn def_id and param index to arg spans
     pub(super) fn_param_to_arg_spans: FxHashMap<(LocalDefId, usize), Vec<Span>>,
-
     /// callee span to expr hir_id
     pub(super) callee_span_to_hir_id: FxHashMap<Span, HirId>,
     /// call expr span to callee id
     pub(super) call_span_to_callee_id: FxHashMap<Span, LocalDefId>,
+    /// recursive functions
+    pub(super) recursive_fns: FxHashSet<LocalDefId>,
 
     /// function def_id to returned local hir_ids
     pub(super) return_locals: FxHashMap<LocalDefId, FxHashSet<Option<HirId>>>,
@@ -261,6 +262,9 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                                     .entry((def_id, i))
                                     .or_default()
                                     .push(arg.span);
+                            }
+                            if expr.hir_id.owner.def_id == def_id {
+                                self.ctx.recursive_fns.insert(def_id);
                             }
                         }
                     }
