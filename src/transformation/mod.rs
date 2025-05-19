@@ -334,6 +334,48 @@ impl Pass for Transformation {
             })
             .collect();
 
+        // is a global variable or a field assigned to this location without assigning
+        // a local variable to the variable/field in the same function
+        let mut non_local_assigns: FxHashSet<_> = FxHashSet::default();
+        loop {
+            let new_non_local_assigns: FxHashSet<_> = hir_loc_to_loc_id
+                .keys()
+                .copied()
+                .filter(|hir_loc| {
+                    hir_ctx.rhs_locs_of_lhs(*hir_loc).any(|rhs| {
+                        if non_local_assigns.contains(&rhs) {
+                            return true;
+                        }
+                        match rhs {
+                            HirLoc::Local(_) | HirLoc::Return(_) => return false,
+                            HirLoc::Global(def_id) => {
+                                let name =
+                                    compile_util::def_id_to_value_symbol(def_id, tcx).unwrap();
+                                let name = name.as_str();
+                                if name == "stdin" || name == "stdout" || name == "stderr" {
+                                    return false;
+                                }
+                            }
+                            HirLoc::Field(_, _) => {}
+                        }
+                        if matches!(rhs, HirLoc::Local(_)) {
+                            return false;
+                        }
+                        let HirLoc::Local(loc_id) = hir_loc else { return true };
+                        // to handle `test_return_old_static`-like cases
+                        !hir_ctx.rhs_locs_of_lhs(rhs).any(|rhs| {
+                            let HirLoc::Local(hir_id) = rhs else { return false };
+                            hir_id.owner == loc_id.owner
+                        })
+                    })
+                })
+                .collect();
+            if non_local_assigns == new_non_local_assigns {
+                break;
+            }
+            non_local_assigns = new_non_local_assigns;
+        }
+
         let arena = Arena::new();
         let type_arena = TypeArena::new(
             &arena,
@@ -351,32 +393,7 @@ impl Pass for Transformation {
                     continue;
                 }
 
-                let non_local_assign =
-                    // is a global variable or a field assigned to this location without assigning
-                    // a local variable to the variable/field in the same function
-                    hir_ctx.rhs_locs_of_lhs(hir_loc).any(|rhs| {
-                        match rhs {
-                            HirLoc::Local(_) | HirLoc::Return(_) => return false,
-                            HirLoc::Global(def_id) => {
-                                let name = compile_util::def_id_to_value_symbol(def_id, tcx).unwrap();
-                                let name = name.as_str();
-                                if name == "stdin" || name == "stdout" || name == "stderr" {
-                                    return false;
-                                }
-                            }
-                            HirLoc::Field(_, _) => {}
-                        }
-                        if matches!(rhs, HirLoc::Local(_)) {
-                            return false;
-                        }
-                        let HirLoc::Local(loc_id) = hir_loc else { return true };
-                        // to handle `test_return_old_static`-like cases
-                        !hir_ctx.rhs_locs_of_lhs(rhs).any(|rhs| {
-                            let HirLoc::Local(hir_id) = rhs else { return false };
-                            hir_id.owner == loc_id.owner
-                        })
-                    });
-                ctx.is_non_local_assign |= non_local_assign;
+                ctx.is_non_local_assign |= non_local_assigns.contains(&hir_loc);
 
                 if let Some(param) = hir_loc_to_param.get(&hir_loc) {
                     if !non_generic_params.contains(param) {

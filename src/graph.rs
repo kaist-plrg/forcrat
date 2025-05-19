@@ -2,6 +2,7 @@ use rustc_data_structures::{
     fx::{FxHashMap, FxHashSet},
     graph::{scc::Sccs, vec_graph::VecGraph},
 };
+use rustc_index::{bit_set::MixedBitSet, Idx, IndexVec};
 
 pub fn transitive_closure<T: Copy + Eq + std::hash::Hash>(
     graph: &FxHashMap<T, FxHashSet<T>>,
@@ -20,38 +21,33 @@ pub fn transitive_closure<T: Copy + Eq + std::hash::Hash>(
         .collect();
     let len = id_to_v.len();
 
-    let mut reachability = vec![vec![false; len]; len];
+    let mut reachability = IndexVec::from_raw(vec![MixedBitSet::new_empty(len); len]);
     for (v, succs) in graph.iter() {
         for succ in succs {
-            reachability[v_to_id[v]][v_to_id[succ]] = true;
+            reachability[v_to_id[v]].insert(v_to_id[succ]);
         }
     }
 
-    for k in 0..len {
-        for i in 0..len {
-            for j in 0..len {
-                reachability[i][j] =
-                    reachability[i][j] || (reachability[i][k] && reachability[k][j]);
-            }
-        }
-    }
+    bitset_transitive_closure(&mut reachability);
 
     let mut new_graph = FxHashMap::default();
     for (i, reachability) in reachability.iter().enumerate() {
-        let neighbors = reachability
-            .iter()
-            .enumerate()
-            .filter_map(|(to, is_reachable)| {
-                if *is_reachable {
-                    Some(id_to_v[to])
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let neighbors = reachability.iter().map(|to| id_to_v[to]).collect();
         new_graph.insert(id_to_v[i], neighbors);
     }
     new_graph
+}
+
+pub fn bitset_transitive_closure<T: Idx>(graph: &mut IndexVec<T, MixedBitSet<T>>) {
+    for k in graph.indices() {
+        for i in graph.indices() {
+            for j in graph.indices() {
+                if graph[i].contains(k) && graph[k].contains(j) {
+                    graph[i].insert(j);
+                }
+            }
+        }
+    }
 }
 
 pub fn inverse<T: Copy + Eq + std::hash::Hash>(

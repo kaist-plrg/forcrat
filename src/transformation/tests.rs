@@ -2636,6 +2636,47 @@ unsafe extern "C" fn f(mut new_stream: *mut FILE) -> *mut FILE {
     );
 }
 
+#[test]
+fn test_no_origin() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct s {
+    pub stream: *mut FILE,
+}
+pub unsafe extern "C" fn f(mut x: libc::c_int, mut s: *mut s) {
+    let mut stream: *mut FILE = if x != 0 { (*s).stream } else { stdout };
+    fputc('a' as i32, stream);
+    fputc('b' as i32, stream);
+}"#,
+        &["crate::stdio::rs_fputc"],
+        &["FILE"],
+    );
+}
+
+#[test]
+fn test_no_origin_tmp_local() {
+    run_test(
+        r#"
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct s {
+    pub stream: *mut FILE,
+}
+pub unsafe extern "C" fn f(mut x: libc::c_int, mut s: *mut s) {
+    let mut tmp: *mut FILE = (*s).stream;
+    if x - 1 as libc::c_int != 0 {
+        let mut stream: *mut FILE = if x != 0 { tmp } else { stdout };
+        fputc('a' as i32, stream);
+        fputc('b' as i32, stream);
+    }
+}"#,
+        &["crate::stdio::rs_fputc"],
+        &["FILE"],
+    );
+}
+
 const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]

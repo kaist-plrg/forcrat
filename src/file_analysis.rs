@@ -32,6 +32,7 @@ use crate::{
     compile_util::{self, Pass},
     disjoint_set::DisjointSet,
     error_analysis::{self, ErrorPropagation, ExprLoc, Indicator},
+    graph,
     likely_lit::LikelyLit,
     rustc_ast::visit::Visitor as _,
     rustc_index::bit_set::BitRelations,
@@ -218,8 +219,34 @@ pub fn analyze<'a>(
         }
     }
 
+    let mut transitive_origins = analyzer.origin_graph.edges.clone();
+    graph::bitset_transitive_closure(&mut transitive_origins);
+
     let permissions = analyzer.permission_graph.solve();
-    let origins = analyzer.origin_graph.solve();
+    let mut origins = analyzer.origin_graph.solve();
+
+    let origins_clone = origins.clone();
+    for (loc_id, origins) in origins.iter_enumerated_mut() {
+        if !origins.is_empty() {
+            continue;
+        }
+        let mut new_origins: Option<BitSet8<Origin>> = None;
+        for reachable in transitive_origins[loc_id].iter() {
+            let origins = origins_clone[reachable];
+            if origins.is_empty() {
+                continue;
+            }
+            if let Some(new_origins) = &mut new_origins {
+                new_origins.intersect(&origins);
+            } else {
+                new_origins = Some(origins);
+            }
+        }
+        if let Some(new_origins) = new_origins {
+            assert!(!new_origins.is_empty());
+            *origins = new_origins;
+        }
+    }
 
     for cycle in cycles {
         if cycle

@@ -423,6 +423,26 @@ pub(super) fn convert_expr(
                 expr
             )
         }
+        (Ptr(BufReader(File)), Option(File)) => {
+            if consume {
+                format!(
+                    "Box::leak(Box::new(({}).map(std::io::BufReader::new))).as_mut().map_or(std::ptr::null_mut(), |x| x as _)",
+                    expr
+                )
+            } else {
+                panic!()
+            }
+        }
+        (Ptr(BufWriter(File)), Option(File)) => {
+            if consume {
+                format!(
+                    "Box::leak(Box::new(({}).map(std::io::BufWriter::new))).as_mut().map_or(std::ptr::null_mut(), |x| x as _)",
+                    expr
+                )
+            } else {
+                panic!()
+            }
+        }
         (Ptr(to), Ref(from)) if to == from => {
             format!("&mut *({}) as *mut _", expr)
         }
