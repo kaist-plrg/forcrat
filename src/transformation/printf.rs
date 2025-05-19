@@ -451,15 +451,20 @@ impl Conversion {
                 Some(PtrDiff) => "u64",
                 Some(LongDouble) => panic!(),
             },
-            Self::Octal | Self::Unsigned | Self::Hexadecimal | Self::HexadecimalUpper => {
-                match length {
-                    None => "u32",
-                    Some(Char) => "u8",
-                    Some(Short) => "u16",
-                    Some(Long | LongLong | IntMax | Size | PtrDiff) => "u64",
-                    Some(LongDouble) => panic!(),
-                }
-            }
+            Self::Octal | Self::Unsigned => match length {
+                None => "u32",
+                Some(Char) => "u8",
+                Some(Short) => "u16",
+                Some(Long | LongLong | IntMax | Size | PtrDiff) => "u64",
+                Some(LongDouble) => panic!(),
+            },
+            Self::Hexadecimal | Self::HexadecimalUpper => match length {
+                None => "crate::stdio::Xu32",
+                Some(Char) => "crate::stdio::Xu8",
+                Some(Short) => "crate::stdio::Xu16",
+                Some(Long | LongLong | IntMax | Size | PtrDiff) => "crate::stdio::Xu64",
+                Some(LongDouble) => panic!(),
+            },
             Self::Double | Self::DoubleExp => match length {
                 None | Some(Long) => "f64",
                 Some(LongDouble) => "f128::f128",

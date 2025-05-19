@@ -1266,19 +1266,19 @@ pub unsafe fn rs_vfprintf<W: std::io::Write>(
                 (Conversion::Unsigned, Some(LengthMod::LongDouble)) => panic!(),
                 (Conversion::Hexadecimal, None) => {
                     let v = args.arg::<u32>();
-                    if std::fmt::LowerHex::fmt(&v, &mut fmt).is_err() {
+                    if std::fmt::LowerHex::fmt(&Xu32(v), &mut fmt).is_err() {
                         return (-1, 1);
                     }
                 }
                 (Conversion::Hexadecimal, Some(LengthMod::Char)) => {
                     let v = args.arg::<u8>();
-                    if std::fmt::LowerHex::fmt(&v, &mut fmt).is_err() {
+                    if std::fmt::LowerHex::fmt(&Xu8(v), &mut fmt).is_err() {
                         return (-1, 1);
                     }
                 }
                 (Conversion::Hexadecimal, Some(LengthMod::Short)) => {
                     let v = args.arg::<u16>();
-                    if std::fmt::LowerHex::fmt(&v, &mut fmt).is_err() {
+                    if std::fmt::LowerHex::fmt(&Xu16(v), &mut fmt).is_err() {
                         return (-1, 1);
                     }
                 }
@@ -1293,26 +1293,26 @@ pub unsafe fn rs_vfprintf<W: std::io::Write>(
                     ),
                 ) => {
                     let v = args.arg::<u64>();
-                    if std::fmt::LowerHex::fmt(&v, &mut fmt).is_err() {
+                    if std::fmt::LowerHex::fmt(&Xu64(v), &mut fmt).is_err() {
                         return (-1, 1);
                     }
                 }
                 (Conversion::Hexadecimal, Some(LengthMod::LongDouble)) => panic!(),
                 (Conversion::HexadecimalUpper, None) => {
                     let v = args.arg::<u32>();
-                    if std::fmt::UpperHex::fmt(&v, &mut fmt).is_err() {
+                    if std::fmt::UpperHex::fmt(&Xu32(v), &mut fmt).is_err() {
                         return (-1, 1);
                     }
                 }
                 (Conversion::HexadecimalUpper, Some(LengthMod::Char)) => {
                     let v = args.arg::<u8>();
-                    if std::fmt::UpperHex::fmt(&v, &mut fmt).is_err() {
+                    if std::fmt::UpperHex::fmt(&Xu8(v), &mut fmt).is_err() {
                         return (-1, 1);
                     }
                 }
                 (Conversion::HexadecimalUpper, Some(LengthMod::Short)) => {
                     let v = args.arg::<u16>();
-                    if std::fmt::UpperHex::fmt(&v, &mut fmt).is_err() {
+                    if std::fmt::UpperHex::fmt(&Xu16(v), &mut fmt).is_err() {
                         return (-1, 1);
                     }
                 }
@@ -1327,7 +1327,7 @@ pub unsafe fn rs_vfprintf<W: std::io::Write>(
                     ),
                 ) => {
                     let v = args.arg::<u64>();
-                    if std::fmt::UpperHex::fmt(&v, &mut fmt).is_err() {
+                    if std::fmt::UpperHex::fmt(&Xu64(v), &mut fmt).is_err() {
                         return (-1, 1);
                     }
                 }
@@ -1605,6 +1605,82 @@ impl Conversion {
             b'S' => Some(Self::S),
             b'%' => Some(Self::Percent),
             _ => None,
+        }
+    }
+}
+pub struct Xu8(pub u8);
+impl std::fmt::LowerHex for Xu8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+}
+impl std::fmt::UpperHex for Xu8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::UpperHex::fmt(&self.0, f)
+        }
+    }
+}
+pub struct Xu16(pub u16);
+impl std::fmt::LowerHex for Xu16 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+}
+impl std::fmt::UpperHex for Xu16 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::UpperHex::fmt(&self.0, f)
+        }
+    }
+}
+pub struct Xu32(pub u32);
+impl std::fmt::LowerHex for Xu32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+}
+impl std::fmt::UpperHex for Xu32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::UpperHex::fmt(&self.0, f)
+        }
+    }
+}
+pub struct Xu64(pub u64);
+impl std::fmt::LowerHex for Xu64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::LowerHex::fmt(&self.0, f)
+        }
+    }
+}
+impl std::fmt::UpperHex for Xu64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() && self.0 == 0 && f.precision().unwrap_or_default() == 0 {
+            f.write_str("0")
+        } else {
+            std::fmt::UpperHex::fmt(&self.0, f)
         }
     }
 }
