@@ -122,7 +122,7 @@ impl<'a> TypeArena<'a> {
                 traits.insert(StreamTrait::AsRawFd);
             }
             let mut ty = self.alloc(StreamType::Impl(TraitBound(traits)));
-            if ctx.is_recursive {
+            if ctx.is_recursive && !permissions.contains(Permission::Close) {
                 ty = self.ptr(ty);
             }
             self.option(ty)
@@ -564,7 +564,7 @@ pub(super) fn convert_expr(
             format!("&mut *({}) as *mut _", expr)
         }
         (
-            Ptr(Dyn(_)),
+            Ptr(Impl(_) | Dyn(_)),
             Ptr(File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_)),
         ) => {
             format!("&mut *({}) as *mut _", expr)

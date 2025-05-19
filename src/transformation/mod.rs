@@ -120,7 +120,7 @@ impl Pass for Transformation {
             ctx: HirCtx::default(),
         };
         tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
-        let hir_ctx = hir_visitor.ctx;
+        let mut hir_ctx = hir_visitor.ctx;
         let return_locals: FxHashMap<_, _> = hir_ctx
             .return_locals
             .iter()
@@ -198,6 +198,23 @@ impl Pass for Transformation {
             .filter_map(|span| hir_ctx.bound_span_to_loc.get(span))
             .collect();
 
+        let callers: FxHashSet<_> = hir_ctx.call_graph.keys().copied().collect();
+        for callees in hir_ctx.call_graph.values_mut() {
+            callees.retain(|f| callers.contains(f));
+        }
+        let (_, sccs) = graph::compute_sccs(&hir_ctx.call_graph);
+        let mut recursive_fns = FxHashSet::default();
+        for fns in sccs.values() {
+            if fns.len() == 1 {
+                let f = fns.iter().next().unwrap();
+                if hir_ctx.call_graph[f].contains(f) {
+                    recursive_fns.insert(*f);
+                }
+            } else {
+                recursive_fns.extend(fns.iter().copied());
+            }
+        }
+
         let mut param_to_hir_loc = FxHashMap::default();
         let mut hir_loc_to_param = FxHashMap::default();
         let mut non_generic_params = FxHashSet::default();
@@ -257,7 +274,7 @@ impl Pass for Transformation {
                             let mut ctx = LocCtx::new(ty);
                             ctx.is_non_local_assign = is_static_return;
                             ctx.is_param_without_assign |= is_param_without_assign;
-                            ctx.is_recursive = hir_ctx.recursive_fns.contains(def_id);
+                            ctx.is_recursive = recursive_fns.contains(def_id);
                             (locs, ctx)
                         }
                         hir::ItemKind::Static(_, _, _) => {

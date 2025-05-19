@@ -66,8 +66,8 @@ pub(super) struct HirCtx {
     pub(super) callee_span_to_hir_id: FxHashMap<Span, HirId>,
     /// call expr span to callee id
     pub(super) call_span_to_callee_id: FxHashMap<Span, LocalDefId>,
-    /// recursive functions
-    pub(super) recursive_fns: FxHashSet<LocalDefId>,
+    /// caller to callees
+    pub(super) call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
 
     /// function def_id to returned local hir_ids
     pub(super) return_locals: FxHashMap<LocalDefId, FxHashSet<Option<HirId>>>,
@@ -263,9 +263,11 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                                     .or_default()
                                     .push(arg.span);
                             }
-                            if expr.hir_id.owner.def_id == def_id {
-                                self.ctx.recursive_fns.insert(def_id);
-                            }
+                            self.ctx
+                                .call_graph
+                                .entry(expr.hir_id.owner.def_id)
+                                .or_default()
+                                .insert(def_id);
                         }
                     }
                     let name = path.segments.last().unwrap().ident.name;

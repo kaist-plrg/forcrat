@@ -1883,7 +1883,9 @@ if !c.is_ascii_whitespace() {
                     arg
                 )
                 .unwrap(),
-                "crate::stdio::Gf64" => write!(args, "crate::stdio::Gf64({} as _), ", arg).unwrap(),
+                "crate::stdio::Gf64" => {
+                    write!(args, "crate::stdio::Gf64(({}) as _), ", arg).unwrap()
+                }
                 _ => write!(args, "({}) as {}, ", arg, cast).unwrap(),
             }
         }

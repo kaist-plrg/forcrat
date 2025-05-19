@@ -1,4 +1,7 @@
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::{
+    fx::{FxHashMap, FxHashSet},
+    graph::{scc::Sccs, vec_graph::VecGraph},
+};
 
 pub fn transitive_closure<T: Copy + Eq + std::hash::Hash>(
     graph: &FxHashMap<T, FxHashSet<T>>,
@@ -64,4 +67,47 @@ pub fn inverse<T: Copy + Eq + std::hash::Hash>(
         }
     }
     inv
+}
+
+pub fn compute_sccs<T: Copy + Eq + std::hash::Hash>(
+    map: &FxHashMap<T, FxHashSet<T>>,
+) -> (
+    FxHashMap<SccId, FxHashSet<SccId>>,
+    FxHashMap<SccId, FxHashSet<T>>,
+) {
+    let id_map: FxHashMap<_, _> = map.keys().enumerate().map(|(i, f)| (i, *f)).collect();
+    let inv_id_map: FxHashMap<_, _> = id_map.iter().map(|(i, f)| (*f, *i)).collect();
+    let edges = map
+        .iter()
+        .flat_map(|(node, succs)| {
+            succs.iter().map(|succ| {
+                (
+                    SccId::from_usize(*inv_id_map.get(node).unwrap()),
+                    SccId::from_usize(*inv_id_map.get(succ).unwrap()),
+                )
+            })
+        })
+        .collect();
+    let vec_graph: VecGraph<SccId> = VecGraph::new(map.len(), edges);
+    let sccs: Sccs<SccId, SccId> = Sccs::new(&vec_graph);
+
+    let component_graph: FxHashMap<_, _> = sccs
+        .all_sccs()
+        .map(|node| (node, sccs.successors(node).iter().copied().collect()))
+        .collect();
+
+    let mut component_elems: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+    for i in 0..(map.len()) {
+        let scc = sccs.scc(SccId::from_usize(i));
+        let node = id_map[&i];
+        component_elems.entry(scc).or_default().insert(node);
+    }
+
+    (component_graph, component_elems)
+}
+
+rustc_index::newtype_index! {
+    #[orderable]
+    #[debug_format = "Scc{}"]
+    pub struct SccId {}
 }
