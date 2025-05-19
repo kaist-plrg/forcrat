@@ -219,8 +219,7 @@ pub fn analyze<'a>(
         }
     }
 
-    let mut transitive_origins = analyzer.origin_graph.edges.clone();
-    graph::bitset_transitive_closure(&mut transitive_origins);
+    let origin_edges = analyzer.origin_graph.edges.clone();
 
     let permissions = analyzer.permission_graph.solve();
     let mut origins = analyzer.origin_graph.solve();
@@ -231,7 +230,7 @@ pub fn analyze<'a>(
             continue;
         }
         let mut new_origins: Option<BitSet8<Origin>> = None;
-        for reachable in transitive_origins[loc_id].iter() {
+        for reachable in graph::bitset_reachable_vertices(&origin_edges, loc_id).iter() {
             let origins = origins_clone[reachable];
             if origins.is_empty() {
                 continue;

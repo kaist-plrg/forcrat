@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use rustc_data_structures::{
     fx::{FxHashMap, FxHashSet},
     graph::{scc::Sccs, vec_graph::VecGraph},
@@ -48,6 +50,23 @@ pub fn bitset_transitive_closure<T: Idx>(graph: &mut IndexVec<T, MixedBitSet<T>>
             }
         }
     }
+}
+
+pub fn bitset_reachable_vertices<T: Idx>(
+    graph: &IndexVec<T, MixedBitSet<T>>,
+    v: T,
+) -> MixedBitSet<T> {
+    let mut visited = MixedBitSet::new_empty(graph.len());
+    let mut worklist = VecDeque::new();
+    worklist.push_back(v);
+    while let Some(u) = worklist.pop_front() {
+        if visited.insert(u) {
+            for w in graph[u].iter() {
+                worklist.push_back(w);
+            }
+        }
+    }
+    visited
 }
 
 pub fn inverse<T: Copy + Eq + std::hash::Hash>(
