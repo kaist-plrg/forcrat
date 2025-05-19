@@ -1861,7 +1861,7 @@ if !c.is_ascii_whitespace() {
             match cast {
                 "&str" => write!(
                     args,
-                    "std::ffi::CStr::from_ptr(({}) as _).to_str().unwrap(), ",
+                    "std::ffi::CStr::from_ptr(({}) as _).to_string_lossy(), ",
                     arg
                 )
                 .unwrap(),
