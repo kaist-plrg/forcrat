@@ -389,13 +389,20 @@ pub(super) fn convert_expr(
 ) -> String {
     tracing::info!("{} := {} // {}", to, from, consume);
     use StreamType::*;
-    if to == from && (consume || from.is_copyable()) && (!is_non_local || !matches!(to, Option(_)))
+    if to == from && (from.is_copyable() || consume && (!is_non_local || !matches!(to, Option(_))))
     {
         return expr.to_string();
     }
     match (to, from) {
         (Option(to), Option(from)) => {
-            if consume {
+            if from.is_copyable() {
+                let body = convert_expr(*to, *from, "x", true, false);
+                if to.contains_impl() {
+                    format!("({}).map(|mut x| {})", expr, body)
+                } else {
+                    format!("({}).map::<{}, _>(|mut x| {})", expr, to, body)
+                }
+            } else if consume {
                 let body = convert_expr(*to, *from, "x", true, false);
                 if is_non_local {
                     if to.contains_impl() {
@@ -404,13 +411,6 @@ pub(super) fn convert_expr(
                         format!("({}).take().map::<{}, _>(|mut x| {})", expr, to, body)
                     }
                 } else if to.contains_impl() {
-                    format!("({}).map(|mut x| {})", expr, body)
-                } else {
-                    format!("({}).map::<{}, _>(|mut x| {})", expr, to, body)
-                }
-            } else if from.is_copyable() {
-                let body = convert_expr(*to, *from, "x", true, false);
-                if to.contains_impl() {
                     format!("({}).map(|mut x| {})", expr, body)
                 } else {
                     format!("({}).map::<{}, _>(|mut x| {})", expr, to, body)
