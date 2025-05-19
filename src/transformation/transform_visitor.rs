@@ -1861,7 +1861,14 @@ if !c.is_ascii_whitespace() {
             match cast {
                 "&str" => write!(
                     args,
-                    "std::ffi::CStr::from_ptr(({}) as _).to_string_lossy(), ",
+                    "{{
+    let ___s = std::ffi::CStr::from_ptr(({}) as _);
+    if let Ok(___s) = ___s.to_str() {{
+        ___s.to_string()
+    }} else {{
+        ___s.to_bytes().iter().map(|&b| b as char).collect()
+    }}
+}}, ",
                     arg
                 )
                 .unwrap(),
@@ -2157,7 +2164,7 @@ if !c.is_ascii_whitespace() {
                     stream, rs_name
                 )
                 .unwrap();
-                write_args(&mut new_expr, before_args, "std::io::stdout()", after_args);
+                write_args(&mut new_expr, before_args, "std::io::stderr()", after_args);
                 new_expr.push_str("); crate::stdio::STDERR_ERROR = ___error; ___v } else ");
             } else {
                 write!(
