@@ -113,6 +113,18 @@ impl Pass for Transformation {
             .iter()
             .map(|(def_id, set)| (*def_id, set.iter().copied().collect()))
             .collect();
+        let tracked_locs: FxHashSet<_> = analysis_res
+            .tracking_fns
+            .values()
+            .flatten()
+            .map(|(loc, _)| *loc)
+            .collect();
+        let tracked_locs: Vec<_> = tracked_locs.into_iter().collect();
+        let tracked_loc_to_index: FxHashMap<_, _> = tracked_locs
+            .iter()
+            .enumerate()
+            .map(|(i, loc)| (*loc, i))
+            .collect();
 
         // collect information from HIR
         let mut hir_visitor = HirVisitor {
@@ -537,6 +549,7 @@ impl Pass for Transformation {
 
                 error_returning_fns: &error_returning_fns,
                 error_taking_fns: &error_taking_fns,
+                tracked_loc_to_index: &tracked_loc_to_index,
 
                 hir_loc_to_loc_id: &hir_loc_to_loc_id,
 

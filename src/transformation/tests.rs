@@ -1177,7 +1177,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &["crate::stdio::rs_fgetc", "stream_error ="],
+        &["crate::stdio::rs_fgetc", "_error ="],
         &["FILE", "ferror"],
     );
 }
@@ -1197,7 +1197,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &["crate::stdio::rs_fgetc", "stream_eof ="],
+        &["crate::stdio::rs_fgetc", "_eof ="],
         &["FILE", "feof"],
     );
 }
@@ -1223,11 +1223,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &[
-            "crate::stdio::rs_fgetc",
-            "stream_error =",
-            "return stream_error",
-        ],
+        &["crate::stdio::rs_fgetc", "_error ="],
         &["FILE", "ferror"],
     );
 }
@@ -1256,7 +1252,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &["crate::stdio::rs_fgetc", "stream_error =", "stream_eof ="],
+        &["crate::stdio::rs_fgetc", "_error =", "_eof ="],
         &["FILE", "ferror", "feof"],
     );
 }
@@ -1288,7 +1284,7 @@ unsafe fn f() {
     }
     fclose(stream);
 }"#,
-        &["crate::stdio::rs_fgetc", "stream_error =", "stream_eof ="],
+        &["crate::stdio::rs_fgetc", "_error =", "_eof ="],
         &["FILE", "ferror", "feof"],
     );
 }
@@ -1311,11 +1307,7 @@ unsafe fn f() {
     g(stream);
     fclose(stream);
 }"#,
-        &[
-            "crate::stdio::rs_fgetc",
-            "stream_error =",
-            "stream_error: i32",
-        ],
+        &["crate::stdio::rs_fgetc", "_error =", "_error: i32"],
         &["FILE", "ferror"],
     );
 }
@@ -1342,10 +1334,10 @@ unsafe fn f() {
 }"#,
         &[
             "crate::stdio::rs_fgetc",
-            "stream_error =",
-            "stream_eof =",
-            "stream_error: i32",
-            "stream_eof: i32",
+            "_error =",
+            "_eof =",
+            "_error: i32",
+            "_eof: i32",
         ],
         &["FILE", "ferror", "feof"],
     );

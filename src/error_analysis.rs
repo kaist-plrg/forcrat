@@ -701,6 +701,12 @@ impl<'tcx> Visitor<'tcx> for HirVisitor<'_, 'tcx> {
                     .or_default()
                     .insert(curr_fn);
             }
+            ExprKind::Assign(lhs, _, _) => {
+                let loc = expr_to_path(lhs, self.tcx).map(|loc| &*self.arena.alloc(loc));
+                if let Some(loc) = loc {
+                    self.ctx.span_to_loc.insert(lhs.span, loc);
+                }
+            }
             ExprKind::Path(QPath::Resolved(_, path)) => {
                 let Res::Def(DefKind::Fn, def_id) = path.res else { return };
                 let def_id = some_or!(def_id.as_local(), return);

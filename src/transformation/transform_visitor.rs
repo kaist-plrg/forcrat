@@ -40,6 +40,7 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
 
     pub(super) error_returning_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,
     pub(super) error_taking_fns: &'a FxHashMap<LocalDefId, Vec<(&'a ExprLoc, Indicator)>>,
+    pub(super) tracked_loc_to_index: &'a FxHashMap<&'a ExprLoc, usize>,
 
     pub(super) hir_loc_to_loc_id: &'a FxHashMap<HirLoc, LocId>,
 
@@ -463,7 +464,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 if i != 0 {
                                     rv.push_str(", ");
                                 }
-                                write!(rv, "{}_{}", loc, indicator).unwrap();
+                                let ind = self.tracked_loc_to_index[loc];
+                                write!(rv, "___v_{}_{}", ind, indicator).unwrap();
                             }
                             if returns.len() != 1 {
                                 rv = format!("({})", rv);
@@ -477,7 +479,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
                 if let Some(params) = self.error_taking_fns.get(&def_id) {
                     for (loc, indicator) in params {
-                        let param = param!("mut {}_{}: i32", loc, indicator);
+                        let ind = self.tracked_loc_to_index[loc];
+                        let param = param!("mut ___v_{}_{}: i32", ind, indicator);
                         item.sig.decl.inputs.push(param);
                         self.updated = true;
                     }
@@ -497,7 +500,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             continue;
                         }
                         let (loc, indicator) = var;
-                        let stmt = stmt!("let mut {}_{} = 0;", loc, indicator);
+                        let ind = self.tracked_loc_to_index[loc];
+                        let stmt = stmt!("let mut ___v_{}_{} = 0;", ind, indicator);
                         stmts.insert(0, stmt);
                     }
                 }
@@ -732,7 +736,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 return;
                             }
                             let name = self.analysis_res.span_to_expr_loc[&args[0].span];
-                            let new_expr = expr!("{}_eof", name);
+                            let ind = self.tracked_loc_to_index[&name];
+                            let new_expr = expr!("___v_{}_eof", ind);
                             self.replace_expr(expr, new_expr);
                         }
                         "ferror" => {
@@ -746,7 +751,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 return;
                             }
                             let name = self.analysis_res.span_to_expr_loc[&args[0].span];
-                            let new_expr = expr!("{}_error", name);
+                            let ind = self.tracked_loc_to_index[&name];
+                            let new_expr = expr!("___v_{}_error", ind);
                             self.replace_expr(expr, new_expr);
                         }
                         "clearerr" => {
@@ -754,7 +760,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 return;
                             }
                             let ic = self.indicator_check(&args[0]);
-                            let new_expr = expr!("{}", ic.clear());
+                            let new_expr = expr!("{}", self.clear(ic));
                             self.replace_expr(expr, new_expr);
                         }
                         "fprintf" => {
@@ -1103,7 +1109,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                                 )
                                         })
                                         .unwrap();
-                                    let arg = expr!("{}_{}", loc, indicator);
+                                    let ind = self.tracked_loc_to_index[loc];
+                                    let arg = expr!("___v_{}_{}", ind, indicator);
                                     args.push(P(arg));
                                     self.updated = true;
                                 }
@@ -1134,11 +1141,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 let curr = self.current_fn();
                                 if let Some(trackings) = self.analysis_res.tracking_fns.get(&curr) {
                                     for (loc0, i0) in trackings {
+                                        let ind = self.tracked_loc_to_index[loc0];
                                         for (i, (loc1, i1)) in returns.iter().enumerate() {
                                             if i0 == i1
                                                 && self.can_propagate(curr, loc0, *def_id, loc1)
                                             {
-                                                write!(assigns, "{}_{} = ___v{};", loc0, i0, i)
+                                                write!(assigns, "___v_{}_{} = ___v{};", ind, i0, i)
                                                     .unwrap();
                                             }
                                         }
@@ -1203,6 +1211,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             ExprKind::Assign(lhs, rhs, _) => {
                 let lhs_pot = some_or!(self.bound_expr_pot(lhs), return);
                 self.convert_rhs(rhs, lhs_pot, true);
+
+                let ic = self.indicator_check(lhs);
+                let s = self.clear(ic);
+                if s != "()" {
+                    let expr_str = pprust::expr_to_string(expr);
+                    let new_expr = expr!("{{ {}; {} }}", s, expr_str);
+                    self.replace_expr(expr, new_expr);
+                }
             }
             ExprKind::Struct(se) => {
                 for f in se.fields.iter_mut() {
@@ -1226,7 +1242,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         if !new_v.is_empty() {
                             new_v.push_str(", ");
                         }
-                        write!(new_v, "{}_{}", loc, i).unwrap();
+                        let ind = self.tracked_loc_to_index[loc];
+                        write!(new_v, "___v_{}_{}", ind, i).unwrap();
                     }
                     let new_expr = expr!("return ({})", new_v);
                     self.replace_expr(expr, new_expr);
@@ -1573,7 +1590,7 @@ impl TransformVisitor<'_, '_> {
         ic: IndicatorCheck<'_>,
     ) -> Expr {
         let stream = stream.borrow_for(StreamTrait::BufRead);
-        let handling = ic.error_handling();
+        let handling = self.error_handling(ic);
         let fmt = LikelyLit::from_expr(fmt);
         match fmt {
             LikelyLit::Lit(fmt) => {
@@ -1707,7 +1724,7 @@ if !c.is_ascii_whitespace() {
     #[inline]
     fn transform_fgetc<S: StreamExpr>(&self, stream: &S, ic: IndicatorCheck<'_>) -> Expr {
         let stream_str = stream.borrow_for(StreamTrait::Read);
-        ic.update_error(format!("crate::stdio::rs_fgetc({})", stream_str))
+        self.update_error(ic, format!("crate::stdio::rs_fgetc({})", stream_str))
     }
 
     #[inline]
@@ -1721,10 +1738,10 @@ if !c.is_ascii_whitespace() {
         let stream_str = stream.borrow_for(StreamTrait::BufRead);
         let s = pprust::expr_to_string(s);
         let n = pprust::expr_to_string(n);
-        ic.update_error(format!(
-            "crate::stdio::rs_fgets({}, {}, {})",
-            s, n, stream_str
-        ))
+        self.update_error(
+            ic,
+            format!("crate::stdio::rs_fgets({}, {}, {})", s, n, stream_str),
+        )
     }
 
     #[inline]
@@ -1740,10 +1757,13 @@ if !c.is_ascii_whitespace() {
         let lineptr = pprust::expr_to_string(lineptr);
         let n = pprust::expr_to_string(n);
         let delimiter = pprust::expr_to_string(delimiter);
-        ic.update_error(format!(
-            "crate::stdio::rs_getdelim({}, {}, {}, {})",
-            lineptr, n, delimiter, stream_str
-        ))
+        self.update_error(
+            ic,
+            format!(
+                "crate::stdio::rs_getdelim({}, {}, {}, {})",
+                lineptr, n, delimiter, stream_str
+            ),
+        )
     }
 
     #[inline]
@@ -1757,10 +1777,13 @@ if !c.is_ascii_whitespace() {
         let stream_str = stream.borrow_for(StreamTrait::BufRead);
         let lineptr = pprust::expr_to_string(lineptr);
         let n = pprust::expr_to_string(n);
-        ic.update_error(format!(
-            "crate::stdio::rs_getline({}, {}, {})",
-            lineptr, n, stream_str
-        ))
+        self.update_error(
+            ic,
+            format!(
+                "crate::stdio::rs_getline({}, {}, {})",
+                lineptr, n, stream_str
+            ),
+        )
     }
 
     #[inline]
@@ -1776,10 +1799,13 @@ if !c.is_ascii_whitespace() {
         let ptr = pprust::expr_to_string(ptr);
         let size = pprust::expr_to_string(size);
         let nitems = pprust::expr_to_string(nitems);
-        ic.update_error(format!(
-            "crate::stdio::rs_fread({}, {}, {}, {})",
-            ptr, size, nitems, stream_str
-        ))
+        self.update_error(
+            ic,
+            format!(
+                "crate::stdio::rs_fread({}, {}, {}, {})",
+                ptr, size, nitems, stream_str
+            ),
+        )
     }
 
     fn transform_fprintf<S: StreamExpr, E: Deref<Target = Expr>>(
@@ -2227,6 +2253,90 @@ if !c.is_ascii_whitespace() {
         Some(expr!("{}", new_expr))
     }
 
+    fn error_handling(&self, ic: IndicatorCheck<'_>) -> String {
+        match (ic.eof, ic.error) {
+            (true, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!(
+                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{
+    ___v_{0}_eof = 1;
+}} else {{
+    ___v_{0}_error = 1;
+}}",
+                    ind,
+                )
+            }
+            (true, false) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!(
+                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{ ___v_{}_eof = 1; }}",
+                    ind,
+                )
+            }
+            (false, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!(
+                    "if e.kind() != std::io::ErrorKind::UnexpectedEof {{ ___v_{}_error = 1; }}",
+                    ind,
+                )
+            }
+            (false, false) => "".to_string(),
+        }
+    }
+
+    fn update_error(&self, ic: IndicatorCheck<'_>, e: String) -> Expr {
+        match (ic.eof, ic.error) {
+            (true, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                expr!(
+                    "{{
+    let (___v, ___error, ___eof) = {};
+    ___v_{1}_eof = ___eof;
+    ___v_{1}_error = ___error;
+    ___v
+}}",
+                    e,
+                    ind,
+                )
+            }
+            (true, false) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                expr!(
+                    "{{ let (___v, _, ___eof) = {}; ___v_{}_eof = ___eof; ___v }}",
+                    e,
+                    ind,
+                )
+            }
+            (false, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                expr!(
+                    "{{ let (___v, ___error, _) = {}; ___v_{}_error = ___error; ___v }}",
+                    e,
+                    ind,
+                )
+            }
+            (false, false) => expr!("{}.0", e),
+        }
+    }
+
+    fn clear(&self, ic: IndicatorCheck<'_>) -> String {
+        match (ic.eof, ic.error) {
+            (true, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("{{ ___v_{0}_eof = 0; ___v_{0}_error = 0; }}", ind)
+            }
+            (true, false) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("{{ ___v_{}_eof = 0; }}", ind)
+            }
+            (false, true) => {
+                let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+                format!("{{ ___v_{}_error = 0; }}", ind)
+            }
+            (false, false) => "()".to_string(),
+        }
+    }
+
     fn error_handling_no_eof<S: StreamExpr>(&self, ic: IndicatorCheck<'_>, stream: &S) -> String {
         let mut update = String::new();
         let ty = stream.ty();
@@ -2258,7 +2368,8 @@ if !c.is_ascii_whitespace() {
             update.push('}');
         }
         if ic.error {
-            write!(update, "{}_error = 1;", ic.name.unwrap()).unwrap();
+            let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+            write!(update, "___v_{}_error = 1;", ind).unwrap();
         }
         update
     }
@@ -2299,7 +2410,8 @@ if !c.is_ascii_whitespace() {
             update.push('}');
         }
         if ic.error {
-            write!(update, "{}_error = ___error;", ic.name.unwrap()).unwrap();
+            let ind = self.tracked_loc_to_index[ic.name.unwrap()];
+            write!(update, "___v_{}_error = ___error;", ind).unwrap();
         }
         if update.is_empty() {
             expr!("{}.0", e)
@@ -2376,72 +2488,6 @@ struct IndicatorCheck<'a> {
     name: Option<&'a ExprLoc>,
     eof: bool,
     error: bool,
-}
-
-impl IndicatorCheck<'_> {
-    fn error_handling(&self) -> String {
-        match (self.eof, self.error) {
-            (true, true) => {
-                format!(
-                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{
-    {0}_eof = 1;
-}} else {{
-    {0}_error = 1;
-}}",
-                    self.name.unwrap()
-                )
-            }
-            (true, false) => {
-                format!(
-                    "if e.kind() == std::io::ErrorKind::UnexpectedEof {{ {}_eof = 1; }}",
-                    self.name.unwrap()
-                )
-            }
-            (false, true) => {
-                format!(
-                    "if e.kind() != std::io::ErrorKind::UnexpectedEof {{ {}_error = 1; }}",
-                    self.name.unwrap()
-                )
-            }
-            (false, false) => "".to_string(),
-        }
-    }
-
-    fn update_error(&self, e: String) -> Expr {
-        match (self.eof, self.error) {
-            (true, true) => {
-                expr!(
-                    "{{ let (___v, ___error, ___eof) = {}; {1}_eof = ___eof; {1}_error = ___error; ___v }}",
-                    e,
-                    self.name.unwrap()
-                )
-            }
-            (true, false) => {
-                expr!(
-                    "{{ let (___v, _, ___eof) = {}; {}_eof = ___eof; ___v }}",
-                    e,
-                    self.name.unwrap()
-                )
-            }
-            (false, true) => {
-                expr!(
-                    "{{ let (___v, ___error, _) = {}; {}_error = ___error; ___v }}",
-                    e,
-                    self.name.unwrap()
-                )
-            }
-            (false, false) => expr!("{}.0", e),
-        }
-    }
-
-    fn clear(&self) -> String {
-        match (self.eof, self.error) {
-            (true, true) => format!("{{ {0}_eof = 0; {0}_error = 0; }}", self.name.unwrap()),
-            (true, false) => format!("{{ {}_eof = 0; }}", self.name.unwrap()),
-            (false, true) => format!("{{ {}_error = 0; }}", self.name.unwrap()),
-            (false, false) => "()".to_string(),
-        }
-    }
 }
 
 fn is_popen_read(arg: &LikelyLit<'_>) -> Option<bool> {
