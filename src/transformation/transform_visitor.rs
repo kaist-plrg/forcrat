@@ -1879,10 +1879,11 @@ if !c.is_ascii_whitespace() {
         s.push(std::char::from_u32(i).unwrap());
         p = p.offset(4);
     }}
-}}",
+}}, ",
                     arg
                 )
                 .unwrap(),
+                "crate::stdio::Gf64" => write!(args, "crate::stdio::Gf64({} as _), ", arg).unwrap(),
                 _ => write!(args, "({}) as {}, ", arg, cast).unwrap(),
             }
         }

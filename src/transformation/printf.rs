@@ -84,10 +84,7 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
                     }
                 }
                 Conversion::DoubleExp => fmt.push('e'),
-                Conversion::DoubleAuto => {
-                    println!("DoubleAuto");
-                    // TODO
-                }
+                Conversion::DoubleAuto => {}
                 Conversion::DoubleError => todo!(),
                 Conversion::Pointer => fmt.push_str("#x"),
                 Conversion::Num | Conversion::C | Conversion::S => unimplemented!(),
@@ -463,11 +460,16 @@ impl Conversion {
                     Some(LongDouble) => panic!(),
                 }
             }
-            Self::Double | Self::DoubleExp | Self::DoubleAuto | Self::DoubleError => match length {
+            Self::Double | Self::DoubleExp => match length {
                 None | Some(Long) => "f64",
                 Some(LongDouble) => "f128::f128",
                 _ => panic!(),
             },
+            Self::DoubleAuto => match length {
+                None | Some(Long) => "crate::stdio::Gf64",
+                _ => panic!(),
+            },
+            Self::DoubleError => panic!(),
             Self::Char => "u8 as char",
             Self::Str => match length {
                 None => "&str",
@@ -475,7 +477,7 @@ impl Conversion {
                 _ => panic!(),
             },
             Self::Pointer => "usize",
-            Self::C | Self::S => unimplemented!(),
+            Self::C | Self::S => panic!(),
             Self::Num | Self::Percent => return None,
         };
         Some(t)
