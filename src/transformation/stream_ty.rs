@@ -378,6 +378,20 @@ impl StreamType<'_> {
             | Self::ManuallyDrop(t) => t.may_std(),
         }
     }
+
+    pub(super) fn must_std(self) -> bool {
+        match self {
+            Self::File | Self::Child | Self::Dyn(_) | Self::Impl(_) => false,
+            Self::Stdin | Self::Stdout | Self::Stderr => true,
+            Self::BufWriter(t)
+            | Self::BufReader(t)
+            | Self::Option(t)
+            | Self::Ptr(t)
+            | Self::Ref(t)
+            | Self::Box(t)
+            | Self::ManuallyDrop(t) => t.must_std(),
+        }
+    }
 }
 
 pub(super) fn convert_expr(

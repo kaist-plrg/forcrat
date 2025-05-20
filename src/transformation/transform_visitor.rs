@@ -230,11 +230,14 @@ impl<'a> TransformVisitor<'_, 'a> {
         )
     }
 
-    fn convert_rhs(&mut self, rhs: &mut Expr, lhs_pot: Pot<'_>, consume: bool) {
+    fn convert_rhs(&mut self, rhs: &mut Expr, lhs_pot: Pot<'_>) {
+        let mut consume = lhs_pot.permissions.contains(Permission::Close)
+            || matches!(rhs.kind, ExprKind::Call(_, _) | ExprKind::MethodCall(_));
         let rhs_span = rhs.span;
         let is_non_local = self.is_non_local(rhs_span);
         if let Some(rhs_pot) = self.bound_expr_pot(rhs) {
             let rhs_str = pprust::expr_to_string(rhs);
+            consume |= rhs_pot.ty.must_std();
             let new_rhs = convert_expr(*lhs_pot.ty, *rhs_pot.ty, &rhs_str, consume, is_non_local);
             let new_rhs = expr!("{}", new_rhs);
             self.replace_expr(rhs, new_rhs);
@@ -248,6 +251,7 @@ impl<'a> TransformVisitor<'_, 'a> {
                 "popen" => StreamType::Option(&CHILD_TY),
                 _ => *self.return_pot(*def_id).unwrap().ty,
             };
+            consume |= rhs_ty.must_std();
             let new_rhs = convert_expr(*lhs_pot.ty, rhs_ty, &rhs_str, consume, is_non_local);
             let new_rhs = expr!("{}", new_rhs);
             self.replace_expr(rhs, new_rhs);
@@ -255,11 +259,11 @@ impl<'a> TransformVisitor<'_, 'a> {
             match &mut rhs.kind {
                 ExprKind::If(_, t, Some(f)) => {
                     let StmtKind::Expr(t) = &mut t.stmts.last_mut().unwrap().kind else { panic!() };
-                    self.convert_rhs(t, lhs_pot, consume);
+                    self.convert_rhs(t, lhs_pot);
 
                     let ExprKind::Block(f, _) = &mut f.kind else { panic!() };
                     let StmtKind::Expr(f) = &mut f.stmts.last_mut().unwrap().kind else { panic!() };
-                    self.convert_rhs(f, lhs_pot, consume);
+                    self.convert_rhs(f, lhs_pot);
                 }
                 ExprKind::Cast(_, _) => {
                     assert!(matches!(remove_cast(rhs).kind, ExprKind::Lit(_)));
@@ -397,7 +401,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     self.replace_fn_ptr_param_type(&mut item.ty, *pot, index);
                 } else {
                     self.replace_ty_with_pot(&mut item.ty, *pot);
-                    self.convert_rhs(body, *pot, true);
+                    self.convert_rhs(body, *pot);
                 }
             }
             ItemKind::Fn(box item) => {
@@ -598,7 +602,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         }
 
         let LocalKind::Init(rhs) = &mut local.kind else { return };
-        self.convert_rhs(rhs, pot, true);
+        self.convert_rhs(rhs, pot);
     }
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
@@ -1072,12 +1076,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                                 let param_pot = some_or!(self.param_pot(p), continue);
                                 let is_null = matches!(remove_cast(arg).kind, ExprKind::Lit(_));
                                 let permissions = param_pot.permissions;
-                                let consume = permissions.contains(Permission::Close)
-                                    || matches!(
-                                        arg.kind,
-                                        ExprKind::Call(_, _) | ExprKind::MethodCall(_)
-                                    );
-                                self.convert_rhs(arg, param_pot, consume);
+                                self.convert_rhs(arg, param_pot);
                                 if param_pot.ty.contains_impl() {
                                     if is_null {
                                         let targ = if permissions.contains(Permission::BufRead) {
@@ -1168,15 +1167,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         return;
                     }
                     let pot = some_or!(self.bound_expr_pot(&call.receiver), return);
-                    let permissions = pot.permissions;
                     if let Some(index) = pot.file_param_index {
                         let arg = &mut args[index];
                         if self.is_unsupported(arg) {
                             return;
                         }
-                        let consume = permissions.contains(Permission::Close)
-                            || matches!(arg.kind, ExprKind::Call(_, _) | ExprKind::MethodCall(_));
-                        self.convert_rhs(arg, pot, consume);
+                        self.convert_rhs(arg, pot);
                     }
                 }
             }
@@ -1210,7 +1206,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             }
             ExprKind::Assign(lhs, rhs, _) => {
                 let lhs_pot = some_or!(self.bound_expr_pot(lhs), return);
-                self.convert_rhs(rhs, lhs_pot, true);
+                self.convert_rhs(rhs, lhs_pot);
 
                 let ic = self.indicator_check(lhs);
                 let s = self.clear(ic);
@@ -1223,7 +1219,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             ExprKind::Struct(se) => {
                 for f in se.fields.iter_mut() {
                     let lhs_pot = some_or!(self.bound_pot(f.ident.span), continue);
-                    self.convert_rhs(&mut f.expr, lhs_pot, true);
+                    self.convert_rhs(&mut f.expr, lhs_pot);
                 }
             }
             ExprKind::Ret(opt_e) => {
@@ -1231,7 +1227,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 if let Some(e) = opt_e
                     && let Some(pot) = self.return_pot(curr)
                 {
-                    self.convert_rhs(e, pot, true);
+                    self.convert_rhs(e, pot);
                 }
                 if let Some(rets) = self.error_returning_fns.get(&curr) {
                     let mut new_v = String::new();
