@@ -41,6 +41,8 @@ enum Command {
     Transform {
         #[arg(short, long)]
         output: PathBuf,
+        #[arg(long, default_value = "false")]
+        show_unsupported_reasons: bool,
     },
 }
 
@@ -159,7 +161,10 @@ fn main() {
         Command::AnalyzeError => {
             error_analysis::ErrorAnalysis.run_on_path(&file);
         }
-        Command::Transform { mut output } => {
+        Command::Transform {
+            mut output,
+            show_unsupported_reasons,
+        } => {
             output.push(args.input.file_name().unwrap());
             if output.exists() {
                 assert!(output.is_dir());
@@ -172,7 +177,14 @@ fn main() {
 
             let result = transformation::Transformation.run_on_path(&file);
             transformation::write_to_files(&result, &output);
-            println!("{}", result.unsupported_reasons.len());
+            if show_unsupported_reasons {
+                for reasons in result.unsupported_reasons {
+                    for reason in reasons.iter() {
+                        print!("{:?},", reason);
+                    }
+                    println!();
+                }
+            }
         }
         Command::Preprocess { mut output } => {
             output.push(args.input.file_name().unwrap());
