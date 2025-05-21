@@ -79,20 +79,7 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
 
     let error_analysis = error_analysis::analyze(arena, tcx);
 
-    let mut visitor = HirVisitor::new(tcx);
-    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
-
-    let mut defined_apis = FxHashSet::default();
-    let mut worklist = visitor.defined_apis;
-    while let Some(def_id) = worklist.pop() {
-        if !defined_apis.insert(def_id) {
-            continue;
-        }
-        let callees = some_or!(visitor.dependencies.get(&def_id), continue);
-        for def_id in callees {
-            worklist.push(*def_id);
-        }
-    }
+    let defined_apis = find_defined_apis(tcx);
     tracing::info!("Defined APIs:");
     for def_id in &defined_apis {
         tracing::info!("{:?}", def_id);
@@ -1179,6 +1166,25 @@ impl rustc_ast::visit::Visitor<'_> for AstVisitor {
             self.static_span_to_lit.insert(item.ident.span, lit);
         }
     }
+}
+
+pub fn find_defined_apis(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
+    let mut visitor = HirVisitor::new(tcx);
+    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
+
+    let mut defined_apis = FxHashSet::default();
+    let mut worklist = visitor.defined_apis;
+    while let Some(def_id) = worklist.pop() {
+        if !defined_apis.insert(def_id) {
+            continue;
+        }
+        let callees = some_or!(visitor.dependencies.get(&def_id), continue);
+        for def_id in callees {
+            worklist.push(*def_id);
+        }
+    }
+
+    defined_apis
 }
 
 struct HirVisitor<'tcx> {

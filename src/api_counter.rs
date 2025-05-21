@@ -9,8 +9,9 @@ use rustc_hir::{
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 
 use crate::{
-    api_list::{is_symbol_api, normalize_api_name, API_MAP},
+    api_list::{normalize_api_name, API_MAP},
     compile_util::{def_id_to_value_symbol, is_std_io_expr, Pass},
+    file_analysis,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -23,12 +24,14 @@ impl Pass for ApiCounter {
     );
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
+        let defined_apis = file_analysis::find_defined_apis(tcx);
+
         let mut visitor = ApiVisitor::new(tcx);
 
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
-            let name = item.ident.name;
-            if name.as_str() == "main" || is_symbol_api(name) {
+            if defined_apis.contains(&item_id.owner_id.def_id) || item.ident.name.as_str() == "main"
+            {
                 continue;
             }
             let (ItemKind::Fn { body: body_id, .. }
@@ -74,6 +77,9 @@ impl<'tcx> Visitor<'tcx> for ApiVisitor<'tcx> {
         let ExprKind::Call(callee, args) = &expr.kind else { return };
         let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else { return };
         let Res::Def(DefKind::Fn, def_id) = path.res else { return };
+        if !def_id.is_local() {
+            return;
+        }
         let symbol = some_or!(def_id_to_value_symbol(def_id, self.tcx), return);
         let name = normalize_api_name(symbol.as_str());
         let (name, api_info) = some_or!(API_MAP.get_key_value(name), return);

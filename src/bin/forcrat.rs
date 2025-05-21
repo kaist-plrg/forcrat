@@ -1,6 +1,7 @@
 #![feature(rustc_private)]
 
 use std::{
+    fmt::Write as _,
     fs,
     fs::File,
     path::{Path, PathBuf},
@@ -98,35 +99,40 @@ fn main() {
                 println!();
             }
             let (counts, std_arg_counts) = api_counter::ApiCounter.run_on_path(&file);
-            let sum = counts
-                .values()
-                .chain(std_arg_counts.values())
-                .sum::<usize>();
-            print!("{} ", sum);
-            if show_detail {
-                for (name, api_info) in API_LIST {
-                    let api_kind = api_info.kind;
-                    if !api_info.is_byte && !show_wide {
-                        continue;
+            let mut sum = 0;
+            let mut s = String::new();
+            for (name, api_info) in API_LIST {
+                let api_kind = api_info.kind;
+                if !api_info.is_byte && !show_wide {
+                    continue;
+                }
+                if !api_kind.is_posix_high_level_io() && !show_non_posix_high_level_io {
+                    continue;
+                }
+                if distinguish_std_args {
+                    let v = counts.get(name).copied().unwrap_or(0);
+                    sum += v;
+                    if show_detail {
+                        write!(s, "{} ", v).unwrap();
                     }
-                    if !api_kind.is_posix_high_level_io() && !show_non_posix_high_level_io {
-                        continue;
-                    }
-                    if distinguish_std_args {
-                        let v = counts.get(name).copied().unwrap_or(0);
-                        print!("{} ", v);
-                        if api_kind.is_operation() {
-                            let v = std_arg_counts.get(name).copied().unwrap_or(0);
-                            print!("{} ", v);
+                    if api_kind.is_operation() {
+                        let v = std_arg_counts.get(name).copied().unwrap_or(0);
+                        sum += v;
+                        if show_detail {
+                            write!(s, "{} ", v).unwrap();
                         }
-                    } else {
-                        let v1 = counts.get(name).copied().unwrap_or(0);
-                        let v2 = std_arg_counts.get(name).copied().unwrap_or(0);
-                        print!("{} ", v1 + v2);
+                    }
+                } else {
+                    let v1 = counts.get(name).copied().unwrap_or(0);
+                    let v2 = std_arg_counts.get(name).copied().unwrap_or(0);
+                    let v = v1 + v2;
+                    sum += v;
+                    if show_detail {
+                        write!(s, "{} ", v).unwrap();
                     }
                 }
             }
-            println!();
+            println!("{} {}", sum, s);
         }
         Command::CountReturnValues => {
             let counts = retval_use_counter::RetValCounter.run_on_path(&file);
