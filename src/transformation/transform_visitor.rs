@@ -659,6 +659,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     || name == "popen"
                     || name == "fmemopen"
                     || name == "open_memstream"
+                    || name == "freopen"
                 {
                     let reasons = self.get_unsupported_reasons(loc);
                     self.unsupported_reasons.push(reasons);
@@ -822,11 +823,13 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "ferror" => {
                             if let Some(loc) = self.loc_if_unsupported(&args[0]) {
-                                let reasons = self.get_unsupported_reasons(loc);
-                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
-                                let new_expr =
+                                let (new_expr, rem) =
                                     self.transform_unsupported_ferror(orig_name, &args[0], origins);
+                                if rem {
+                                    let reasons = self.get_unsupported_reasons(loc);
+                                    self.unsupported_reasons.push(reasons);
+                                }
                                 if let Some(new_expr) = new_expr {
                                     self.replace_expr(expr, new_expr);
                                 }
@@ -2365,20 +2368,20 @@ if !c.is_ascii_whitespace() {
         c_name: &str,
         stream: &Expr,
         origins: Option<BitSet8<Origin>>,
-    ) -> Option<Expr> {
+    ) -> (Option<Expr>, bool) {
         let stdout =
             origins.is_none_or(|o| o.contains(Origin::Stdout)) && !self.is_stdout_unsupported;
         let stderr =
             origins.is_none_or(|o| o.contains(Origin::Stderr)) && !self.is_stderr_unsupported;
         if !stdout && !stderr {
-            return None;
+            return (None, true);
         }
         let stream = pprust::expr_to_string(stream);
         if stream == "stdout" {
-            return Some(expr!("crate::stdio::STDOUT_ERROR"));
+            return (Some(expr!("crate::stdio::STDOUT_ERROR")), false);
         }
         if stream == "stderr" {
-            return Some(expr!("crate::stdio::STDERR_ERROR"));
+            return (Some(expr!("crate::stdio::STDERR_ERROR")), false);
         }
         let mut new_expr = String::new();
         if stdout {
@@ -2400,7 +2403,7 @@ if !c.is_ascii_whitespace() {
             .unwrap();
         }
         write!(new_expr, "{{ {}({}) }}", c_name, stream).unwrap();
-        Some(expr!("{}", new_expr))
+        (Some(expr!("{}", new_expr)), true)
     }
 
     fn error_handling(&self, ic: IndicatorCheck<'_>) -> String {
