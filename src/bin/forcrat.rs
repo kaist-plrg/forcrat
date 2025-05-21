@@ -42,6 +42,8 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
         #[arg(long, default_value = "false")]
+        show_times: bool,
+        #[arg(long, default_value = "false")]
         show_unsupported_reasons: bool,
     },
 }
@@ -163,6 +165,7 @@ fn main() {
         }
         Command::Transform {
             mut output,
+            show_times,
             show_unsupported_reasons,
         } => {
             output.push(args.input.file_name().unwrap());
@@ -176,7 +179,14 @@ fn main() {
             let file = output.join("c2rust-lib.rs");
 
             let result = transformation::Transformation.run_on_path(&file);
+            let start = std::time::Instant::now();
             transformation::write_to_files(&result, &output);
+            let time = start.elapsed().as_millis();
+            if show_times {
+                println!("{}", result.error_analysis_time);
+                println!("{}", result.file_analysis_time);
+                println!("{}", result.transformation_time + time);
+            }
             if show_unsupported_reasons {
                 for reasons in result.unsupported_reasons {
                     for reason in reasons.iter() {

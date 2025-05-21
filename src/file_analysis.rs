@@ -54,6 +54,8 @@ pub struct AnalysisResult<'a> {
     pub propagations: FxHashSet<ErrorPropagation<'a>>,
     pub unsupported_stdout_errors: bool,
     pub unsupported_stderr_errors: bool,
+    pub error_analysis_time: u128,
+    pub file_analysis_time: u128,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +72,7 @@ impl Pass for FileAnalysis {
 }
 
 pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult<'a> {
+    let start = std::time::Instant::now();
     let stolen = tcx.resolver_for_lowering().borrow();
     let (_, krate) = stolen.deref();
     let mut ast_visitor = AstVisitor::default();
@@ -78,7 +81,9 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
     drop(stolen);
 
     let error_analysis = error_analysis::analyze(arena, tcx);
+    let error_analysis_time = start.elapsed().as_millis();
 
+    let start = std::time::Instant::now();
     let defined_apis = find_defined_apis(tcx);
     tracing::info!("Defined APIs:");
     for def_id in &defined_apis {
@@ -310,6 +315,8 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
 
     let fn_ptrs = analyzer.fn_ptrs;
 
+    let file_analysis_time = start.elapsed().as_millis();
+
     AnalysisResult {
         locs,
         loc_ind_map,
@@ -326,6 +333,8 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
         propagations,
         unsupported_stdout_errors,
         unsupported_stderr_errors,
+        error_analysis_time,
+        file_analysis_time,
     }
 }
 

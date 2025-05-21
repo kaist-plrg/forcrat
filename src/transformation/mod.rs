@@ -63,6 +63,9 @@ pub struct TransformationResult {
     stderr_error: bool,
     bounds: FxHashSet<TraitBound>,
     pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
+    pub error_analysis_time: u128,
+    pub file_analysis_time: u128,
+    pub transformation_time: u128,
 }
 
 impl TransformationResult {
@@ -106,6 +109,7 @@ impl Pass for Transformation {
         let arena = Arena::new();
         let analysis_res = file_analysis::analyze(&arena, tcx);
 
+        let start = std::time::Instant::now();
         let error_returning_fns: FxHashMap<_, Vec<_>> = analysis_res
             .returning_fns
             .iter()
@@ -588,13 +592,18 @@ impl Pass for Transformation {
             unsupported_reasons.extend(visitor.unsupported_reasons);
         }
 
+        let transformation_time = start.elapsed().as_millis();
+
         TransformationResult {
             files,
             tmpfile,
             bounds,
-            unsupported_reasons,
             stdout_error: analysis_res.unsupported_stdout_errors,
             stderr_error: analysis_res.unsupported_stderr_errors,
+            unsupported_reasons,
+            error_analysis_time: analysis_res.error_analysis_time,
+            file_analysis_time: analysis_res.file_analysis_time,
+            transformation_time,
         }
     }
 }
