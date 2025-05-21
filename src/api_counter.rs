@@ -4,7 +4,7 @@ use rustc_hir::{
     def::{DefKind, Res},
     intravisit,
     intravisit::Visitor,
-    Expr, ExprKind, HirId, ItemKind, Path, QPath,
+    Expr, ExprKind, ItemKind, QPath,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 
@@ -59,35 +59,6 @@ impl<'tcx> ApiVisitor<'tcx> {
             std_arg_counts: FxHashMap::default(),
         }
     }
-
-    fn handle_expr(&mut self, expr: &'tcx Expr<'tcx>) -> bool {
-        let ExprKind::Call(callee, args) = &expr.kind else { return false };
-        let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else { return false };
-        let Res::Def(DefKind::Fn, def_id) = path.res else { return true };
-        let symbol = some_or!(def_id_to_value_symbol(def_id, self.tcx), return true);
-        let name = normalize_api_name(symbol.as_str());
-        let (name, api_kind) = some_or!(API_MAP.get_key_value(name), return true);
-        if !api_kind.is_posix_io() {
-            return true;
-        }
-        let counts = if (api_kind.is_read() || api_kind.is_write())
-            && args.iter().any(|arg| is_std_io_expr(arg, self.tcx))
-        {
-            &mut self.std_arg_counts
-        } else {
-            &mut self.counts
-        };
-        *counts.entry(*name).or_default() += 1;
-        true
-    }
-
-    fn handle_path(&mut self, path: &Path<'tcx>) {
-        let Res::Def(DefKind::Fn, def_id) = path.res else { return };
-        let symbol = some_or!(def_id_to_value_symbol(def_id, self.tcx), return);
-        let name = normalize_api_name(symbol.as_str());
-        let (name, _) = some_or!(API_MAP.get_key_value(name), return);
-        *self.counts.entry(*name).or_default() += 1;
-    }
 }
 
 impl<'tcx> Visitor<'tcx> for ApiVisitor<'tcx> {
@@ -98,13 +69,21 @@ impl<'tcx> Visitor<'tcx> for ApiVisitor<'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        if !self.handle_expr(expr) {
-            intravisit::walk_expr(self, expr);
-        }
-    }
+        intravisit::walk_expr(self, expr);
 
-    fn visit_path(&mut self, path: &Path<'tcx>, _: HirId) {
-        self.handle_path(path);
-        intravisit::walk_path(self, path);
+        let ExprKind::Call(callee, args) = &expr.kind else { return };
+        let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else { return };
+        let Res::Def(DefKind::Fn, def_id) = path.res else { return };
+        let symbol = some_or!(def_id_to_value_symbol(def_id, self.tcx), return);
+        let name = normalize_api_name(symbol.as_str());
+        let (name, api_info) = some_or!(API_MAP.get_key_value(name), return);
+        let kind = api_info.kind;
+        let counts = if kind.is_operation() && args.iter().any(|arg| is_std_io_expr(arg, self.tcx))
+        {
+            &mut self.std_arg_counts
+        } else {
+            &mut self.counts
+        };
+        *counts.entry(*name).or_default() += 1;
     }
 }

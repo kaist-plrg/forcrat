@@ -12,7 +12,10 @@ use crate::compile_util::def_id_to_value_symbol;
 
 #[inline]
 pub fn symbol_api_kind(name: Symbol) -> Option<ApiKind> {
-    API_MAP.get(normalize_api_name(name.as_str())).copied()
+    API_MAP
+        .get(normalize_api_name(name.as_str()))
+        .copied()
+        .map(|info| info.kind)
 }
 
 #[inline]
@@ -106,6 +109,7 @@ pub enum ApiKind {
     Operation(Option<Permission>),
     StdioOperation,
     Unsupported,
+    FileSysOperation,
     FileDescrOperation,
     StringOperation,
     NonPosixOpen,
@@ -114,13 +118,8 @@ pub enum ApiKind {
 
 impl ApiKind {
     #[inline]
-    pub fn is_read(self) -> bool {
-        matches!(self, Operation(Some(Read)))
-    }
-
-    #[inline]
-    pub fn is_write(self) -> bool {
-        matches!(self, Operation(Some(Write)))
+    pub fn is_operation(self) -> bool {
+        matches!(self, Operation(_))
     }
 
     #[inline]
@@ -129,140 +128,153 @@ impl ApiKind {
     }
 
     #[inline]
-    pub fn is_posix_io(self) -> bool {
+    pub fn is_posix_high_level_io(self) -> bool {
         match self {
-            Open(_) | Operation(_) | StdioOperation | Unsupported => true,
+            Open(_) | Operation(_) | StdioOperation | FileSysOperation | Unsupported => true,
             FileDescrOperation | StringOperation | NonPosixOpen | NonPosix => false,
         }
     }
 }
 
-lazy_static! {
-    pub static ref API_MAP: FxHashMap<&'static str, ApiKind> = API_LIST.iter().copied().collect();
+#[derive(Debug, Clone, Copy)]
+pub struct ApiInfo {
+    pub kind: ApiKind,
+    pub is_byte: bool,
 }
 
-pub static API_LIST: [(&str, ApiKind); 97] = [
+impl ApiInfo {
+    #[inline]
+    const fn new(kind: ApiKind, is_byte: bool) -> Self {
+        Self { kind, is_byte }
+    }
+}
+
+lazy_static! {
+    pub static ref API_MAP: FxHashMap<&'static str, ApiInfo> = API_LIST.iter().copied().collect();
+}
+
+pub static API_LIST: [(&str, ApiInfo); 97] = [
     // stdio.h
     // Open (6)
-    ("fopen", Open(File)),
-    ("fdopen", Open(File)),
-    ("tmpfile", Open(File)),
-    ("popen", Open(Pipe)),
-    ("fmemopen", Open(Buffer)),
-    ("open_memstream", Open(Buffer)),
+    ("fopen", ApiInfo::new(Open(File), true)),
+    ("fdopen", ApiInfo::new(Open(File), true)),
+    ("tmpfile", ApiInfo::new(Open(File), true)),
+    ("popen", ApiInfo::new(Open(Pipe), true)),
+    ("fmemopen", ApiInfo::new(Open(Buffer), true)),
+    ("open_memstream", ApiInfo::new(Open(Buffer), true)),
     // Close (2)
-    ("fclose", Operation(Some(Close))),
-    ("pclose", Operation(Some(Close))),
+    ("fclose", ApiInfo::new(Operation(Some(Close)), true)),
+    ("pclose", ApiInfo::new(Operation(Some(Close)), true)),
     // Read (10)
-    ("fscanf", Operation(Some(BufRead))),
-    ("vfscanf", Unsupported),
-    ("getc", Operation(Some(Read))), // unlocked
-    ("fgetc", Operation(Some(Read))),
-    ("fgets", Operation(Some(BufRead))),
-    ("fread", Operation(Some(Read))),
-    ("ungetc", Unsupported),
-    ("getline", Operation(Some(BufRead))),
-    ("getdelim", Operation(Some(BufRead))),
+    ("fscanf", ApiInfo::new(Operation(Some(BufRead)), true)),
+    ("vfscanf", ApiInfo::new(Unsupported, true)),
+    ("getc", ApiInfo::new(Operation(Some(Read)), true)), // unlocked
+    ("fgetc", ApiInfo::new(Operation(Some(Read)), true)),
+    ("fgets", ApiInfo::new(Operation(Some(BufRead)), true)),
+    ("fread", ApiInfo::new(Operation(Some(Read)), true)),
+    ("ungetc", ApiInfo::new(Unsupported, true)),
+    ("getline", ApiInfo::new(Operation(Some(BufRead)), true)),
+    ("getdelim", ApiInfo::new(Operation(Some(BufRead)), true)),
     // Read stdin (5)
-    ("scanf", StdioOperation),
-    ("vscanf", StdioOperation),
-    ("getchar", StdioOperation), // unlocked
-    ("gets", StdioOperation),    // removed
+    ("scanf", ApiInfo::new(StdioOperation, true)),
+    ("vscanf", ApiInfo::new(StdioOperation, true)),
+    ("getchar", ApiInfo::new(StdioOperation, true)), // unlocked
+    ("gets", ApiInfo::new(StdioOperation, true)),    // removed
     // Read string (2)
-    ("sscanf", StringOperation),
-    ("vsscanf", StringOperation),
+    ("sscanf", ApiInfo::new(StringOperation, true)),
+    ("vsscanf", ApiInfo::new(StringOperation, true)),
     // Write (8)
-    ("fprintf", Operation(Some(Write))),
-    ("vfprintf", Operation(Some(Write))),
-    ("putc", Operation(Some(Write))), // unlocked
-    ("fputc", Operation(Some(Write))),
-    ("fputs", Operation(Some(Write))),
-    ("fwrite", Operation(Some(Write))),
-    ("fflush", Operation(Some(Write))),
+    ("fprintf", ApiInfo::new(Operation(Some(Write)), true)),
+    ("vfprintf", ApiInfo::new(Operation(Some(Write)), true)),
+    ("putc", ApiInfo::new(Operation(Some(Write)), true)), // unlocked
+    ("fputc", ApiInfo::new(Operation(Some(Write)), true)),
+    ("fputs", ApiInfo::new(Operation(Some(Write)), true)),
+    ("fwrite", ApiInfo::new(Operation(Some(Write)), true)),
+    ("fflush", ApiInfo::new(Operation(Some(Write)), true)),
     // Write stdout/stderr (6)
-    ("printf", StdioOperation),
-    ("vprintf", StdioOperation),
-    ("putchar", StdioOperation), // unlocked
-    ("puts", StdioOperation),
-    ("perror", StdioOperation),
+    ("printf", ApiInfo::new(StdioOperation, true)),
+    ("vprintf", ApiInfo::new(StdioOperation, true)),
+    ("putchar", ApiInfo::new(StdioOperation, true)), // unlocked
+    ("puts", ApiInfo::new(StdioOperation, true)),
+    ("perror", ApiInfo::new(StdioOperation, true)),
     // Write fd (2)
-    ("dprintf", FileDescrOperation),
-    ("vdprintf", FileDescrOperation),
+    ("dprintf", ApiInfo::new(FileDescrOperation, true)),
+    ("vdprintf", ApiInfo::new(FileDescrOperation, true)),
     // Write string (4)
-    ("sprintf", StringOperation),
-    ("vsprintf", StringOperation),
-    ("snprintf", StringOperation),
-    ("vsnprintf", StringOperation),
+    ("sprintf", ApiInfo::new(StringOperation, true)),
+    ("vsprintf", ApiInfo::new(StringOperation, true)),
+    ("snprintf", ApiInfo::new(StringOperation, true)),
+    ("vsnprintf", ApiInfo::new(StringOperation, true)),
     // Positioning (7)
-    ("fseek", Operation(Some(Seek))),
-    ("fseeko", Operation(Some(Seek))),
-    ("ftell", Operation(Some(Seek))),
-    ("ftello", Operation(Some(Seek))),
-    ("rewind", Operation(Some(Seek))),
-    ("fgetpos", Operation(Some(Seek))),
-    ("fsetpos", Operation(Some(Seek))),
+    ("fseek", ApiInfo::new(Operation(Some(Seek)), true)),
+    ("fseeko", ApiInfo::new(Operation(Some(Seek)), true)),
+    ("ftell", ApiInfo::new(Operation(Some(Seek)), true)),
+    ("ftello", ApiInfo::new(Operation(Some(Seek)), true)),
+    ("rewind", ApiInfo::new(Operation(Some(Seek)), true)),
+    ("fgetpos", ApiInfo::new(Operation(Some(Seek)), true)),
+    ("fsetpos", ApiInfo::new(Operation(Some(Seek)), true)),
     // Error (3)
-    ("clearerr", Operation(None)),
-    ("feof", Operation(None)),
-    ("ferror", Operation(None)),
+    ("clearerr", ApiInfo::new(Operation(None), true)),
+    ("feof", ApiInfo::new(Operation(None), true)),
+    ("ferror", ApiInfo::new(Operation(None), true)),
     // Locking (3)
-    ("flockfile", Operation(Some(Lock))),
-    ("ftrylockfile", Operation(Some(Lock))),
-    ("funlockfile", Operation(Some(Lock))),
+    ("flockfile", ApiInfo::new(Operation(Some(Lock)), true)),
+    ("ftrylockfile", ApiInfo::new(Operation(Some(Lock)), true)),
+    ("funlockfile", ApiInfo::new(Operation(Some(Lock)), true)),
     // Buffering (2)
-    ("setvbuf", Unsupported),
-    ("setbuf", Unsupported),
+    ("setvbuf", ApiInfo::new(Unsupported, true)),
+    ("setbuf", ApiInfo::new(Unsupported, true)),
     // Other (2)
-    ("freopen", Unsupported),
-    ("fileno", Operation(Some(AsRawFd))),
+    ("freopen", ApiInfo::new(Unsupported, true)),
+    ("fileno", ApiInfo::new(Operation(Some(AsRawFd)), true)),
     // File system (6)
-    ("rename", Unsupported),
-    ("renameat", FileDescrOperation),
-    ("remove", Unsupported),
-    ("tmpnam", Unsupported),
-    ("tempnam", Unsupported), // removed
-    ("ctermid", Unsupported),
+    ("rename", ApiInfo::new(FileSysOperation, true)),
+    ("renameat", ApiInfo::new(FileDescrOperation, true)),
+    ("remove", ApiInfo::new(FileSysOperation, true)),
+    ("tmpnam", ApiInfo::new(FileSysOperation, true)),
+    ("tempnam", ApiInfo::new(FileSysOperation, true)), // removed
+    ("ctermid", ApiInfo::new(FileSysOperation, true)),
     // GNU libc / Linux
-    ("__fpending", NonPosix),
-    ("__freading", NonPosix),
-    ("__fwriting", NonPosix),
-    ("fpurge", NonPosix),
-    ("setmntent", NonPosixOpen),
-    ("getmntent", NonPosix),
-    ("addmntent", NonPosix),
-    ("endmntent", NonPosix),
-    ("setlinebuf", NonPosix),
-    ("setbuffer", NonPosix),
+    ("__fpending", ApiInfo::new(NonPosix, true)),
+    ("__freading", ApiInfo::new(NonPosix, true)),
+    ("__fwriting", ApiInfo::new(NonPosix, true)),
+    ("fpurge", ApiInfo::new(NonPosix, true)),
+    ("setmntent", ApiInfo::new(NonPosixOpen, true)),
+    ("getmntent", ApiInfo::new(NonPosix, true)),
+    ("addmntent", ApiInfo::new(NonPosix, true)),
+    ("endmntent", ApiInfo::new(NonPosix, true)),
+    ("setlinebuf", ApiInfo::new(NonPosix, true)),
+    ("setbuffer", ApiInfo::new(NonPosix, true)),
     // wchar.h
     // Open (1)
-    ("open_wmemstream", Open(Buffer)),
+    ("open_wmemstream", ApiInfo::new(Open(Buffer), false)),
     // Read (6)
-    ("fwscanf", Operation(Some(BufRead))),
-    ("vfwscanf", Unsupported),
-    ("getwc", Operation(Some(Read))),
-    ("fgetwc", Operation(Some(Read))),
-    ("fgetws", Operation(Some(BufRead))),
-    ("ungetwc", Unsupported),
+    ("fwscanf", ApiInfo::new(Operation(Some(BufRead)), false)),
+    ("vfwscanf", ApiInfo::new(Unsupported, false)),
+    ("getwc", ApiInfo::new(Operation(Some(Read)), false)),
+    ("fgetwc", ApiInfo::new(Operation(Some(Read)), false)),
+    ("fgetws", ApiInfo::new(Operation(Some(BufRead)), false)),
+    ("ungetwc", ApiInfo::new(Unsupported, false)),
     // Read stdin (3)
-    ("wscanf", StdioOperation),
-    ("vwscanf", Unsupported),
-    ("getwchar", StdioOperation),
+    ("wscanf", ApiInfo::new(StdioOperation, false)),
+    ("vwscanf", ApiInfo::new(StdioOperation, false)),
+    ("getwchar", ApiInfo::new(StdioOperation, false)),
     // Read string (2)
-    ("swscanf", StringOperation),
-    ("vswscanf", StringOperation),
+    ("swscanf", ApiInfo::new(StringOperation, false)),
+    ("vswscanf", ApiInfo::new(StringOperation, false)),
     // Write (5)
-    ("fwprintf", Operation(Some(Write))),
-    ("vfwprintf", Unsupported),
-    ("putwc", Operation(Some(Write))),
-    ("fputwc", Operation(Some(Write))),
-    ("fputws", Operation(Some(Write))),
+    ("fwprintf", ApiInfo::new(Operation(Some(Write)), false)),
+    ("vfwprintf", ApiInfo::new(Operation(Some(Write)), false)),
+    ("putwc", ApiInfo::new(Operation(Some(Write)), false)),
+    ("fputwc", ApiInfo::new(Operation(Some(Write)), false)),
+    ("fputws", ApiInfo::new(Operation(Some(Write)), false)),
     // Write stdout/stderr (3)
-    ("wprintf", StdioOperation),
-    ("vwprintf", Unsupported),
-    ("putwchar", StdioOperation),
+    ("wprintf", ApiInfo::new(StdioOperation, false)),
+    ("vwprintf", ApiInfo::new(StdioOperation, false)),
+    ("putwchar", ApiInfo::new(StdioOperation, false)),
     // Write string (2)
-    ("swprintf", StringOperation),
-    ("vswprintf", StringOperation),
+    ("swprintf", ApiInfo::new(StringOperation, false)),
+    ("vswprintf", ApiInfo::new(StringOperation, false)),
     // Orientation (1)
-    ("fwide", Unsupported),
+    ("fwide", ApiInfo::new(Unsupported, false)),
 ];

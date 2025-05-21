@@ -670,6 +670,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         }
                         ApiKind::Operation(None)
                         | ApiKind::StdioOperation
+                        | ApiKind::FileSysOperation
                         | ApiKind::FileDescrOperation
                         | ApiKind::StringOperation => {}
                     }

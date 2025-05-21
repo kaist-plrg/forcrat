@@ -13,13 +13,15 @@ use forcrat::{api_list::API_LIST, compile_util::Pass, *};
 enum Command {
     CountApis {
         #[arg(long, default_value = "false")]
-        distinguish_std_args: bool,
+        show_detail: bool,
+        #[arg(long, default_value = "false")]
+        show_wide: bool,
+        #[arg(long, default_value = "false")]
+        show_non_posix_high_level_io: bool,
         #[arg(long, default_value = "false")]
         show_api_names: bool,
         #[arg(long, default_value = "false")]
-        show_unsupported: bool,
-        #[arg(long, default_value = "false")]
-        only_show_total: bool,
+        distinguish_std_args: bool,
     },
     CountReturnValues,
     FindFileReturns,
@@ -70,20 +72,27 @@ fn main() {
 
     match args.command {
         Command::CountApis {
-            distinguish_std_args,
+            show_detail,
+            show_wide,
+            show_non_posix_high_level_io,
             show_api_names,
-            show_unsupported,
-            only_show_total,
+            distinguish_std_args,
         } => {
             if show_api_names {
                 print!("total ");
-                for (name, api_kind) in API_LIST {
-                    if !api_kind.is_posix_io() {
-                        continue;
-                    }
-                    print!("{} ", name);
-                    if distinguish_std_args && (api_kind.is_read() || api_kind.is_write()) {
-                        print!("{}_std ", name);
+                if show_detail {
+                    for (name, api_info) in API_LIST {
+                        let api_kind = api_info.kind;
+                        if !api_info.is_byte && !show_wide {
+                            continue;
+                        }
+                        if !api_kind.is_posix_high_level_io() && !show_non_posix_high_level_io {
+                            continue;
+                        }
+                        print!("{} ", name);
+                        if distinguish_std_args && api_kind.is_operation() {
+                            print!("{}_std ", name);
+                        }
                     }
                 }
                 println!();
@@ -94,42 +103,30 @@ fn main() {
                 .chain(std_arg_counts.values())
                 .sum::<usize>();
             print!("{} ", sum);
-            if only_show_total {
-                println!();
-                return;
-            }
-            for (name, api_kind) in API_LIST {
-                if !api_kind.is_posix_io() {
-                    continue;
-                }
-                if distinguish_std_args {
-                    let v = counts.get(name).copied().unwrap_or(0);
-                    print!("{} ", v);
-                    if api_kind.is_read() || api_kind.is_write() {
-                        let v = std_arg_counts.get(name).copied().unwrap_or(0);
-                        print!("{} ", v);
+            if show_detail {
+                for (name, api_info) in API_LIST {
+                    let api_kind = api_info.kind;
+                    if !api_info.is_byte && !show_wide {
+                        continue;
                     }
-                } else {
-                    let v1 = counts.get(name).copied().unwrap_or(0);
-                    let v2 = std_arg_counts.get(name).copied().unwrap_or(0);
-                    print!("{} ", v1 + v2);
+                    if !api_kind.is_posix_high_level_io() && !show_non_posix_high_level_io {
+                        continue;
+                    }
+                    if distinguish_std_args {
+                        let v = counts.get(name).copied().unwrap_or(0);
+                        print!("{} ", v);
+                        if api_kind.is_operation() {
+                            let v = std_arg_counts.get(name).copied().unwrap_or(0);
+                            print!("{} ", v);
+                        }
+                    } else {
+                        let v1 = counts.get(name).copied().unwrap_or(0);
+                        let v2 = std_arg_counts.get(name).copied().unwrap_or(0);
+                        print!("{} ", v1 + v2);
+                    }
                 }
             }
             println!();
-            if show_unsupported {
-                for (name, api_kind) in API_LIST {
-                    if !api_kind.is_unsupported() {
-                        continue;
-                    }
-                    let v1 = counts.get(name).copied().unwrap_or(0);
-                    let v2 = std_arg_counts.get(name).copied().unwrap_or(0);
-                    let v = v1 + v2;
-                    if v > 0 {
-                        print!("{}: {}, ", name, v);
-                    }
-                }
-                println!();
-            }
         }
         Command::CountReturnValues => {
             let counts = retval_use_counter::RetValCounter.run_on_path(&file);
