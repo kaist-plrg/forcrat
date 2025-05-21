@@ -1,7 +1,6 @@
-use std::{collections::hash_map::Entry, ops::Deref as _};
+use std::ops::Deref as _;
 
 use etrace::some_or;
-use regex::Regex;
 use rustc_abi::{FieldIdx, FIRST_VARIANT};
 use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::{scc::Sccs, DirectedGraph, Successors};
@@ -28,7 +27,7 @@ use typed_arena::Arena;
 
 use crate::{
     api_list::{def_id_api_kind, is_def_id_api, ApiKind, Origin, Permission},
-    bit_set::BitSet8,
+    bit_set::{BitSet16, BitSet8},
     compile_util::{self, Pass},
     disjoint_set::DisjointSet,
     error_analysis::{self, ErrorPropagation, ExprLoc, Indicator},
@@ -44,7 +43,7 @@ pub struct AnalysisResult<'a> {
     pub loc_ind_map: FxHashMap<Loc, LocId>,
     pub permissions: IndexVec<LocId, BitSet8<Permission>>,
     pub origins: IndexVec<LocId, BitSet8<Origin>>,
-    pub unsupported: FxHashSet<LocId>,
+    pub unsupported: UnsupportedLocs,
     pub static_span_to_lit: FxHashMap<Span, Symbol>,
     pub defined_apis: FxHashSet<LocalDefId>,
     pub fn_ptrs: FxHashSet<LocalDefId>,
@@ -58,25 +57,19 @@ pub struct AnalysisResult<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct FileAnalysis {
-    pub verbose: bool,
-}
+pub struct FileAnalysis;
 
 impl Pass for FileAnalysis {
     type Out = ();
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let arena = Arena::new();
-        let result = analyze(&arena, self.verbose, tcx);
+        let result = analyze(&arena, tcx);
         println!("{:#?}", result);
     }
 }
 
-pub fn analyze<'a>(
-    arena: &'a Arena<ExprLoc>,
-    verbose: bool,
-    tcx: TyCtxt<'_>,
-) -> AnalysisResult<'a> {
+pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult<'a> {
     let stolen = tcx.resolver_for_lowering().borrow();
     let (_, krate) = stolen.deref();
     let mut ast_visitor = AstVisitor::default();
@@ -153,7 +146,6 @@ pub fn analyze<'a>(
     let arena = Arena::new();
     let mut analyzer = Analyzer {
         tcx,
-        verbose,
         loc_ind_map: &loc_ind_map,
         fn_ptrs: FxHashSet::default(),
         permission_graph,
@@ -163,10 +155,9 @@ pub fn analyze<'a>(
 
     for loc in &error_analysis.no_source_locs {
         let loc_id = loc_ind_map[loc];
-        analyzer.unsupported.add(loc_id);
-        if verbose {
-            println!("Unsupported error handling {:?}", loc);
-        }
+        analyzer
+            .unsupported
+            .add(loc_id, UnsupportedReason::ErrorHandling);
     }
 
     for item_id in tcx.hir_free_items() {
@@ -253,10 +244,9 @@ pub fn analyze<'a>(
             .any(|loc_id| permissions[loc_id].contains(Permission::Close))
         {
             for loc_id in cycle.iter() {
-                if verbose {
-                    println!("Unsupported close cycle {:?}", locs[loc_id],);
-                }
-                analyzer.unsupported.add(loc_id);
+                analyzer
+                    .unsupported
+                    .add(loc_id, UnsupportedReason::CloseCycle);
             }
         }
     }
@@ -273,28 +263,22 @@ pub fn analyze<'a>(
             || permissions.contains(Permission::Read)
                 && (origins.contains(Origin::Stdout) || origins.contains(Origin::Stderr))
         {
-            if verbose {
-                println!(
-                    "Unsupported permission {:?}: {:?}, {:?}",
-                    loc, permissions, origins
-                );
-            }
-            analyzer.unsupported.add(i);
+            analyzer.unsupported.add(i, UnsupportedReason::Permission);
         }
     }
 
     let stdout = analyzer.loc_ind_map[&Loc::Stdout];
-    if analyzer.unsupported.unsupported.contains(&stdout) {
+    if analyzer.unsupported.unsupported.contains_key(&stdout) {
         analyzer.unsupported.unsupport_stdout(stdout);
     }
     let stderr = analyzer.loc_ind_map[&Loc::Stderr];
-    if analyzer.unsupported.unsupported.contains(&stderr) {
+    if analyzer.unsupported.unsupported.contains_key(&stderr) {
         analyzer.unsupported.unsupport_stderr(stderr);
     }
 
     let unsupported = analyzer.unsupported.compute_all();
     for loc_id in unsupported.iter() {
-        tracing::info!("{:?} unsupported", locs[*loc_id]);
+        tracing::info!("{:?} unsupported", locs[loc_id]);
     }
 
     let mut tracking_fns: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
@@ -306,7 +290,7 @@ pub fn analyze<'a>(
 
     for (loc, res) in error_analysis.loc_results {
         let loc_id = loc_ind_map[&loc];
-        if unsupported.contains(&loc_id) {
+        if unsupported.contains(loc_id) {
             if origins[loc_id].contains(Origin::Stdout) {
                 unsupported_stdout_errors = true;
             }
@@ -360,7 +344,6 @@ pub fn analyze<'a>(
 
 struct Analyzer<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    verbose: bool,
     loc_ind_map: &'a FxHashMap<Loc, LocId>,
     fn_ptrs: FxHashSet<LocalDefId>,
     permission_graph: Graph<LocId, Permission>,
@@ -389,18 +372,12 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         self.assign(l, r, variance);
                     }
                     (Some(_), false) => {
-                        if self.verbose {
-                            println!("Unsupported ptr cast {:?}", rty);
-                        }
                         let l = self.transfer_place(*l, ctx);
-                        self.unsupported.add(l);
+                        self.unsupported.add(l, UnsupportedReason::Cast);
                     }
                     (None, true) => {
-                        if self.verbose {
-                            println!("Unsupported ptr cast {:?}", ty);
-                        }
                         let r = self.transfer_operand(op, ctx);
-                        self.unsupported.add(r);
+                        self.unsupported.add(r, UnsupportedReason::Cast);
                     }
                     (None, false) => {}
                 }
@@ -414,12 +391,10 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     }) = op
                     {
                         if i.to_int(i.size()) != 0 {
-                            self.print_code("provenance cast", stmt.source_info.span);
-                            self.unsupported.add(l);
+                            self.unsupported.add(l, UnsupportedReason::Cast);
                         }
                     } else {
-                        self.print_code("provenance cast", stmt.source_info.span);
-                        self.unsupported.add(l);
+                        self.unsupported.add(l, UnsupportedReason::Cast);
                     }
                 }
             }
@@ -427,8 +402,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 let rty = op.ty(ctx.local_decls, self.tcx);
                 if compile_util::contains_file_ty(rty, self.tcx) {
                     let r = self.transfer_operand(op, ctx);
-                    self.unsupported.add(r);
-                    self.print_code("provenance cast", stmt.source_info.span);
+                    self.unsupported.add(r, UnsupportedReason::Cast);
                 }
             }
             Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer, _), op, _) => {
@@ -443,8 +417,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         if compile_util::contains_file_ty(*ty, self.tcx) {
                             let node = self.tcx.hir_node_by_def_id(def_id);
                             if matches!(node, Node::ForeignItem(_)) {
-                                self.unsupported.add(l);
-                                self.print_code("api fn ptr", stmt.source_info.span);
+                                self.unsupported.add(l, UnsupportedReason::ApiFnPtr);
                             } else {
                                 let r = Loc::Var(def_id, Local::new(i + 1));
                                 let r = self.loc_ind_map[&r];
@@ -465,16 +438,13 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                     stmt.source_info.span
                 );
             }
-            Rvalue::BinaryOp(op, box (op1, op2)) => {
+            Rvalue::BinaryOp(_, box (op1, op2)) => {
                 let ty = op1.ty(ctx.local_decls, self.tcx);
                 if compile_util::contains_file_ty(ty, self.tcx) {
-                    if self.verbose {
-                        println!("Unsupported op {:?}", op);
-                    }
                     let op1 = self.transfer_operand(op1, ctx);
-                    self.unsupported.add(op1);
+                    self.unsupported.add(op1, UnsupportedReason::Cmp);
                     let op2 = self.transfer_operand(op2, ctx);
-                    self.unsupported.add(op2);
+                    self.unsupported.add(op2, UnsupportedReason::Cmp);
                 }
             }
             Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, field_idx), fields) => {
@@ -623,8 +593,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         }
                     } else if compile_util::contains_file_ty(ty, self.tcx) {
                         let arg = self.transfer_operand(&arg.node, ctx);
-                        self.unsupported.add(arg);
-                        self.print_code("var arg", term.source_info.span);
+                        self.unsupported.add(arg, UnsupportedReason::Variadic);
                     }
                 }
             }
@@ -640,10 +609,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         }
                         ApiKind::NonPosixOpen => {
                             let x = self.transfer_place(*destination, ctx);
-                            if self.verbose {
-                                println!("Unsupported open {:?}", def_id);
-                            }
-                            self.unsupported.add(x);
+                            self.unsupported.add(x, UnsupportedReason::NonPosix);
                         }
                         ApiKind::Operation(Some(permission)) => {
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
@@ -656,14 +622,19 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             }
                         }
                         ApiKind::Unsupported | ApiKind::NonPosix => {
-                            if self.verbose {
-                                println!("Unsupported api {:?}", def_id);
-                            }
+                            let name =
+                                compile_util::def_id_to_value_symbol(def_id, self.tcx).unwrap();
+                            let reason = match name.as_str() {
+                                "setbuf" | "setvbuf" => UnsupportedReason::Setbuf,
+                                "ungetc" => UnsupportedReason::Ungetc,
+                                "freopen" => UnsupportedReason::Freopen,
+                                _ => UnsupportedReason::NonPosix,
+                            };
                             let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
                             for (t, arg) in sig.inputs().iter().zip(args) {
                                 if compile_util::contains_file_ty(*t, self.tcx) {
                                     let x = self.transfer_operand(&arg.node, ctx);
-                                    self.unsupported.add(x);
+                                    self.unsupported.add(x, reason);
                                     break;
                                 }
                             }
@@ -675,13 +646,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                         | ApiKind::StringOperation => {}
                     }
                 } else if let Some(callee) = def_id.as_local() {
-                    self.transfer_non_api_call(
-                        callee,
-                        args,
-                        *destination,
-                        term.source_info.span,
-                        ctx,
-                    );
+                    self.transfer_non_api_call(callee, args, *destination, ctx);
                 } else {
                     let name = compile_util::def_id_to_value_symbol(def_id, self.tcx).unwrap();
                     match name.as_str() {
@@ -689,8 +654,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                             let ty = Place::ty(destination, ctx.local_decls, self.tcx).ty;
                             if compile_util::contains_file_ty(ty, self.tcx) {
                                 let x = self.transfer_place(*destination, ctx);
-                                self.unsupported.add(x);
-                                self.print_code("var param", term.source_info.span);
+                                self.unsupported.add(x, UnsupportedReason::Variadic);
                             }
                         }
                         "unwrap" => {
@@ -713,7 +677,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
         callee: LocalDefId,
         args: &[Spanned<Operand<'tcx>>],
         destination: Place<'tcx>,
-        span: Span,
         ctx: Ctx<'_, 'tcx>,
     ) {
         let sig = self.tcx.fn_sig(callee).skip_binder().skip_binder();
@@ -729,8 +692,7 @@ impl<'tcx> Analyzer<'_, 'tcx> {
                 }
             } else if compile_util::contains_file_ty(ty, self.tcx) {
                 let arg = self.transfer_operand(&arg.node, ctx);
-                self.unsupported.add(arg);
-                self.print_code("var arg", span);
+                self.unsupported.add(arg, UnsupportedReason::Variadic);
             }
         }
         if let Some(variance) = file_type_variance(sig.output(), self.tcx) {
@@ -781,20 +743,6 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             self.unsupported.stderr_locs.insert(lhs);
         } else {
             self.unsupported.union(lhs, rhs);
-        }
-    }
-
-    fn print_code(&self, msg: &str, span: Span) {
-        if self.verbose {
-            let code = self
-                .tcx
-                .sess
-                .source_map()
-                .span_to_snippet(span)
-                .unwrap()
-                .replace('\n', " ");
-            let re = Regex::new(r"\s+").unwrap();
-            println!("Unsupported {} {}", msg, re.replace_all(&code, " "));
         }
     }
 }
@@ -1076,10 +1024,45 @@ impl<T: Idx> Successors for VecBitSet<'_, T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum UnsupportedReason {
+    Setbuf = 0,
+    Ungetc = 1,
+    Freopen = 2,
+    ErrorHandling = 3,
+    CloseCycle = 4,
+    Permission = 5,
+    Cast = 6,
+    Variadic = 7,
+    ApiFnPtr = 8,
+    Cmp = 9,
+    NonPosix = 10,
+}
+
+impl UnsupportedReason {
+    pub const NUM: usize = 11;
+}
+
+impl Idx for UnsupportedReason {
+    #[inline]
+    fn new(idx: usize) -> Self {
+        if idx >= Self::NUM {
+            panic!()
+        }
+        unsafe { std::mem::transmute(idx as u8) }
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        self as _
+    }
+}
+
 struct UnsupportedTracker<'a> {
     arena: &'a Arena<DisjointSet<'a, LocId>>,
     locs: FxHashMap<LocId, &'a DisjointSet<'a, LocId>>,
-    unsupported: FxHashSet<LocId>,
+    unsupported: FxHashMap<LocId, BitSet16<UnsupportedReason>>,
 
     stdout_locs: MixedBitSet<LocId>,
     stderr_locs: MixedBitSet<LocId>,
@@ -1090,7 +1073,7 @@ impl<'a> UnsupportedTracker<'a> {
         Self {
             arena,
             locs: FxHashMap::default(),
-            unsupported: FxHashSet::default(),
+            unsupported: FxHashMap::default(),
 
             stdout_locs: MixedBitSet::new_empty(len),
             stderr_locs: MixedBitSet::new_empty(len),
@@ -1111,11 +1094,11 @@ impl<'a> UnsupportedTracker<'a> {
         }
     }
 
-    fn add(&mut self, loc: LocId) {
-        if let Entry::Vacant(e) = self.locs.entry(loc) {
-            e.insert(self.arena.alloc(DisjointSet::new(loc)));
-        }
-        self.unsupported.insert(loc);
+    fn add(&mut self, loc: LocId, reason: UnsupportedReason) {
+        self.locs
+            .entry(loc)
+            .or_insert_with(|| self.arena.alloc(DisjointSet::new(loc)));
+        self.unsupported.entry(loc).or_default().insert(reason);
     }
 
     fn unsupport_stdout(&mut self, stdout: LocId) {
@@ -1132,18 +1115,47 @@ impl<'a> UnsupportedTracker<'a> {
         }
     }
 
-    fn compute_all(&self) -> FxHashSet<LocId> {
-        let mut unsupported = FxHashSet::default();
-        for loc_id in &self.unsupported {
-            unsupported.insert(self.locs[loc_id].find_set().id());
+    fn compute_all(&self) -> UnsupportedLocs {
+        let mut loc_to_root = FxHashMap::default();
+        let mut reasons: FxHashMap<_, BitSet16<_>> = FxHashMap::default();
+        for (loc_id, r) in &self.unsupported {
+            let root = self.locs[loc_id].find_set().id();
+            loc_to_root.insert(root, root);
+            reasons.entry(root).or_default().union(r);
         }
         for (loc, set) in &self.locs {
             let root = set.find_set().id();
-            if unsupported.contains(&root) {
-                unsupported.insert(*loc);
+            if loc_to_root.contains_key(&root) {
+                loc_to_root.insert(*loc, root);
             }
         }
-        unsupported
+        UnsupportedLocs {
+            loc_to_root,
+            reasons,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct UnsupportedLocs {
+    loc_to_root: FxHashMap<LocId, LocId>,
+    reasons: FxHashMap<LocId, BitSet16<UnsupportedReason>>,
+}
+
+impl UnsupportedLocs {
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = LocId> + '_ {
+        self.loc_to_root.keys().copied()
+    }
+
+    #[inline]
+    pub fn contains(&self, loc: LocId) -> bool {
+        self.loc_to_root.contains_key(&loc)
+    }
+
+    #[inline]
+    pub fn get_reasons(&self, loc: LocId) -> BitSet16<UnsupportedReason> {
+        self.reasons[&self.loc_to_root[&loc]]
     }
 }
 

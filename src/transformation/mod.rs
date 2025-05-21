@@ -20,8 +20,9 @@ use typed_arena::Arena;
 
 use crate::{
     api_list::Permission,
+    bit_set::BitSet16,
     compile_util::{self, Pass},
-    file_analysis::{self, Loc},
+    file_analysis::{self, Loc, UnsupportedReason},
     graph,
 };
 
@@ -61,6 +62,7 @@ pub struct TransformationResult {
     stdout_error: bool,
     stderr_error: bool,
     bounds: FxHashSet<TraitBound>,
+    pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
 }
 
 impl TransformationResult {
@@ -89,7 +91,8 @@ impl TransformationResult {
             m.push_str(" pub static mut STDERR_ERROR: i32 = 0;");
         }
         m.push('}');
-        m
+        let re = regex::Regex::new(r"\s+").unwrap();
+        re.replace_all(&m.replace('\n', " "), " ").to_string()
     }
 }
 
@@ -101,7 +104,7 @@ impl Pass for Transformation {
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let arena = Arena::new();
-        let analysis_res = file_analysis::analyze(&arena, true, tcx);
+        let analysis_res = file_analysis::analyze(&arena, tcx);
 
         let error_returning_fns: FxHashMap<_, Vec<_>> = analysis_res
             .returning_fns
@@ -147,28 +150,28 @@ impl Pass for Transformation {
 
         let is_stdin_unsupported = analysis_res
             .unsupported
-            .contains(&analysis_res.loc_ind_map[&Loc::Stdin]);
+            .contains(analysis_res.loc_ind_map[&Loc::Stdin]);
         let is_stdout_unsupported = analysis_res
             .unsupported
-            .contains(&analysis_res.loc_ind_map[&Loc::Stdout]);
+            .contains(analysis_res.loc_ind_map[&Loc::Stdout]);
         let is_stderr_unsupported = analysis_res
             .unsupported
-            .contains(&analysis_res.loc_ind_map[&Loc::Stderr]);
+            .contains(analysis_res.loc_ind_map[&Loc::Stderr]);
 
         // all unsupported spans
-        let mut unsupported = FxHashSet::default();
+        let mut unsupported = FxHashMap::default();
         let mut unsupported_returns = FxHashSet::default();
-        for loc_id in &analysis_res.unsupported {
-            let loc = analysis_res.locs[*loc_id];
+        for loc_id in analysis_res.unsupported.iter() {
+            let loc = analysis_res.locs[loc_id];
             match loc {
                 Loc::Var(def_id, local) => {
                     let span = mir_local_span(def_id, local, &return_locals, &hir_ctx, tcx);
-                    unsupported.insert(span);
+                    unsupported.insert(span, loc);
                     if local == mir::Local::ZERO {
                         unsupported_returns.insert(def_id);
                         if let Some(spans) = hir_ctx.return_spans.get(&def_id) {
                             for span in spans {
-                                unsupported.insert(*span);
+                                unsupported.insert(*span, loc);
                             }
                         }
                     }
@@ -181,25 +184,25 @@ impl Pass for Transformation {
                         panic!()
                     };
                     let hir::VariantData::Struct { fields, .. } = vd else { panic!() };
-                    unsupported.insert(fields[field_idx.as_usize()].span);
+                    unsupported.insert(fields[field_idx.as_usize()].span, loc);
                 }
                 Loc::Stdin | Loc::Stdout | Loc::Stderr => {}
             }
         }
         let mut unsupported_locs = FxHashSet::default();
         for (span, loc) in &hir_ctx.binding_span_to_loc {
-            if !unsupported.contains(span) {
-                continue;
-            }
+            let unsupported_loc = *some_or!(unsupported.get(span), continue);
             unsupported_locs.insert(*loc);
             let bounds = some_or!(hir_ctx.loc_to_bound_spans.get(loc), continue);
             for span in bounds {
                 // add bound occurrence to unsupported
-                unsupported.insert(*span);
+                unsupported.insert(*span, unsupported_loc);
 
                 // add rhs to unsupported
-                if let Some(span) = hir_ctx.lhs_to_rhs.get(span) {
-                    unsupported.extend(span);
+                if let Some(spans) = hir_ctx.lhs_to_rhs.get(span) {
+                    for span in spans {
+                        unsupported.insert(*span, unsupported_loc);
+                    }
                 }
             }
         }
@@ -525,6 +528,7 @@ impl Pass for Transformation {
         let mut files = vec![];
         let mut tmpfile = false;
         let mut bounds = FxHashSet::default();
+        let mut unsupported_reasons = vec![];
 
         for file in source_map.files().iter() {
             if !matches!(
@@ -571,6 +575,7 @@ impl Pass for Transformation {
                 bounds: vec![],
                 guards: FxHashSet::default(),
                 foreign_statics: FxHashSet::default(),
+                unsupported_reasons: vec![],
             };
             visitor.visit_crate(&mut krate);
             if visitor.updated {
@@ -580,12 +585,14 @@ impl Pass for Transformation {
                 bounds.extend(visitor.bounds);
             }
             unsupported = visitor.unsupported;
+            unsupported_reasons.extend(visitor.unsupported_reasons);
         }
 
         TransformationResult {
             files,
             tmpfile,
             bounds,
+            unsupported_reasons,
             stdout_error: analysis_res.unsupported_stdout_errors,
             stderr_error: analysis_res.unsupported_stderr_errors,
         }

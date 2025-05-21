@@ -167,7 +167,7 @@ pub static API_LIST: [(&str, ApiInfo); 97] = [
     ("pclose", ApiInfo::new(Operation(Some(Close)), true)),
     // Read (10)
     ("fscanf", ApiInfo::new(Operation(Some(BufRead)), true)),
-    ("vfscanf", ApiInfo::new(Unsupported, true)),
+    ("vfscanf", ApiInfo::new(Operation(Some(BufRead)), true)),
     ("getc", ApiInfo::new(Operation(Some(Read)), true)), // unlocked
     ("fgetc", ApiInfo::new(Operation(Some(Read)), true)),
     ("fgets", ApiInfo::new(Operation(Some(BufRead)), true)),

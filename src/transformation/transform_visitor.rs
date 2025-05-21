@@ -25,10 +25,10 @@ use super::*;
 use crate::{
     api_list::{self, Origin, Permission},
     ast_maker::*,
-    bit_set::BitSet8,
+    bit_set::{BitSet16, BitSet8},
     compile_util,
     error_analysis::{ErrorPropagation, ExprLoc, Indicator},
-    file_analysis::{self, LocId},
+    file_analysis::{self, LocId, UnsupportedReason},
     likely_lit::LikelyLit,
 };
 
@@ -55,8 +55,8 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     /// spans of projections of manually dropped fields
     pub(super) manually_drop_projections: &'a FxHashSet<Span>,
 
-    /// unsupported expr spans
-    pub(super) unsupported: FxHashSet<Span>,
+    /// unsupported expr span to location
+    pub(super) unsupported: FxHashMap<Span, Loc>,
     /// unsupported return fn ids
     pub(super) unsupported_returns: &'a FxHashSet<LocalDefId>,
     /// is stdin unsupported
@@ -73,6 +73,7 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) bounds: Vec<TraitBound>,
     pub(super) guards: FxHashSet<Symbol>,
     pub(super) foreign_statics: FxHashSet<&'static str>,
+    pub(super) unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
 }
 
 fn remove_cast(expr: &Expr) -> &Expr {
@@ -89,8 +90,16 @@ struct FprintfCtx<'a> {
 
 impl<'a> TransformVisitor<'_, 'a> {
     #[inline]
+    fn loc_if_unsupported(&self, expr: &Expr) -> Option<Loc> {
+        self.unsupported
+            .get(&expr.span)
+            .or_else(|| self.unsupported.get(&remove_cast(expr).span))
+            .copied()
+    }
+
+    #[inline]
     fn is_unsupported(&self, expr: &Expr) -> bool {
-        self.unsupported.contains(&expr.span) || self.unsupported.contains(&remove_cast(expr).span)
+        self.loc_if_unsupported(expr).is_some()
     }
 
     #[inline]
@@ -325,6 +334,26 @@ impl<'a> TransformVisitor<'_, 'a> {
                 caller, caller_loc, callee, callee_loc,
             ))
     }
+
+    fn stdin_unsuppoted_reasons(&self) -> BitSet16<UnsupportedReason> {
+        let loc_id = self.analysis_res.loc_ind_map[&Loc::Stdin];
+        self.analysis_res.unsupported.get_reasons(loc_id)
+    }
+
+    fn stdout_unsuppoted_reasons(&self) -> BitSet16<UnsupportedReason> {
+        let loc_id = self.analysis_res.loc_ind_map[&Loc::Stdout];
+        self.analysis_res.unsupported.get_reasons(loc_id)
+    }
+
+    fn stderr_unsuppoted_reasons(&self) -> BitSet16<UnsupportedReason> {
+        let loc_id = self.analysis_res.loc_ind_map[&Loc::Stderr];
+        self.analysis_res.unsupported.get_reasons(loc_id)
+    }
+
+    fn get_unsupported_reasons(&self, loc: Loc) -> BitSet16<UnsupportedReason> {
+        let loc_id = self.analysis_res.loc_ind_map[&loc];
+        self.analysis_res.unsupported.get_reasons(loc_id)
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
@@ -391,7 +420,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
         match &mut item.kind {
             ItemKind::Static(box item) => {
                 let body = some_or!(&mut item.expr, return);
-                if self.unsupported.contains(&body.span) {
+                if self.unsupported.contains_key(&body.span) {
                     return;
                 }
                 let loc = self.hir.binding_span_to_loc[&ident_span];
@@ -410,7 +439,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 };
                 let mut tparams = vec![];
                 for (i, param) in item.sig.decl.inputs.iter_mut().enumerate() {
-                    if self.unsupported.contains(&param.pat.span) {
+                    if self.unsupported.contains_key(&param.pat.span) {
                         continue;
                     }
                     let p = Parameter::new(def_id, i);
@@ -568,7 +597,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
         let VariantData::Struct { fields, .. } = vd else { return };
         for f in fields {
-            if self.unsupported.contains(&f.span) {
+            if self.unsupported.contains_key(&f.span) {
                 continue;
             }
             let pot = some_or!(self.binding_pot(f.span), continue);
@@ -584,7 +613,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     fn visit_local(&mut self, local: &mut P<Local>) {
         walk_local(self, local);
 
-        if self.unsupported.contains(&local.pat.span) {
+        if self.unsupported.contains_key(&local.pat.span) {
             return;
         }
 
@@ -607,20 +636,38 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
     fn visit_expr(&mut self, expr: &mut P<Expr>) {
         if let ExprKind::If(_, t, Some(f)) = &expr.kind {
-            if self.is_unsupported(expr) {
+            if let Some(loc) = self.loc_if_unsupported(expr) {
                 let t = t.stmts.last().unwrap();
                 let StmtKind::Expr(t) = &t.kind else { panic!() };
-                self.unsupported.insert(t.span);
-                self.unsupported.insert(f.span);
+                self.unsupported.insert(t.span, loc);
+                self.unsupported.insert(f.span, loc);
             }
         }
 
         mut_visit::walk_expr(self, expr);
 
-        let expr_span = expr.span;
-        if self.is_unsupported(expr) {
+        if let Some(loc) = self.loc_if_unsupported(expr) {
+            if let ExprKind::Call(callee, _) = &expr.kind
+                && let Some(HirLoc::Global(def_id)) = self.hir.bound_span_to_loc.get(&callee.span)
+            {
+                let name = compile_util::def_id_to_value_symbol(*def_id, self.tcx).unwrap();
+                let name = name.as_str();
+                let name = api_list::normalize_api_name(name);
+                if name == "fopen"
+                    || name == "fdopen"
+                    || name == "tmpfile"
+                    || name == "popen"
+                    || name == "fmemopen"
+                    || name == "open_memstream"
+                {
+                    let reasons = self.get_unsupported_reasons(loc);
+                    self.unsupported_reasons.push(reasons);
+                }
+            }
             return;
         }
+
+        let expr_span = expr.span;
         match &mut expr.kind {
             ExprKind::Call(callee, args) => {
                 if let Some(HirLoc::Global(def_id)) = self.hir.bound_span_to_loc.get(&callee.span) {
@@ -646,8 +693,11 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let new_expr = self.transform_popen(&args[0], &args[1]);
                             self.replace_expr(expr, new_expr);
                         }
+                        "fmemopen" | "open_memstream" => todo!(),
                         "fclose" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -656,7 +706,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "pclose" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -665,7 +717,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fscanf" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -674,8 +728,18 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let new_expr = self.transform_fscanf(&stream, &args[1], &args[2..], ic);
                             self.replace_expr(expr, new_expr);
                         }
+                        "vfscanf" => {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
+                                return;
+                            }
+                            todo!()
+                        }
                         "fgetc" | "getc" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -686,6 +750,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "getchar" => {
                             if self.is_stdin_unsupported {
+                                let reasons = self.stdin_unsuppoted_reasons();
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let stream = StdExpr::stdin();
@@ -694,7 +760,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fgets" => {
-                            if self.is_unsupported(&args[2]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[2]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
@@ -704,7 +772,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fread" => {
-                            if self.is_unsupported(&args[3]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[3]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
@@ -715,7 +785,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "getdelim" => {
-                            if self.is_unsupported(&args[3]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[3]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[3]).unwrap().ty;
@@ -726,7 +798,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "getline" => {
-                            if self.is_unsupported(&args[2]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[2]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[2]).unwrap().ty;
@@ -736,7 +810,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "feof" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let name = self.analysis_res.span_to_expr_loc[&args[0].span];
@@ -745,7 +821,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "ferror" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
                                 let new_expr =
                                     self.transform_unsupported_ferror(orig_name, &args[0], origins);
@@ -760,7 +838,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "clearerr" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ic = self.indicator_check(&args[0]);
@@ -768,7 +848,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fprintf" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fprintf",
@@ -797,6 +879,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "printf" => {
                             if self.is_stdout_unsupported {
+                                let reasons = self.stdout_unsuppoted_reasons();
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let stream = StdExpr::stdout();
@@ -813,6 +897,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "wprintf" => {
                             if self.is_stdout_unsupported {
+                                let reasons = self.stdout_unsuppoted_reasons();
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let stream = StdExpr::stdout();
@@ -828,7 +914,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "vfprintf" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_vfprintf",
@@ -850,6 +938,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "vprintf" => {
                             if self.is_stdout_unsupported {
+                                let reasons = self.stdout_unsuppoted_reasons();
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let stream = StdExpr::stdout();
@@ -858,7 +948,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fputc" | "putc" => {
-                            if self.is_unsupported(&args[1]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[1]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputc",
@@ -880,6 +972,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "putchar" => {
                             if self.is_stdout_unsupported {
+                                let reasons = self.stdout_unsuppoted_reasons();
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let stream = StdExpr::stdout();
@@ -888,7 +982,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fputwc" | "putwc" => {
-                            if self.is_unsupported(&args[1]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[1]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputwc",
@@ -909,7 +1005,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fputs" => {
-                            if self.is_unsupported(&args[1]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[1]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[1]);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fputs",
@@ -931,6 +1029,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "puts" => {
                             if self.is_stdout_unsupported {
+                                let reasons = self.stdout_unsuppoted_reasons();
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ic = self.indicator_check_std("stdout");
@@ -939,13 +1039,17 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         "perror" => {
                             if self.is_stderr_unsupported {
+                                let reasons = self.stderr_unsuppoted_reasons();
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let new_expr = self.transform_perror(&args[0]);
                             self.replace_expr(expr, new_expr);
                         }
                         "fwrite" => {
-                            if self.is_unsupported(&args[3]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[3]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[3]);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fwrite",
@@ -967,7 +1071,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fflush" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 let origins = self.bound_expr_origins(&args[0]);
                                 if let Some(new_expr) = self.transform_unsupported(
                                     "rs_fflush",
@@ -992,7 +1098,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                         }
                         "fseek" | "fseeko" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -1001,7 +1109,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "ftell" | "ftello" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -1010,7 +1120,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "rewind" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -1019,19 +1131,25 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "fgetpos" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             todo!()
                         }
                         "fsetpos" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             todo!()
                         }
                         "fileno" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -1040,7 +1158,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             self.replace_expr(expr, new_expr);
                         }
                         "flockfile" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -1053,7 +1173,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             }
                         }
                         "funlockfile" => {
-                            if self.is_unsupported(&args[0]) {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
                                 return;
                             }
                             let ty = self.bound_expr_pot(&args[0]).unwrap().ty;
@@ -1070,6 +1192,30 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let new_expr = expr!("crate::stdio::rs_remove");
                             self.replace_expr(callee, new_expr);
                         }
+                        "setvbuf" | "setbuf" => {
+                            if let Some(loc) = self.loc_if_unsupported(&args[0]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
+                                return;
+                            }
+                            panic!()
+                        }
+                        "ungetc" => {
+                            if let Some(loc) = self.loc_if_unsupported(&args[1]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
+                                return;
+                            }
+                            panic!()
+                        }
+                        "freopen" => {
+                            if let Some(loc) = self.loc_if_unsupported(&args[2]) {
+                                let reasons = self.get_unsupported_reasons(loc);
+                                self.unsupported_reasons.push(reasons);
+                                return;
+                            }
+                            panic!()
+                        }
                         _ => {
                             let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(*def_id) else {
                                 return;
@@ -1077,7 +1223,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let hir::ItemKind::Fn { sig, .. } = item.kind else { panic!() };
                             let mut targs = vec![];
                             for (i, arg) in args[..sig.decl.inputs.len()].iter_mut().enumerate() {
-                                if self.is_unsupported(arg) {
+                                if self.loc_if_unsupported(arg).is_some() {
                                     continue;
                                 }
                                 let p = Parameter::new(*def_id, i);

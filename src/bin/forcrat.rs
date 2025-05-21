@@ -148,7 +148,7 @@ fn main() {
             println!("{:?}", res.fn_tys);
         }
         Command::AnalyzeFile => {
-            file_analysis::FileAnalysis { verbose: true }.run_on_path(&file);
+            file_analysis::FileAnalysis.run_on_path(&file);
         }
         Command::AnalyzeError => {
             error_analysis::ErrorAnalysis.run_on_path(&file);
@@ -166,6 +166,7 @@ fn main() {
 
             let result = transformation::Transformation.run_on_path(&file);
             transformation::write_to_files(&result, &output);
+            println!("{}", result.unsupported_reasons.len());
         }
         Command::Preprocess { mut output } => {
             output.push(args.input.file_name().unwrap());
