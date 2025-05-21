@@ -1062,6 +1062,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                             let new_expr = self.transform_funlockfile(&stream, name);
                             self.replace_expr(expr, new_expr);
                         }
+                        "rename" => {
+                            let new_expr = expr!("crate::stdio::rs_rename");
+                            self.replace_expr(callee, new_expr);
+                        }
+                        "remove" => {
+                            let new_expr = expr!("crate::stdio::rs_remove");
+                            self.replace_expr(callee, new_expr);
+                        }
                         _ => {
                             let hir::Node::Item(item) = self.tcx.hir_node_by_def_id(*def_id) else {
                                 return;

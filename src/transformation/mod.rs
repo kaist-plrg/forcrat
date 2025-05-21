@@ -1513,6 +1513,28 @@ pub fn rs_rewind<S: std::io::Seek>(mut stream: S) {
     let _ = stream.rewind();
 }
 
+#[inline]
+pub unsafe fn rs_rename(old: *const i8, new: *const i8) -> i32 {
+    let old = std::ffi::CStr::from_ptr(old as _).to_str().unwrap();
+    let new = std::ffi::CStr::from_ptr(new as _).to_str().unwrap();
+    std::fs::rename(old, new).map_or(-1, |_| 0)
+}
+
+#[inline]
+pub unsafe fn rs_remove(path: *const i8) -> i32 {
+    let path = std::ffi::CStr::from_ptr(path as _).to_str().unwrap();
+    match std::fs::remove_file(path) {
+        Ok(()) => 0,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::IsADirectory {
+                std::fs::remove_dir(path).map_or(-1, |_| 0)
+            } else {
+                -1
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Percent,
