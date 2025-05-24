@@ -797,6 +797,8 @@ pub trait Close {
 }
 impl Close for Child {
     fn close(&mut self) -> i32 {
+        drop(self.stdout.take());
+        drop(self.stdin.take());
         self.child.wait().ok().and_then(|e| e.code()).unwrap_or(-1)
     }
 }
@@ -1010,7 +1012,7 @@ pub unsafe fn rs_fread<R: std::io::Read>(
     let mut i = 0;
     while !buf.is_empty() {
         match stream.read(buf) {
-            Ok(0) => break,
+            Ok(0) => return (i / size, 0, 1),
             Ok(n) => {
                 buf = &mut buf[n..];
                 i += n as u64;
@@ -1520,7 +1522,7 @@ pub unsafe fn rs_fwrite<W: std::io::Write>(
     let mut i = 0;
     while !buf.is_empty() {
         match stream.write(buf) {
-            Ok(0) => break,
+            Ok(0) => return (i / size, 1),
             Ok(n) => {
                 buf = &buf[n..];
                 i += n as u64;
