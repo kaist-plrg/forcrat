@@ -2289,7 +2289,12 @@ unsafe fn f() {
     fgetc(u.y.stream);
     fclose(u.y.stream);
 }"#,
-        &["crate::stdio::rs_fgetc", "File", "ManuallyDrop"],
+        &[
+            "crate::stdio::rs_fgetc",
+            "File",
+            "ManuallyDrop",
+            "ptr::write",
+        ],
         &["FILE"],
     );
 }

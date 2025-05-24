@@ -354,6 +354,14 @@ impl<'a> TransformVisitor<'_, 'a> {
         let loc_id = self.analysis_res.loc_ind_map[&loc];
         self.analysis_res.unsupported.get_reasons(loc_id)
     }
+
+    fn should_prevent_drop(&self, lhs: &Expr) -> bool {
+        if self.manually_drop_projections.contains(&lhs.span) {
+            return true;
+        }
+        let (ExprKind::Paren(e) | ExprKind::Field(e, _)) = &lhs.kind else { return false };
+        self.should_prevent_drop(e)
+    }
 }
 
 impl MutVisitor for TransformVisitor<'_, '_> {
@@ -1367,6 +1375,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 
                 let ic = self.indicator_check(lhs);
                 let s = self.clear(ic);
+
+                if self.should_prevent_drop(lhs) {
+                    let lhs = pprust::expr_to_string(lhs);
+                    let rhs = pprust::expr_to_string(rhs);
+                    let new_expr = expr!("std::ptr::write(&mut ({}), {})", lhs, rhs);
+                    self.replace_expr(expr, new_expr);
+                }
+
                 if s != "()" {
                     let expr_str = pprust::expr_to_string(expr);
                     let new_expr = expr!("{{ {}; {} }}", s, expr_str);
@@ -1694,7 +1710,7 @@ impl TransformVisitor<'_, '_> {
                 .{1}(std::process::Stdio::piped())
                 .spawn()
                 .ok()
-                .map(|c| crate::stdio::Child(c))"#,
+                .map(|c| crate::stdio::Child::new(c))"#,
                     command,
                     field
                 )

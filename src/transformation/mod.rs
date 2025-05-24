@@ -742,28 +742,53 @@ impl<T: AsRawFd + std::io::Write> AsRawFd for std::io::BufWriter<T> {
         self.get_ref().as_raw_fd()
     }
 }
-pub struct Child(pub std::process::Child);
+pub struct Child {
+    child: std::process::Child,
+    stdout: Option<std::io::BufReader<std::process::ChildStdout>>,
+    stdin: Option<std::io::BufWriter<std::process::ChildStdin>>,
+}
+impl Child {
+    #[inline]
+    pub fn new(mut child: std::process::Child) -> Self {
+        let stdout = child.stdout.take().map(std::io::BufReader::new);
+        let stdin = child.stdin.take().map(std::io::BufWriter::new);
+        Self {
+            child,
+            stdout,
+            stdin,
+        }
+    }
+}
 impl std::io::Read for Child {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.stdout.as_mut().unwrap().read(buf)
+        self.stdout.as_mut().unwrap().read(buf)
     }
 }
 impl std::io::Write for Child {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.stdin.as_mut().unwrap().write(buf)
+        self.stdin.as_mut().unwrap().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.stdin.as_mut().unwrap().flush()
+        self.stdin.as_mut().unwrap().flush()
+    }
+}
+impl AsRawFd for std::process::ChildStdin {
+    fn as_raw_fd(&self) -> i32 {
+        std::os::unix::io::AsRawFd::as_raw_fd(self)
+    }
+}
+impl AsRawFd for std::process::ChildStdout {
+    fn as_raw_fd(&self) -> i32 {
+        std::os::unix::io::AsRawFd::as_raw_fd(self)
     }
 }
 impl AsRawFd for Child {
     fn as_raw_fd(&self) -> i32 {
-        self.0
-            .stdout
+        self.stdout
             .as_ref()
-            .map(std::os::fd::AsRawFd::as_raw_fd)
-            .or_else(|| self.0.stdin.as_ref().map(std::os::fd::AsRawFd::as_raw_fd))
+            .map(AsRawFd::as_raw_fd)
+            .or_else(|| self.stdin.as_ref().map(AsRawFd::as_raw_fd))
             .unwrap()
     }
 }
@@ -772,7 +797,7 @@ pub trait Close {
 }
 impl Close for Child {
     fn close(&mut self) -> i32 {
-        self.0.wait().ok().and_then(|e| e.code()).unwrap_or(-1)
+        self.child.wait().ok().and_then(|e| e.code()).unwrap_or(-1)
     }
 }
 impl Close for std::fs::File {
@@ -981,21 +1006,23 @@ pub unsafe fn rs_fread<R: std::io::Read>(
     nitems: u64,
     mut stream: R,
 ) -> (u64, i32, i32) {
-    let ptr: &mut [u8] = std::slice::from_raw_parts_mut(ptr as _, (size * nitems) as usize);
+    let mut buf: &mut [u8] = std::slice::from_raw_parts_mut(ptr as _, (size * nitems) as usize);
     let mut i = 0;
-    for data in ptr.chunks_mut(size as usize) {
-        match stream.read_exact(data) {
-            Ok(_) => i += 1,
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                    return (i, 1, 0);
-                } else {
-                    return (i, 0, 1);
-                }
+    while !buf.is_empty() {
+        match stream.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf = &mut buf[n..];
+                i += n as u64;
             }
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::UnexpectedEof => return (i / size, 0, 1),
+                _ => return (i / size, 1, 0),
+            },
         }
     }
-    (i, 0, 0)
+    (i / size, 0, 0)
 }
 
 #[inline]
@@ -1489,15 +1516,23 @@ pub unsafe fn rs_fwrite<W: std::io::Write>(
     nitems: u64,
     mut stream: W,
 ) -> (u64, i32) {
-    let ptr: &[u8] = std::slice::from_raw_parts(ptr as _, (size * nitems) as usize);
+    let mut buf: &[u8] = std::slice::from_raw_parts(ptr as _, (size * nitems) as usize);
     let mut i = 0;
-    for data in ptr.chunks(size as usize) {
-        match stream.write_all(data) {
-            Ok(_) => i += 1,
-            Err(_) => return (i, 1),
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf = &buf[n..];
+                i += n as u64;
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return (i / size, 1);
+                }
+            }
         }
     }
-    (i, 0)
+    (i / size, 0)
 }
 
 #[inline]
