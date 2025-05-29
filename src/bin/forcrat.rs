@@ -183,9 +183,13 @@ fn main() {
             transformation::write_to_files(&result, &output);
             let time = start.elapsed().as_millis();
             if show_times {
-                println!("{}", result.error_analysis_time);
-                println!("{}", result.file_analysis_time);
-                println!("{}", result.transformation_time + time);
+                println!(
+                    "{} {} {} {}",
+                    result.error_analysis_time,
+                    result.file_analysis_time,
+                    result.solving_time,
+                    result.transformation_time + time
+                );
             }
             if show_unsupported_reasons {
                 for reasons in result.unsupported_reasons {

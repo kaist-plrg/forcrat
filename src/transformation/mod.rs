@@ -65,6 +65,7 @@ pub struct TransformationResult {
     pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
     pub error_analysis_time: u128,
     pub file_analysis_time: u128,
+    pub solving_time: u128,
     pub transformation_time: u128,
 }
 
@@ -603,6 +604,7 @@ impl Pass for Transformation {
             unsupported_reasons,
             error_analysis_time: analysis_res.error_analysis_time,
             file_analysis_time: analysis_res.file_analysis_time,
+            solving_time: analysis_res.solving_time,
             transformation_time,
         }
     }

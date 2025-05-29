@@ -56,6 +56,7 @@ pub struct AnalysisResult<'a> {
     pub unsupported_stderr_errors: bool,
     pub error_analysis_time: u128,
     pub file_analysis_time: u128,
+    pub solving_time: u128,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -204,6 +205,9 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
 
     let origin_edges = analyzer.origin_graph.edges.clone();
 
+    let file_analysis_time = start.elapsed().as_millis();
+
+    let start = std::time::Instant::now();
     let permissions = analyzer.permission_graph.solve();
     let mut origins = analyzer.origin_graph.solve();
 
@@ -315,7 +319,7 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
 
     let fn_ptrs = analyzer.fn_ptrs;
 
-    let file_analysis_time = start.elapsed().as_millis();
+    let solving_time = start.elapsed().as_millis();
 
     AnalysisResult {
         locs,
@@ -335,6 +339,7 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
         unsupported_stderr_errors,
         error_analysis_time,
         file_analysis_time,
+        solving_time,
     }
 }
 
