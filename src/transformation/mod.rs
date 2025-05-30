@@ -63,11 +63,8 @@ pub struct TransformationResult {
     stderr_error: bool,
     bounds: FxHashSet<TraitBound>,
     pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
-    pub error_visit_nums: Vec<usize>,
-    pub error_analysis_time: u128,
-    pub file_analysis_time: u128,
-    pub solving_time: u128,
     pub transformation_time: u128,
+    pub analysis_stat: file_analysis::Statistics,
 }
 
 impl TransformationResult {
@@ -603,11 +600,8 @@ impl Pass for Transformation {
             stdout_error: analysis_res.unsupported_stdout_errors,
             stderr_error: analysis_res.unsupported_stderr_errors,
             unsupported_reasons,
-            error_visit_nums: analysis_res.error_visit_nums,
-            error_analysis_time: analysis_res.error_analysis_time,
-            file_analysis_time: analysis_res.file_analysis_time,
-            solving_time: analysis_res.solving_time,
             transformation_time,
+            analysis_stat: analysis_res.stat,
         }
     }
 }

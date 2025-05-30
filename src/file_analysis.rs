@@ -54,10 +54,17 @@ pub struct AnalysisResult<'a> {
     pub propagations: FxHashSet<ErrorPropagation<'a>>,
     pub unsupported_stdout_errors: bool,
     pub unsupported_stderr_errors: bool,
+    pub stat: Statistics,
+}
+
+#[derive(Debug)]
+pub struct Statistics {
     pub error_visit_nums: Vec<usize>,
     pub error_analysis_time: u128,
     pub file_analysis_time: u128,
     pub solving_time: u128,
+    pub loc_num: usize,
+    pub unsupported_num: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -318,9 +325,17 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
         }
     }
 
-    let fn_ptrs = analyzer.fn_ptrs;
-
     let solving_time = start.elapsed().as_millis();
+
+    let fn_ptrs = analyzer.fn_ptrs;
+    let stat = Statistics {
+        error_visit_nums: error_analysis.visit_nums,
+        error_analysis_time,
+        file_analysis_time,
+        solving_time,
+        loc_num: locs.len(),
+        unsupported_num: unsupported.loc_to_root.len(),
+    };
 
     AnalysisResult {
         locs,
@@ -338,10 +353,7 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
         propagations,
         unsupported_stdout_errors,
         unsupported_stderr_errors,
-        error_visit_nums: error_analysis.visit_nums,
-        error_analysis_time,
-        file_analysis_time,
-        solving_time,
+        stat,
     }
 }
 
