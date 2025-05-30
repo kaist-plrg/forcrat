@@ -203,8 +203,10 @@ fn main() {
             }
             if show_loc_nums {
                 println!(
-                    "{} {}",
-                    result.analysis_stat.loc_num, result.analysis_stat.unsupported_num
+                    "{} {} {}",
+                    result.analysis_stat.loc_num,
+                    result.analysis_stat.unsupported_num,
+                    result.bound_num,
                 );
             }
             if show_unsupported_reasons {

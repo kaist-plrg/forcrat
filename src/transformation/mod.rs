@@ -63,6 +63,7 @@ pub struct TransformationResult {
     stderr_error: bool,
     bounds: FxHashSet<TraitBound>,
     pub unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
+    pub bound_num: usize,
     pub transformation_time: u128,
     pub analysis_stat: file_analysis::Statistics,
 }
@@ -531,6 +532,7 @@ impl Pass for Transformation {
         let mut files = vec![];
         let mut tmpfile = false;
         let mut bounds = FxHashSet::default();
+        let mut bound_num = 0;
         let mut unsupported_reasons = vec![];
 
         for file in source_map.files().iter() {
@@ -576,6 +578,7 @@ impl Pass for Transformation {
                 tmpfile: false,
                 current_fns: vec![],
                 bounds: vec![],
+                bound_num: 0,
                 guards: FxHashSet::default(),
                 foreign_statics: FxHashSet::default(),
                 unsupported_reasons: vec![],
@@ -586,6 +589,7 @@ impl Pass for Transformation {
                 files.push((file.name.clone(), s));
                 tmpfile |= visitor.tmpfile;
                 bounds.extend(visitor.bounds);
+                bound_num += visitor.bound_num;
             }
             unsupported = visitor.unsupported;
             unsupported_reasons.extend(visitor.unsupported_reasons);
@@ -600,6 +604,7 @@ impl Pass for Transformation {
             stdout_error: analysis_res.unsupported_stdout_errors,
             stderr_error: analysis_res.unsupported_stderr_errors,
             unsupported_reasons,
+            bound_num,
             transformation_time,
             analysis_stat: analysis_res.stat,
         }

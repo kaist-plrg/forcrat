@@ -71,6 +71,7 @@ pub(super) struct TransformVisitor<'tcx, 'a> {
     pub(super) tmpfile: bool,
     pub(super) current_fns: Vec<LocalDefId>,
     pub(super) bounds: Vec<TraitBound>,
+    pub(super) bound_num: usize,
     pub(super) guards: FxHashSet<Symbol>,
     pub(super) foreign_statics: FxHashSet<&'static str>,
     pub(super) unsupported_reasons: Vec<BitSet16<UnsupportedReason>>,
@@ -208,6 +209,7 @@ impl<'a> TransformVisitor<'_, 'a> {
     #[inline]
     fn replace_ty_with_pot(&mut self, old: &mut Ty, pot: Pot<'_>) {
         if let Some(bound) = pot.ty.get_dyn_bound() {
+            self.bound_num += 1;
             if bound.count() > 1 {
                 self.bounds.push(bound);
             }
@@ -630,6 +632,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             self.replace_ty_with_pot(ty, pot);
         } else {
             if let Some(bound) = pot.ty.get_dyn_bound() {
+                self.bound_num += 1;
                 if bound.count() > 1 {
                     self.bounds.push(bound);
                 }
