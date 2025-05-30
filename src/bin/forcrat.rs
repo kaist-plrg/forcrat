@@ -44,6 +44,8 @@ enum Command {
         #[arg(long, default_value = "false")]
         show_times: bool,
         #[arg(long, default_value = "false")]
+        show_visit_nums: bool,
+        #[arg(long, default_value = "false")]
         show_unsupported_reasons: bool,
     },
 }
@@ -166,6 +168,7 @@ fn main() {
         Command::Transform {
             mut output,
             show_times,
+            show_visit_nums,
             show_unsupported_reasons,
         } => {
             output.push(args.input.file_name().unwrap());
@@ -189,6 +192,13 @@ fn main() {
                     result.file_analysis_time,
                     result.solving_time,
                     result.transformation_time + time
+                );
+            }
+            if show_visit_nums {
+                println!(
+                    "{} {}",
+                    result.error_visit_nums.len(),
+                    result.error_visit_nums.iter().sum::<usize>()
                 );
             }
             if show_unsupported_reasons {

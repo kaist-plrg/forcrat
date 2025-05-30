@@ -63,6 +63,7 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
 
             let label = Label::new(func, bb, loc);
             let sink_result = analyze_sink(label, FxHashSet::default(), arena, &visitor.ctx, tcx);
+            result.visit_nums.push(sink_result.visited_fns.len());
 
             if sink_result.sources.is_empty() {
                 result.no_source_locs.push(hir_loc);
@@ -146,6 +147,7 @@ pub struct AnalysisResult<'a> {
     pub no_source_locs: Vec<Loc>,
     pub span_to_loc: FxHashMap<Span, &'a ExprLoc>,
     pub loc_results: Vec<(Loc, LocAnalysisResult<'a>)>,
+    pub visit_nums: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -273,6 +275,7 @@ impl<'a> FuncLoc<'a> {
 struct SinkResult<'a> {
     sources: Vec<FuncLoc<'a>>,
     call_graph: FxHashMap<FuncLoc<'a>, FxHashSet<FuncLoc<'a>>>,
+    visited_fns: FxHashSet<LocalDefId>,
 }
 
 fn analyze_sink<'a>(
@@ -292,11 +295,13 @@ fn analyze_sink<'a>(
     let mut sources = vec![];
     let mut call_graph: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
     let mut fn_ptr_call = false;
+    let mut visited_fns = FxHashSet::default();
 
     'l: while let Some(label) = worklist.pop() {
         if !visited.insert(label) {
             continue;
         }
+        visited_fns.insert(label.func_loc.func);
 
         let body = tcx.optimized_mir(label.func_loc.func);
         let bbd = &body.basic_blocks[label.bb];
@@ -389,6 +394,7 @@ fn analyze_sink<'a>(
 
                 if !analyzed_labels.contains(&caller_label) {
                     let res = analyze_sink(caller_label, analyzed_labels.clone(), arena, ctx, tcx);
+                    visited_fns.extend(res.visited_fns);
                     if !res.sources.is_empty() {
                         sources.extend(res.sources);
                         for (caller, callees) in res.call_graph {
@@ -411,6 +417,7 @@ fn analyze_sink<'a>(
     SinkResult {
         sources,
         call_graph,
+        visited_fns,
     }
 }
 
