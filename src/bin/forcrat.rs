@@ -42,11 +42,7 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
         #[arg(long, default_value = "false")]
-        show_times: bool,
-        #[arg(long, default_value = "false")]
-        show_visit_nums: bool,
-        #[arg(long, default_value = "false")]
-        show_loc_nums: bool,
+        show_stats: bool,
         #[arg(long, default_value = "false")]
         show_unsupported_reasons: bool,
     },
@@ -169,9 +165,7 @@ fn main() {
         }
         Command::Transform {
             mut output,
-            show_times,
-            show_visit_nums,
-            show_loc_nums,
+            show_stats,
             show_unsupported_reasons,
         } => {
             output.push(args.input.file_name().unwrap());
@@ -188,22 +182,16 @@ fn main() {
             let start = std::time::Instant::now();
             transformation::write_to_files(&result, &output);
             let time = start.elapsed().as_millis();
-            if show_times {
+            if show_stats {
+                let visit_nums = result.analysis_stat.error_visit_nums;
                 println!(
-                    "{} {} {} {}",
+                    "{} {} {} {} {} {} {} {} {}",
                     result.analysis_stat.file_analysis_time,
                     result.analysis_stat.solving_time,
                     result.analysis_stat.error_analysis_time,
-                    result.transformation_time + time
-                );
-            }
-            if show_visit_nums {
-                let visit_nums = result.analysis_stat.error_visit_nums;
-                println!("{} {}", visit_nums.len(), visit_nums.iter().sum::<usize>());
-            }
-            if show_loc_nums {
-                println!(
-                    "{} {} {}",
+                    result.transformation_time + time,
+                    visit_nums.len(),
+                    visit_nums.iter().sum::<usize>(),
                     result.analysis_stat.loc_num,
                     result.analysis_stat.unsupported_num,
                     result.bound_num,
