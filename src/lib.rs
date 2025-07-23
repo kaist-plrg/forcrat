@@ -53,6 +53,7 @@ pub mod api_list;
 #[macro_use]
 pub mod ast_maker;
 pub mod bit_set;
+pub mod check_unsafety;
 pub mod compile_util;
 pub mod disjoint_set;
 pub mod error_analysis;

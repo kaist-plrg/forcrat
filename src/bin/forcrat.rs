@@ -25,6 +25,7 @@ enum Command {
         distinguish_std_args: bool,
     },
     CountReturnValues,
+    CountUnsafe,
     FindFileReturns,
     FindFileTypes {
         #[arg(long, default_value = "false")]
@@ -143,6 +144,9 @@ fn main() {
             for (name, counts) in counts {
                 println!("{} {} {}", name, counts.used, counts.unused);
             }
+        }
+        Command::CountUnsafe => {
+            check_unsafety::UnsafetyChecker.run_on_path(&file);
         }
         Command::FindFileReturns => {
             return_finder::ReturnFinder.run_on_path(&file);
