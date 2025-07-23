@@ -18,7 +18,7 @@ use rustc_middle::{
 };
 use rustc_span::{
     def_id::{DefId, LocalDefId},
-    sym, Span, Symbol,
+    sym, FileName, RealFileName, Span, Symbol,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +49,12 @@ impl Pass for UnsafetyChecker {
                 }
 
                 let fname = source_map.span_to_filename(span);
+                if !matches!(
+                    fname,
+                    FileName::Real(RealFileName::LocalPath(_)) | FileName::Custom(_)
+                ) {
+                    continue;
+                }
                 let file = source_map.get_source_file(&fname).unwrap();
                 let lo = file.lookup_file_pos_with_col_display(span.lo());
                 let hi = file.lookup_file_pos_with_col_display(span.hi());
