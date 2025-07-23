@@ -2678,6 +2678,7 @@ const PREAMBLE: &str = r#"
 #![feature(extern_types)]
 #![feature(c_variadic)]
 #![feature(formatting_options)]
+#![feature(file_lock)]
 #[macro_use]
 extern crate c2rust_bitfields;
 use ::libc;

@@ -51,6 +51,9 @@ pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
     if !contents.contains("#![feature(formatting_options)]") {
         contents = format!("#![feature(formatting_options)]\n{contents}");
     }
+    if !contents.contains("#![feature(file_lock)]") {
+        contents = format!("#![feature(file_lock)]\n{contents}");
+    }
     contents.push_str(&res.stdio_mod());
     fs::write(path, contents).unwrap();
 }
@@ -1194,22 +1197,22 @@ pub unsafe fn rs_vfprintf<W: std::io::Write>(
             if let Some(width) = width.take() {
                 match width {
                     Width::Asterisk => {
-                        let width = args.arg::<usize>();
+                        let width = args.arg::<u16>();
                         opt.width(Some(width));
                     }
                     Width::Decimal(n) => {
-                        opt.width(Some(n));
+                        opt.width(Some(n as u16));
                     }
                 }
             }
             if let Some(precision) = precision.take() {
                 match precision {
                     Width::Asterisk => {
-                        let precision = args.arg::<usize>();
+                        let precision = args.arg::<u16>();
                         opt.precision(Some(precision));
                     }
                     Width::Decimal(n) => {
-                        opt.precision(Some(n));
+                        opt.precision(Some(n as u16));
                     }
                 }
             }
