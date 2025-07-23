@@ -76,7 +76,7 @@ impl Pass for FileAnalysis {
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let arena = Arena::new();
         let result = analyze(&arena, tcx);
-        println!("{:#?}", result);
+        println!("{result:#?}");
     }
 }
 
@@ -466,13 +466,13 @@ impl<'tcx> Analyzer<'_, 'tcx> {
             }
             Rvalue::Aggregate(box AggregateKind::Adt(def_id, _, _, _, field_idx), fields) => {
                 if compile_util::is_option_ty(def_id, self.tcx) {
-                    if !fields.is_empty() {
-                        if let Some(variance) = variance {
-                            let l = self.transfer_place(*l, ctx);
-                            let [f] = &fields.as_slice().raw else { panic!() };
-                            let r = self.transfer_operand(f, ctx);
-                            self.assign(l, r, variance);
-                        }
+                    if !fields.is_empty()
+                        && let Some(variance) = variance
+                    {
+                        let l = self.transfer_place(*l, ctx);
+                        let [f] = &fields.as_slice().raw else { panic!() };
+                        let r = self.transfer_operand(f, ctx);
+                        self.assign(l, r, variance);
                     }
                 } else {
                     assert!(variance.is_none());
@@ -778,7 +778,7 @@ fn strip_index_projection<'a, 'tcx>(
         }
         PlaceElem::Field(f, _) => Some((init, *f)),
         PlaceElem::Index(_) => strip_index_projection(init),
-        _ => panic!("{:?}", projection),
+        _ => panic!("{projection:?}"),
     }
 }
 
@@ -791,10 +791,10 @@ enum Variance {
 fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance> {
     let v = match ty.kind() {
         TyKind::RawPtr(ty, mutbl) | TyKind::Ref(_, ty, mutbl) => {
-            if let TyKind::Adt(adt_def, _) = ty.kind() {
-                if compile_util::is_file_ty(adt_def.did(), tcx) {
-                    return Some(Variance::Covariant);
-                }
+            if let TyKind::Adt(adt_def, _) = ty.kind()
+                && compile_util::is_file_ty(adt_def.did(), tcx)
+            {
+                return Some(Variance::Covariant);
             }
             let v = file_type_variance(*ty, tcx)?;
             if mutbl.is_not() {
@@ -825,8 +825,7 @@ fn file_type_variance<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Option<Variance>
     assert_eq!(
         v.is_some(),
         compile_util::contains_file_ty(ty, tcx),
-        "{:?}",
-        ty
+        "{ty:?}"
     );
     v
 }
@@ -957,7 +956,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 for (rep, ids) in &cycles {
                     for id in ids.iter() {
                         if *rep != id {
-                            let set = std::mem::replace(&mut deltas[id], BitSet8::new_empty());
+                            let set = std::mem::take(&mut deltas[id]);
                             deltas[*rep].union(&set);
                         }
                     }
@@ -970,7 +969,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                     for id in ids.iter() {
                         intersection.intersect(&solutions[id]);
                         if *rep != id {
-                            let set = std::mem::replace(&mut solutions[id], BitSet8::new_empty());
+                            let set = std::mem::take(&mut solutions[id]);
                             solutions[*rep].union(&set);
                         }
                     }
@@ -993,7 +992,7 @@ impl<V: Idx, T: Idx> Graph<V, T> {
                 if deltas[v].is_empty() {
                     continue;
                 }
-                let delta = std::mem::replace(&mut deltas[v], BitSet8::new_empty());
+                let delta = std::mem::take(&mut deltas[v]);
 
                 for l in edges[v].iter() {
                     if l == v {

@@ -46,10 +46,10 @@ pub fn write_to_files(res: &TransformationResult, dir: &std::path::Path) {
     let path = dir.join("c2rust-lib.rs");
     let mut contents = fs::read_to_string(&path).unwrap();
     if !contents.contains("#![feature(c_variadic)]") {
-        contents = format!("#![feature(c_variadic)]\n{}", contents);
+        contents = format!("#![feature(c_variadic)]\n{contents}");
     }
     if !contents.contains("#![feature(formatting_options)]") {
-        contents = format!("#![feature(formatting_options)]\n{}", contents);
+        contents = format!("#![feature(formatting_options)]\n{contents}");
     }
     contents.push_str(&res.stdio_mod());
     fs::write(path, contents).unwrap();
@@ -415,10 +415,10 @@ impl Pass for Transformation {
 
                 ctx.is_non_local_assign |= non_local_assigns.contains(&hir_loc);
 
-                if let Some(param) = hir_loc_to_param.get(&hir_loc) {
-                    if !non_generic_params.contains(param) {
-                        ctx.is_generic = true;
-                    }
+                if let Some(param) = hir_loc_to_param.get(&hir_loc)
+                    && !non_generic_params.contains(param)
+                {
+                    ctx.is_generic = true;
                 }
 
                 if file_param_index(ctx.ty, tcx).is_some() {
@@ -426,10 +426,10 @@ impl Pass for Transformation {
                 }
 
                 let ty = type_arena.make_ty(permissions, origins, ctx, tcx);
-                if !ty.is_copyable() {
-                    if let HirLoc::Field(def_id, field) = hir_loc {
-                        uncopiable.push((def_id, field));
-                    }
+                if !ty.is_copyable()
+                    && let HirLoc::Field(def_id, field) = hir_loc
+                {
+                    uncopiable.push((def_id, field));
                 }
 
                 let pot = Pot {
@@ -440,7 +440,7 @@ impl Pass for Transformation {
                 };
                 let old = hir_loc_to_pot.insert(hir_loc, pot);
                 if let Some(old) = old {
-                    assert_eq!(pot, old, "{:?}", hir_loc);
+                    assert_eq!(pot, old, "{hir_loc:?}");
                 }
             }
         }
@@ -628,11 +628,11 @@ fn mir_local_span(
     let hir::Node::Item(item) = node else { panic!() };
     let body = match item.kind {
         hir::ItemKind::Fn { .. } => {
-            if local == mir::Local::ZERO {
-                if let Some(hir_id) = return_locals.get(&def_id) {
-                    let loc = HirLoc::Local(*hir_id);
-                    return hir_ctx.loc_to_binding_span[&loc];
-                }
+            if local == mir::Local::ZERO
+                && let Some(hir_id) = return_locals.get(&def_id)
+            {
+                let loc = HirLoc::Local(*hir_id);
+                return hir_ctx.loc_to_binding_span[&loc];
             }
             tcx.optimized_mir(def_id)
         }

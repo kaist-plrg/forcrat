@@ -173,10 +173,10 @@ fn find_deps() -> Options {
     let mut args = vec!["a.rs".to_string()];
 
     let dir = std::env::var("DIR").unwrap_or_else(|_| ".".to_string());
-    let dep = format!("{}/deps_crate/target/debug/deps", dir);
+    let dep = format!("{dir}/deps_crate/target/debug/deps");
     if let Ok(dir) = std::fs::read_dir(&dep) {
         args.push("-L".to_string());
-        args.push(format!("dependency={}", dep));
+        args.push(format!("dependency={dep}"));
 
         for f in dir {
             let f = ok_or!(f, continue);
@@ -186,7 +186,7 @@ fn find_deps() -> Options {
             }
             let i = f.find('-').unwrap();
             let name = f[3..i].to_string();
-            let d = format!("{}={}/{}", name, dep, f);
+            let d = format!("{name}={dep}/{f}");
             args.push("--extern".to_string());
             args.push(d);
         }
@@ -247,7 +247,7 @@ pub fn body_to_str(body: &Body<'_>) -> String {
     let mut s = String::new();
     for bbd in body.basic_blocks.iter() {
         for stmt in &bbd.statements {
-            writeln!(s, "{:?}", stmt).unwrap();
+            writeln!(s, "{stmt:?}").unwrap();
         }
         if !matches!(
             bbd.terminator().kind,
@@ -321,10 +321,10 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for FileTypeVisitor<'tcx> {
     type Result = ControlFlow<()>;
 
     fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
-        if let TyKind::Adt(adt_def, _) = t.kind() {
-            if is_file_ty(adt_def.did(), self.tcx) {
-                return ControlFlow::Break(());
-            }
+        if let TyKind::Adt(adt_def, _) = t.kind()
+            && is_file_ty(adt_def.did(), self.tcx)
+        {
+            return ControlFlow::Break(());
         }
         t.super_visit_with(self)
     }

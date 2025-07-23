@@ -34,7 +34,7 @@ impl Pass for ErrorAnalysis {
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let arena = Arena::new();
         let result = analyze(&arena, tcx);
-        println!("{:#?}", result);
+        println!("{result:#?}");
     }
 }
 
@@ -452,7 +452,7 @@ impl std::fmt::Debug for ExprLoc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.base)?;
         for proj in &self.projections {
-            write!(f, "{:?}", proj)?;
+            write!(f, "{proj:?}")?;
         }
         Ok(())
     }
@@ -462,7 +462,7 @@ impl std::fmt::Display for ExprLoc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.base)?;
         for proj in &self.projections {
-            write!(f, "_{}", proj)?;
+            write!(f, "_{proj}")?;
         }
         Ok(())
     }
@@ -547,13 +547,13 @@ impl std::fmt::Display for ExprBase {
             ExprBase::Stderr => write!(f, "stderr"),
             ExprBase::Global(def_id) => compile_util::with_tcx(|tcx| {
                 let name = compile_util::def_id_to_value_symbol(*def_id, tcx).unwrap();
-                write!(f, "{}", name)
+                write!(f, "{name}")
             }),
             ExprBase::Local(hir_id) => compile_util::with_tcx(|tcx| {
                 let node = tcx.hir_node(*hir_id);
                 let Node::Pat(pat) = node else { panic!() };
                 let PatKind::Binding(_, _, name, _) = pat.kind else { panic!() };
-                write!(f, "{}", name)
+                write!(f, "{name}")
             }),
         }
     }
@@ -582,7 +582,7 @@ enum ExprProj {
 impl std::fmt::Debug for ExprProj {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExprProj::Field(name) => write!(f, ".{}", name),
+            ExprProj::Field(name) => write!(f, ".{name}"),
             ExprProj::Index => write!(f, "[*]"),
         }
     }
@@ -591,7 +591,7 @@ impl std::fmt::Debug for ExprProj {
 impl std::fmt::Display for ExprProj {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExprProj::Field(name) => write!(f, "{}", name),
+            ExprProj::Field(name) => write!(f, "{name}"),
             ExprProj::Index => write!(f, "index"),
         }
     }
@@ -720,10 +720,10 @@ impl<'tcx> Visitor<'tcx> for HirVisitor<'_, 'tcx> {
                 let mut parents = self.tcx.hir_parent_iter(expr.hir_id);
                 let (_, parent) = parents.next().unwrap();
                 let Node::Expr(parent) = parent else { panic!() };
-                if let ExprKind::Call(callee, _) = parent.kind {
-                    if callee.hir_id == expr.hir_id {
-                        return;
-                    }
+                if let ExprKind::Call(callee, _) = parent.kind
+                    && callee.hir_id == expr.hir_id
+                {
+                    return;
                 }
                 self.ctx.ptr_used_fns.insert(def_id);
             }

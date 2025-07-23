@@ -241,21 +241,21 @@ impl std::fmt::Display for StreamType<'_> {
             Self::Stdout => write!(f, "std::io::Stdout"),
             Self::Stderr => write!(f, "std::io::Stderr"),
             Self::Child => write!(f, "crate::stdio::Child"),
-            Self::Option(t) => write!(f, "Option<{}>", t),
-            Self::BufWriter(t) => write!(f, "std::io::BufWriter<{}>", t),
-            Self::BufReader(t) => write!(f, "std::io::BufReader<{}>", t),
-            Self::Ptr(t) => write!(f, "*mut {}", t),
-            Self::Ref(t) => write!(f, "&mut {}", t),
-            Self::Box(t) => write!(f, "Box<{}>", t),
-            Self::ManuallyDrop(t) => write!(f, "std::mem::ManuallyDrop<{}>", t),
+            Self::Option(t) => write!(f, "Option<{t}>"),
+            Self::BufWriter(t) => write!(f, "std::io::BufWriter<{t}>"),
+            Self::BufReader(t) => write!(f, "std::io::BufReader<{t}>"),
+            Self::Ptr(t) => write!(f, "*mut {t}"),
+            Self::Ref(t) => write!(f, "&mut {t}"),
+            Self::Box(t) => write!(f, "Box<{t}>"),
+            Self::ManuallyDrop(t) => write!(f, "std::mem::ManuallyDrop<{t}>"),
             Self::Dyn(traits) => {
                 if traits.count() == 1 {
-                    write!(f, "dyn {}", traits)
+                    write!(f, "dyn {traits}")
                 } else {
                     write!(f, "dyn crate::stdio::{}", traits.trait_name())
                 }
             }
-            Self::Impl(traits) => write!(f, "impl {}", traits),
+            Self::Impl(traits) => write!(f, "impl {traits}"),
         }
     }
 }
@@ -412,43 +412,39 @@ pub(super) fn convert_expr(
             if from.is_copyable() {
                 let body = convert_expr(*to, *from, "x", true, false);
                 if to.contains_impl() {
-                    format!("({}).map(|mut x| {})", expr, body)
+                    format!("({expr}).map(|mut x| {body})")
                 } else {
-                    format!("({}).map::<{}, _>(|mut x| {})", expr, to, body)
+                    format!("({expr}).map::<{to}, _>(|mut x| {body})")
                 }
             } else if consume {
                 let body = convert_expr(*to, *from, "x", true, false);
                 if is_non_local {
                     if to.contains_impl() {
-                        format!("({}).take().map(|mut x| {})", expr, body)
+                        format!("({expr}).take().map(|mut x| {body})")
                     } else {
-                        format!("({}).take().map::<{}, _>(|mut x| {})", expr, to, body)
+                        format!("({expr}).take().map::<{to}, _>(|mut x| {body})")
                     }
                 } else if to.contains_impl() {
-                    format!("({}).map(|mut x| {})", expr, body)
+                    format!("({expr}).map(|mut x| {body})")
                 } else {
-                    format!("({}).map::<{}, _>(|mut x| {})", expr, to, body)
+                    format!("({expr}).map::<{to}, _>(|mut x| {body})")
                 }
             } else {
                 let body = convert_expr(*to, Ref(from), "x", true, false);
                 if to.contains_impl() {
-                    format!("({}).as_mut().map(|mut x| {})", expr, body)
+                    format!("({expr}).as_mut().map(|mut x| {body})")
                 } else {
-                    format!("({}).as_mut().map::<{}, _>(|mut x| {})", expr, to, body)
+                    format!("({expr}).as_mut().map::<{to}, _>(|mut x| {body})")
                 }
             }
         }
         (Ptr(to), Option(from)) if to == from => {
-            format!(
-                "({}).as_ref().map_or(std::ptr::null_mut(), |r| r as *const _ as *mut _)",
-                expr
-            )
+            format!("({expr}).as_ref().map_or(std::ptr::null_mut(), |r| r as *const _ as *mut _)")
         }
         (Ptr(BufReader(File)), Option(File)) => {
             if consume {
                 format!(
-                    "Box::leak(Box::new(({}).map(std::io::BufReader::new))).as_mut().map_or(std::ptr::null_mut(), |x| x as _)",
-                    expr
+                    "Box::leak(Box::new(({expr}).map(std::io::BufReader::new))).as_mut().map_or(std::ptr::null_mut(), |x| x as _)"
                 )
             } else {
                 panic!()
@@ -457,55 +453,54 @@ pub(super) fn convert_expr(
         (Ptr(BufWriter(File)), Option(File)) => {
             if consume {
                 format!(
-                    "Box::leak(Box::new(({}).map(std::io::BufWriter::new))).as_mut().map_or(std::ptr::null_mut(), |x| x as _)",
-                    expr
+                    "Box::leak(Box::new(({expr}).map(std::io::BufWriter::new))).as_mut().map_or(std::ptr::null_mut(), |x| x as _)"
                 )
             } else {
                 panic!()
             }
         }
         (Ptr(to), Ref(from)) if to == from => {
-            format!("&mut *({}) as *mut _", expr)
+            format!("&mut *({expr}) as *mut _")
         }
         (to, Option(from)) => {
             if consume || from.is_copyable() {
                 let unwrapped = if is_non_local {
-                    format!("({}).take().unwrap()", expr)
+                    format!("({expr}).take().unwrap()")
                 } else {
-                    format!("({}).unwrap()", expr)
+                    format!("({expr}).unwrap()")
                 };
                 convert_expr(to, *from, &unwrapped, true, false)
             } else {
-                let unwrapped = format!("({}).as_mut().unwrap()", expr);
+                let unwrapped = format!("({expr}).as_mut().unwrap()");
                 convert_expr(to, Ref(from), &unwrapped, true, false)
             }
         }
         (to, Ref(Option(from))) => {
-            let unwrapped = format!("({}).as_mut().unwrap()", expr);
+            let unwrapped = format!("({expr}).as_mut().unwrap()");
             convert_expr(to, Ref(from), &unwrapped, true, false)
         }
         (to, ManuallyDrop(from)) => {
             if consume {
-                let unwrapped = format!("({}).take()", expr);
+                let unwrapped = format!("({expr}).take()");
                 convert_expr(to, *from, &unwrapped, true, false)
             } else {
-                let unwrapped = format!("std::ops::DerefMut::deref_mut(&mut ({}))", expr);
+                let unwrapped = format!("std::ops::DerefMut::deref_mut(&mut ({expr}))");
                 convert_expr(to, Ref(from), &unwrapped, true, false)
             }
         }
         (Option(to), from) => {
             let converted = convert_expr(*to, from, expr, consume, is_non_local);
-            format!("Some({})", converted)
+            format!("Some({converted})")
         }
         (ManuallyDrop(to), from) => {
             let converted = convert_expr(*to, from, expr, consume, is_non_local);
-            format!("std::mem::ManuallyDrop::new({})", converted)
+            format!("std::mem::ManuallyDrop::new({converted})")
         }
         (Impl(_), File | Stdout | Stderr | Child | BufWriter(_) | BufReader(_) | Box(Dyn(_))) => {
             if consume {
                 expr.to_string()
             } else {
-                format!("&mut ({})", expr)
+                format!("&mut ({expr})")
             }
         }
         (
@@ -515,39 +510,39 @@ pub(super) fn convert_expr(
         ) => expr.to_string(),
         (Impl(traits), Stdin) => {
             if traits.contains(StreamTrait::BufRead) {
-                format!("({}).lock()", expr)
+                format!("({expr}).lock()")
             } else if consume {
                 expr.to_string()
             } else {
-                format!("&mut ({})", expr)
+                format!("&mut ({expr})")
             }
         }
         (Impl(traits), Ref(Stdin)) => {
             if traits.contains(StreamTrait::BufRead) {
-                format!("({}).lock()", expr)
+                format!("({expr}).lock()")
             } else if consume {
                 expr.to_string()
             } else {
-                format!("&mut *({})", expr)
+                format!("&mut *({expr})")
             }
         }
         (Impl(_), Ref(Impl(_))) => {
             if consume {
                 expr.to_string()
             } else {
-                format!("&mut *({})", expr)
+                format!("&mut *({expr})")
             }
         }
         (Impl(_), Ref(Box(Dyn(_)))) => {
             if consume {
                 expr.to_string()
             } else {
-                format!("&mut *({})", expr)
+                format!("&mut *({expr})")
             }
         }
-        (Impl(_), Ptr(Dyn(_))) => format!("&mut *({})", expr),
+        (Impl(_), Ptr(Dyn(_))) => format!("&mut *({expr})"),
         (Impl(_), Ptr(from)) => {
-            let r = format!("({}).as_mut()", expr);
+            let r = format!("({expr}).as_mut()");
             let from = Ref(from);
             convert_expr(to, Option(&from), &r, true, false)
         }
@@ -560,55 +555,52 @@ pub(super) fn convert_expr(
                 File => {
                     if traits.contains(StreamTrait::Read) || traits.contains(StreamTrait::BufRead) {
                         return format!(
-                            "{{ let stream: {} = Box::new(std::io::BufReader::new({})); stream }}",
-                            to, expr
+                            "{{ let stream: {to} = Box::new(std::io::BufReader::new({expr})); stream }}"
                         );
                     }
                     if traits.contains(StreamTrait::Write) {
                         return format!(
-                            "{{ let stream: {} = Box::new(std::io::BufWriter::new({})); stream }}",
-                            to, expr
+                            "{{ let stream: {to} = Box::new(std::io::BufWriter::new({expr})); stream }}"
                         );
                     }
                 }
                 Stdin => {
                     if traits.contains(StreamTrait::BufRead) {
                         return format!(
-                            "{{ let stream: {} = Box::new(({}).lock()); stream }}",
-                            to, expr
+                            "{{ let stream: {to} = Box::new(({expr}).lock()); stream }}"
                         );
                     }
                 }
                 _ => {}
             }
-            format!("{{ let stream: {} = Box::new({}); stream }}", to, expr)
+            format!("{{ let stream: {to} = Box::new({expr}); stream }}")
         }
         (
             Ref(Dyn(_)),
             Ref(File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_)),
         ) => {
-            format!("&mut *({})", expr)
+            format!("&mut *({expr})")
         }
         (
             Ptr(Dyn(_)),
             Ref(File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_)),
         ) => {
-            format!("&mut *({}) as *mut _", expr)
+            format!("&mut *({expr}) as *mut _")
         }
         (Ptr(Dyn(to)), Box(Dyn(from))) if to == from => {
-            format!("&mut ({}) as *mut _", expr)
+            format!("&mut ({expr}) as *mut _")
         }
         (Ptr(Dyn(to)), Ref(Box(Dyn(from)))) if to == from => {
-            format!("&mut *({}) as *mut _", expr)
+            format!("&mut *({expr}) as *mut _")
         }
         (Ptr(Dyn(_)), Ptr(Dyn(_))) => {
-            format!("&mut *({}) as *mut _", expr)
+            format!("&mut *({expr}) as *mut _")
         }
         (
             Ptr(Impl(_) | Dyn(_)),
             Ptr(File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_)),
         ) => {
-            format!("&mut *({}) as *mut _", expr)
+            format!("&mut *({expr}) as *mut _")
         }
         (
             Ref(Dyn(traits)),
@@ -616,9 +608,9 @@ pub(super) fn convert_expr(
         ) => {
             if consume {
                 let expr = convert_expr(Box(&Dyn(*traits)), from, expr, true, is_non_local);
-                format!("Box::leak({})", expr)
+                format!("Box::leak({expr})")
             } else {
-                format!("&mut ({})", expr)
+                format!("&mut ({expr})")
             }
         }
         (
@@ -626,26 +618,26 @@ pub(super) fn convert_expr(
             File | Stdin | Stdout | Stderr | Child | BufWriter(_) | BufReader(_),
         ) => {
             let expr = convert_expr(Ref(&Dyn(*traits)), from, expr, consume, is_non_local);
-            format!("({}) as *mut _", expr)
+            format!("({expr}) as *mut _")
         }
         (BufWriter(to), from) if *to == from => {
             assert!(consume);
-            format!("std::io::BufWriter::new({})", expr)
+            format!("std::io::BufWriter::new({expr})")
         }
         (BufReader(to), from) if *to == from => {
             assert!(consume);
-            format!("std::io::BufReader::new({})", expr)
+            format!("std::io::BufReader::new({expr})")
         }
         (Ptr(to), from) => {
             if consume {
                 let converted = convert_expr(*to, from, expr, true, is_non_local);
-                format!("Box::leak(Box::new({})) as *mut _", converted)
+                format!("Box::leak(Box::new({converted})) as *mut _")
             } else {
-                let borrowed = format!("&mut ({})", expr);
+                let borrowed = format!("&mut ({expr})");
                 convert_expr(Ptr(to), Ref(&from), &borrowed, true, false)
             }
         }
-        _ => panic!("{} := {} // {}", to, from, consume),
+        _ => panic!("{to} := {from} // {consume}"),
     }
 }
 
@@ -811,7 +803,7 @@ impl std::fmt::Display for TraitBound {
             if i != 0 {
                 write!(f, " + ")?;
             }
-            write!(f, "{}", t)?;
+            write!(f, "{t}")?;
         }
         Ok(())
     }

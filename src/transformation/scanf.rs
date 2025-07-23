@@ -246,7 +246,7 @@ impl std::fmt::Display for Conversion {
                 }
                 for c in chars {
                     if let Some(s) = escape(*c) {
-                        write!(f, "{}", s)?;
+                        write!(f, "{s}")?;
                     } else {
                         write!(f, "{}", *c as char)?;
                     }
@@ -340,10 +340,10 @@ impl std::fmt::Display for ConversionSpec {
             write!(f, "*")?;
         }
         if let Some(width) = self.width {
-            write!(f, "{}", width)?;
+            write!(f, "{width}")?;
         }
         if let Some(length) = self.length {
-            write!(f, "{}", length)?;
+            write!(f, "{length}")?;
         }
         write!(f, "{}", self.conversion)
     }

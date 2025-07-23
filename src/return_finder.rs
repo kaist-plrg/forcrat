@@ -18,7 +18,7 @@ impl Pass for ReturnFinder {
             let body = tcx.optimized_mir(item_id.owner_id);
             let ret_ty = &body.local_decls[Local::ZERO].ty;
             if compile_util::contains_file_ty(*ret_ty, tcx) {
-                println!("{:?}", item_id);
+                println!("{item_id:?}");
             }
         }
     }

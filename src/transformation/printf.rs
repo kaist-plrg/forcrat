@@ -55,7 +55,7 @@ pub(super) fn to_rust_format(mut remaining: &[u8]) -> RustFormat {
                 }
                 match width {
                     Width::Asterisk => {
-                        write!(fmt, "width{}$", width_count).unwrap();
+                        write!(fmt, "width{width_count}$").unwrap();
                         width_count += 1;
                         width_args.push(casts.len());
                         casts.push("usize");
@@ -326,7 +326,7 @@ impl std::fmt::Display for Width {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Width::Asterisk => write!(f, "*"),
-            Width::Decimal(n) => write!(f, "{}", n),
+            Width::Decimal(n) => write!(f, "{n}"),
         }
     }
 }
@@ -502,16 +502,16 @@ impl std::fmt::Display for ConversionSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "%")?;
         for flag in &self.flags {
-            write!(f, "{}", flag)?;
+            write!(f, "{flag}")?;
         }
         if let Some(width) = self.width {
-            write!(f, "{}", width)?;
+            write!(f, "{width}")?;
         }
         if let Some(precision) = self.precision {
-            write!(f, ".{}", precision)?;
+            write!(f, ".{precision}")?;
         }
         if let Some(length) = self.length {
-            write!(f, "{}", length)?;
+            write!(f, "{length}")?;
         }
         write!(f, "{}", self.conversion)
     }

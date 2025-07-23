@@ -125,7 +125,7 @@ impl std::fmt::Debug for VarId {
         match self {
             Self::Global(id) => write!(f, "#{}", id.local_def_index.index()),
             Self::Local(id, i) => write!(f, "#{}_{}", id.local_def_index.index(), i.index()),
-            Self::Temp(i) => write!(f, "#t{}", i),
+            Self::Temp(i) => write!(f, "#t{i}"),
         }
     }
 }
@@ -180,7 +180,7 @@ impl std::fmt::Debug for VarType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VarType::Bot => write!(f, "⊥"),
-            VarType::Ref(ty) => write!(f, "Ref{:?}", ty),
+            VarType::Ref(ty) => write!(f, "Ref{ty:?}"),
         }
     }
 }
@@ -230,7 +230,7 @@ impl std::fmt::Debug for FnType {
         match self {
             FnType::Bot => write!(f, "⊥"),
             FnType::Lambda(arg_tys, ret_ty) => {
-                write!(f, "{:?} -> {:?}", arg_tys, ret_ty)
+                write!(f, "{arg_tys:?} -> {ret_ty:?}")
             }
         }
     }
@@ -408,7 +408,7 @@ impl std::fmt::Debug for AnalysisResult {
         }
         for (id, ids) in inv_vars {
             let ty = &self.var_tys[id];
-            writeln!(f, "{:?}: {:?}", ids, ty)?;
+            writeln!(f, "{ids:?}: {ty:?}")?;
         }
 
         let mut inv_fns: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
@@ -417,7 +417,7 @@ impl std::fmt::Debug for AnalysisResult {
         }
         for (id, ids) in inv_fns {
             let ty = &self.fn_tys[id];
-            writeln!(f, "{:?}: {:?}", ids, ty)?;
+            writeln!(f, "{ids:?}: {ty:?}")?;
         }
 
         Ok(())

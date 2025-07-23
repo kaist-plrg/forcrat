@@ -253,22 +253,22 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     self.ctx
                         .callee_span_to_hir_id
                         .insert(path.span, expr.hir_id);
-                    if let Res::Def(DefKind::Fn, def_id) = path.res {
-                        if let Some(def_id) = def_id.as_local() {
-                            self.ctx.call_span_to_callee_id.insert(expr.span, def_id);
-                            for (i, arg) in args.iter().enumerate() {
-                                self.ctx
-                                    .fn_param_to_arg_spans
-                                    .entry((def_id, i))
-                                    .or_default()
-                                    .push(arg.span);
-                            }
+                    if let Res::Def(DefKind::Fn, def_id) = path.res
+                        && let Some(def_id) = def_id.as_local()
+                    {
+                        self.ctx.call_span_to_callee_id.insert(expr.span, def_id);
+                        for (i, arg) in args.iter().enumerate() {
                             self.ctx
-                                .call_graph
-                                .entry(expr.hir_id.owner.def_id)
+                                .fn_param_to_arg_spans
+                                .entry((def_id, i))
                                 .or_default()
-                                .insert(def_id);
+                                .push(arg.span);
                         }
+                        self.ctx
+                            .call_graph
+                            .entry(expr.hir_id.owner.def_id)
+                            .or_default()
+                            .insert(def_id);
                     }
                     let name = path.segments.last().unwrap().ident.name;
                     if api_list::is_symbol_api(name) {
@@ -289,7 +289,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                                 hir::Node::Stmt(_) => {
                                     break;
                                 }
-                                _ => panic!("{:?}", parent),
+                                _ => panic!("{parent:?}"),
                             }
                         }
                     }

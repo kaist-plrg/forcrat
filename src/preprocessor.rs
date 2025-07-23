@@ -183,24 +183,23 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
         match expr.kind {
             hir::ExprKind::Call(callee, args) => {
-                if let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind {
-                    if let Res::Def(DefKind::Fn, def_id) = path.res {
-                        if api_list::is_def_id_api(def_id, self.tcx) {
-                            let mut if_args = vec![];
-                            for (i, arg) in args.iter().enumerate() {
-                                if !matches!(arg.kind, hir::ExprKind::If(_, _, _)) {
-                                    continue;
-                                }
-                                let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
-                                let ty = typeck.expr_ty(arg);
-                                if compile_util::contains_file_ty(ty, self.tcx) {
-                                    if_args.push(i);
-                                }
-                            }
-                            if !if_args.is_empty() {
-                                self.call_span_to_if_args.insert(expr.span, if_args);
-                            }
+                if let hir::ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
+                    && let Res::Def(DefKind::Fn, def_id) = path.res
+                    && api_list::is_def_id_api(def_id, self.tcx)
+                {
+                    let mut if_args = vec![];
+                    for (i, arg) in args.iter().enumerate() {
+                        if !matches!(arg.kind, hir::ExprKind::If(_, _, _)) {
+                            continue;
                         }
+                        let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
+                        let ty = typeck.expr_ty(arg);
+                        if compile_util::contains_file_ty(ty, self.tcx) {
+                            if_args.push(i);
+                        }
+                    }
+                    if !if_args.is_empty() {
+                        self.call_span_to_if_args.insert(expr.span, if_args);
                     }
                 }
                 let args = args.iter().map(|arg| (arg.span, vec![])).collect();
@@ -359,7 +358,7 @@ impl MutVisitor for PreprocessVisitor<'_> {
                     let mut new_expr = "{".to_string();
                     for i in indices {
                         let a = pprust::expr_to_string(&args[i]);
-                        write!(new_expr, "let __arg_{} = {};", i, a).unwrap();
+                        write!(new_expr, "let __arg_{i} = {a};").unwrap();
                         *args[i] = expr!("__arg_{}", i);
                     }
                     new_expr.push_str(&pprust::expr_to_string(expr));

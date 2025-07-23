@@ -94,9 +94,9 @@ fn main() {
                         if !api_kind.is_posix_high_level_io() && !show_non_posix_high_level_io {
                             continue;
                         }
-                        print!("{} ", name);
+                        print!("{name} ");
                         if distinguish_std_args && api_kind.is_operation() {
-                            print!("{}_std ", name);
+                            print!("{name}_std ");
                         }
                     }
                 }
@@ -117,13 +117,13 @@ fn main() {
                     let v = counts.get(name).copied().unwrap_or(0);
                     sum += v;
                     if show_detail {
-                        write!(s, "{} ", v).unwrap();
+                        write!(s, "{v} ").unwrap();
                     }
                     if api_kind.is_operation() {
                         let v = std_arg_counts.get(name).copied().unwrap_or(0);
                         sum += v;
                         if show_detail {
-                            write!(s, "{} ", v).unwrap();
+                            write!(s, "{v} ").unwrap();
                         }
                     }
                 } else {
@@ -132,11 +132,11 @@ fn main() {
                     let v = v1 + v2;
                     sum += v;
                     if show_detail {
-                        write!(s, "{} ", v).unwrap();
+                        write!(s, "{v} ").unwrap();
                     }
                 }
             }
-            println!("{} {}", sum, s);
+            println!("{sum} {s}");
         }
         Command::CountReturnValues => {
             let counts = retval_use_counter::RetValCounter.run_on_path(&file);
@@ -200,7 +200,7 @@ fn main() {
             if show_unsupported_reasons {
                 for reasons in result.unsupported_reasons {
                     for reason in reasons.iter() {
-                        print!("{:?},", reason);
+                        print!("{reason:?},");
                     }
                     println!();
                 }

@@ -106,10 +106,10 @@ impl<'tcx> HVisitor<'tcx> for Visitor<'tcx> {
     fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) -> Self::Result {
         intravisit::walk_pat(self, pat);
 
-        if let PatKind::Binding(_, _, ident, _) = pat.kind {
-            if ident.name.as_str() == "self" {
-                return;
-            }
+        if let PatKind::Binding(_, _, ident, _) = pat.kind
+            && ident.name.as_str() == "self"
+        {
+            return;
         }
 
         let typeck = self.tcx.typeck(pat.hir_id.owner.def_id);
