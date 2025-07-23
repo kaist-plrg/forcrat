@@ -31,9 +31,6 @@ impl Pass for Steensgaard {
 
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
-            if item.ident.name.as_str() == "main" {
-                continue;
-            }
             let local_def_id = item.owner_id.def_id;
             let def_id = local_def_id.to_def_id();
             match item.kind {
@@ -47,7 +44,7 @@ impl Pass for Steensgaard {
                         analyzer.insert_and_allocate(id);
                     }
                 }
-                ItemKind::Static(_, _, _) => {
+                ItemKind::Static(_, _, _, _) => {
                     let body = tcx.mir_for_ctfe(def_id);
 
                     for (i, _) in body.local_decls.iter_enumerated() {
@@ -59,7 +56,11 @@ impl Pass for Steensgaard {
                     analyzer.insert_and_allocate(id);
                     analyzer.x_eq_y(id, VarId::Local(local_def_id, Local::from_u32(0)));
                 }
-                ItemKind::Fn { .. } => {
+                ItemKind::Fn { ident, .. } => {
+                    if ident.name.as_str() == "main" {
+                        continue;
+                    }
+
                     let body = tcx.optimized_mir(def_id);
 
                     for (i, _) in body.local_decls.iter_enumerated() {
@@ -77,10 +78,15 @@ impl Pass for Steensgaard {
 
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
-            if !matches!(item.kind, ItemKind::Static(_, _, _) | ItemKind::Fn { .. }) {
+            if !matches!(
+                item.kind,
+                ItemKind::Static(_, _, _, _) | ItemKind::Fn { .. }
+            ) {
                 continue;
             }
-            if item.ident.name.as_str() == "main" {
+            if let ItemKind::Fn { ident, .. } = item.kind
+                && ident.name.as_str() == "main"
+            {
                 continue;
             }
 

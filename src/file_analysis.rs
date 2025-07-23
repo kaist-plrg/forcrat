@@ -106,14 +106,16 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
         let item = tcx.hir_item(item_id);
         let local_def_id = item.owner_id.def_id;
         let body = match item.kind {
-            ItemKind::Fn { .. } => {
-                if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
+            ItemKind::Fn { ident, .. } => {
+                if defined_apis.contains(&local_def_id) || ident.name.as_str() == "main" {
                     continue;
                 }
                 tcx.optimized_mir(local_def_id)
             }
-            ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
-            ItemKind::Struct(_, _) | ItemKind::Union(_, _) if item.ident.as_str() != "_IO_FILE" => {
+            ItemKind::Static(_, _, _, _) => tcx.mir_for_ctfe(local_def_id),
+            ItemKind::Struct(ident, _, _) | ItemKind::Union(ident, _, _)
+                if ident.as_str() != "_IO_FILE" =>
+            {
                 let adt_def = tcx.adt_def(item.owner_id);
                 for (i, fd) in adt_def.variant(FIRST_VARIANT).fields.iter_enumerated() {
                     let ty = fd.ty(tcx, List::empty());
@@ -165,13 +167,13 @@ pub fn analyze<'a>(arena: &'a Arena<ExprLoc>, tcx: TyCtxt<'_>) -> AnalysisResult
         let item = tcx.hir_item(item_id);
         let local_def_id = item.owner_id.def_id;
         let body = match item.kind {
-            ItemKind::Fn { .. } => {
-                if defined_apis.contains(&local_def_id) || item.ident.name.as_str() == "main" {
+            ItemKind::Fn { ident, .. } => {
+                if defined_apis.contains(&local_def_id) || ident.name.as_str() == "main" {
                     continue;
                 }
                 tcx.optimized_mir(local_def_id)
             }
-            ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
+            ItemKind::Static(_, _, _, _) => tcx.mir_for_ctfe(local_def_id),
             _ => continue,
         };
         tracing::info!("{:?}", local_def_id);
@@ -1185,13 +1187,15 @@ impl rustc_ast::visit::Visitor<'_> for AstVisitor {
         rustc_ast::visit::walk_item(self, item);
 
         let rustc_ast::ItemKind::Static(box rustc_ast::StaticItem {
-            expr: Some(expr), ..
+            ident,
+            expr: Some(expr),
+            ..
         }) = &item.kind
         else {
             return;
         };
         if let LikelyLit::Lit(lit) = LikelyLit::from_expr(expr) {
-            self.static_span_to_lit.insert(item.ident.span, lit);
+            self.static_span_to_lit.insert(ident.span, lit);
         }
     }
 }

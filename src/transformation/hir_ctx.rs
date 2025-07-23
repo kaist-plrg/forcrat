@@ -169,18 +169,18 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         intravisit::walk_item(self, item);
 
         match item.kind {
-            hir::ItemKind::Static(_, _, body_id) => {
+            hir::ItemKind::Static(ident, _, _, body_id) => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
                 let body = self.tcx.hir_body(body_id);
-                self.add_binding(loc, item.ident.span);
-                self.add_bound(loc, item.ident.span);
-                self.add_assignment(item.ident.span, body.value);
+                self.add_binding(loc, ident.span);
+                self.add_bound(loc, ident.span);
+                self.add_assignment(ident.span, body.value);
             }
-            hir::ItemKind::Fn { .. } => {
+            hir::ItemKind::Fn { ident, .. } => {
                 let loc = HirLoc::Global(item.owner_id.def_id);
-                self.add_binding(loc, item.ident.span);
+                self.add_binding(loc, ident.span);
             }
-            hir::ItemKind::Struct(vd, _) | hir::ItemKind::Union(vd, _) => {
+            hir::ItemKind::Struct(_, vd, _) | hir::ItemKind::Union(_, vd, _) => {
                 let hir::VariantData::Struct { fields, .. } = vd else { return };
                 let def_id = item.owner_id.def_id;
                 for (i, f) in fields.iter().enumerate() {
@@ -272,7 +272,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                     }
                     let name = path.segments.last().unwrap().ident.name;
                     if api_list::is_symbol_api(name) {
-                        for (_, parent) in self.tcx.hir().parent_iter(expr.hir_id) {
+                        for (_, parent) in self.tcx.hir_parent_iter(expr.hir_id) {
                             match parent {
                                 hir::Node::Expr(e) => {
                                     if !matches!(e.kind, hir::ExprKind::DropTemps(_)) {

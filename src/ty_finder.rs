@@ -25,13 +25,13 @@ impl Pass for TyFinder {
                 let item = tcx.hir_item(item_id);
                 let local_def_id = item.owner_id.def_id;
                 let body = match item.kind {
-                    ItemKind::Fn { .. } => {
-                        if item.ident.name.as_str() == "main" {
+                    ItemKind::Fn { ident, .. } => {
+                        if ident.name.as_str() == "main" {
                             continue;
                         }
                         tcx.optimized_mir(local_def_id)
                     }
-                    ItemKind::Static(_, _, _) => tcx.mir_for_ctfe(local_def_id),
+                    ItemKind::Static(_, _, _, _) => tcx.mir_for_ctfe(local_def_id),
                     _ => continue,
                 };
                 for local_decl in body.local_decls.iter() {
@@ -49,14 +49,14 @@ impl Pass for TyFinder {
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
             match item.kind {
-                ItemKind::Static(_, _, _) => {
+                ItemKind::Static(_, _, _, _) => {
                     let body = tcx.mir_for_ctfe(item_id.owner_id.def_id);
                     let ty = body.local_decls[mir::RETURN_PLACE].ty;
                     if visitor.is_non_trivial_file_ty(ty) {
                         println!("{:?} {:?}", ty, item.span);
                     }
                 }
-                ItemKind::Struct(_, _) | ItemKind::Union(_, _) => {
+                ItemKind::Struct(_, _, _) | ItemKind::Union(_, _, _) => {
                     let adt_def = tcx.adt_def(item_id.owner_id.def_id);
                     let variant = adt_def.variant(FIRST_VARIANT);
                     for field in &variant.fields {

@@ -30,14 +30,17 @@ impl Pass for RetValCounter {
         let mut counts: FxHashMap<&'static str, UseCounts> = FxHashMap::default();
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
-            let name = item.ident.name;
-            if name.as_str() == "main" || is_symbol_api(name) {
-                continue;
-            }
             let def_id = item.owner_id.to_def_id();
             let body = match item.kind {
-                ItemKind::Fn { .. } => tcx.optimized_mir(def_id),
-                ItemKind::Static(_, _, _) | ItemKind::Const(_, _, _) => tcx.mir_for_ctfe(def_id),
+                ItemKind::Fn { ident, .. } => {
+                    if ident.name.as_str() == "main" || is_symbol_api(ident.name) {
+                        continue;
+                    }
+                    tcx.optimized_mir(def_id)
+                }
+                ItemKind::Static(_, _, _, _) | ItemKind::Const(_, _, _, _) => {
+                    tcx.mir_for_ctfe(def_id)
+                }
                 _ => continue,
             };
             let mut visitor = RetValVisitor::new(tcx);

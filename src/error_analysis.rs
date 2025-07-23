@@ -717,7 +717,7 @@ impl<'tcx> Visitor<'tcx> for HirVisitor<'_, 'tcx> {
             ExprKind::Path(QPath::Resolved(_, path)) => {
                 let Res::Def(DefKind::Fn, def_id) = path.res else { return };
                 let def_id = some_or!(def_id.as_local(), return);
-                let mut parents = self.tcx.hir().parent_iter(expr.hir_id);
+                let mut parents = self.tcx.hir_parent_iter(expr.hir_id);
                 let (_, parent) = parents.next().unwrap();
                 let Node::Expr(parent) = parent else { panic!() };
                 if let ExprKind::Call(callee, _) = parent.kind {

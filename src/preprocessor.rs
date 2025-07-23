@@ -134,7 +134,7 @@ struct HirVisitor<'tcx> {
 
 impl HirVisitor<'_> {
     fn find_call_parent(&self, hir_id: HirId) -> HirId {
-        for (hir_id, node) in self.tcx.hir().parent_iter(hir_id) {
+        for (hir_id, node) in self.tcx.hir_parent_iter(hir_id) {
             if matches!(
                 node,
                 hir::Node::Expr(hir::Expr {
@@ -227,7 +227,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
                             .or_default()
                             .push(expr.span);
 
-                        let (_, parent) = self.tcx.hir().parent_iter(expr.hir_id).next().unwrap();
+                        let (_, parent) = self.tcx.hir_parent_iter(expr.hir_id).next().unwrap();
                         if !matches!(parent, hir::Node::LetStmt(_)) {
                             self.used_vars.insert(hir_id);
                         }

@@ -183,7 +183,8 @@ impl Pass for Transformation {
                 Loc::Field(def_id, field_idx) => {
                     let node = tcx.hir_node_by_def_id(def_id);
                     let hir::Node::Item(item) = node else { panic!() };
-                    let (hir::ItemKind::Struct(vd, _) | hir::ItemKind::Union(vd, _)) = item.kind
+                    let (hir::ItemKind::Struct(_, vd, _) | hir::ItemKind::Union(_, vd, _)) =
+                        item.kind
                     else {
                         panic!()
                     };
@@ -296,7 +297,7 @@ impl Pass for Transformation {
                             ctx.is_recursive = recursive_fns.contains(def_id);
                             (locs, ctx)
                         }
-                        hir::ItemKind::Static(_, _, _) => {
+                        hir::ItemKind::Static(_, _, _, _) => {
                             if *local != mir::Local::ZERO {
                                 continue;
                             }
@@ -312,7 +313,7 @@ impl Pass for Transformation {
                     let adt_def = tcx.adt_def(*def_id);
                     let ty = adt_def.variant(FIRST_VARIANT).fields[*field].ty(tcx, List::empty());
                     let mut ctx = LocCtx::new(ty);
-                    ctx.is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _));
+                    ctx.is_union = matches!(item.kind, rustc_hir::ItemKind::Union(_, _, _));
                     (vec![HirLoc::Field(*def_id, *field)], ctx)
                 }
                 _ => continue,
@@ -494,8 +495,13 @@ impl Pass for Transformation {
             }
             let node = tcx.hir_node_by_def_id(def_id);
             let hir::Node::Item(item) = node else { panic!() };
-            uncopiable.entry(item.ident.span).or_default().push(field);
-            if matches!(item.kind, hir::ItemKind::Union(_, _)) {
+            let (hir::ItemKind::Struct(ident, _, _) | hir::ItemKind::Union(ident, _, _)) =
+                item.kind
+            else {
+                panic!();
+            };
+            uncopiable.entry(ident.span).or_default().push(field);
+            if matches!(item.kind, hir::ItemKind::Union(_, _, _)) {
                 uncopiable_union_fields.push((def_id, field));
             }
             let owning_structs = some_or!(hir_ctx.struct_to_owning_structs.get(&def_id), continue);
@@ -517,12 +523,12 @@ impl Pass for Transformation {
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
             let local_def_id = item.owner_id.def_id;
-            if let hir::ItemKind::Fn { .. } = item.kind {
-                if item.ident.name.as_str() == "main" {
+            if let hir::ItemKind::Fn { ident, .. } = item.kind {
+                if ident.name.as_str() == "main" {
                     continue;
                 }
                 if analysis_res.defined_apis.contains(&local_def_id) {
-                    api_ident_spans.insert(item.ident.span);
+                    api_ident_spans.insert(ident.span);
                 }
             }
         }
@@ -630,9 +636,9 @@ fn mir_local_span(
             }
             tcx.optimized_mir(def_id)
         }
-        hir::ItemKind::Static(_, _, _) => {
+        hir::ItemKind::Static(ident, _, _, _) => {
             if local == mir::Local::ZERO {
-                return item.ident.span;
+                return ident.span;
             }
             tcx.mir_for_ctfe(def_id)
         }

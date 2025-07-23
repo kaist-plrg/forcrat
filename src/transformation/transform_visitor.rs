@@ -1,7 +1,4 @@
-use std::{
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
+use std::ops::{Deref, DerefMut};
 
 use etrace::some_or;
 use rustc_abi::FieldIdx;
@@ -10,14 +7,11 @@ use rustc_ast::{
     mut_visit::{self, MutVisitor},
     ptr::P,
     token::TokenKind,
-    tokenstream::{
-        AttrTokenStream, AttrTokenTree, AttrsTarget, LazyAttrTokenStream, TokenStream, TokenTree,
-    },
+    tokenstream::{TokenStream, TokenTree},
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{self as hir};
-use rustc_lexer::unescape;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{def_id::LocalDefId, symbol::Ident, Span, Symbol};
 
@@ -383,11 +377,12 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 })
                 .unwrap();
             for name in self.foreign_statics.drain() {
-                if foreign_mod
-                    .items
-                    .iter()
-                    .any(|item| item.ident.as_str() == name)
-                {
+                if foreign_mod.items.iter().any(|item| {
+                    let ForeignItemKind::Static(box StaticItem { ident, .. }) = item.kind else {
+                        return false;
+                    };
+                    ident.as_str() == name
+                }) {
                     continue;
                 }
                 let item = item!("static mut {}: *mut FILE;", name);
@@ -397,7 +392,6 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     id: item.id,
                     span: item.span,
                     vis: item.vis,
-                    ident: item.ident,
                     kind: ForeignItemKind::Static(static_item),
                     tokens: item.tokens,
                 };
@@ -407,12 +401,14 @@ impl MutVisitor for TransformVisitor<'_, '_> {
     }
 
     fn visit_item(&mut self, item: &mut P<Item>) {
-        if self.api_ident_spans.contains(&item.ident.span) {
+        if let ItemKind::Fn(box Fn { ident, .. }) = item.kind
+            && self.api_ident_spans.contains(&ident.span)
+        {
             return;
         }
 
-        let is_fn = if matches!(item.kind, ItemKind::Fn(_))
-            && let Some(HirLoc::Global(def_id)) = self.hir.binding_span_to_loc.get(&item.ident.span)
+        let is_fn = if let ItemKind::Fn(box Fn { ident, .. }) = item.kind
+            && let Some(HirLoc::Global(def_id)) = self.hir.binding_span_to_loc.get(&ident.span)
         {
             self.current_fns.push(*def_id);
             true
@@ -426,9 +422,9 @@ impl MutVisitor for TransformVisitor<'_, '_> {
             self.current_fns.pop();
         }
 
-        let ident_span = item.ident.span;
         match &mut item.kind {
             ItemKind::Static(box item) => {
+                let ident_span = item.ident.span;
                 let body = some_or!(&mut item.expr, return);
                 if self.unsupported.contains_key(&body.span) {
                     return;
@@ -444,6 +440,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                 }
             }
             ItemKind::Fn(box item) => {
+                let ident_span = item.ident.span;
                 let HirLoc::Global(def_id) = self.hir.binding_span_to_loc[&ident_span] else {
                     panic!()
                 };
@@ -554,8 +551,8 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                     stmts.insert(0, stmt);
                 }
             }
-            ItemKind::Struct(_, _) | ItemKind::Union(_, _) => {
-                if let Some(field_indices) = self.uncopiable.get(&item.ident.span) {
+            ItemKind::Struct(ident, _, _) | ItemKind::Union(ident, _, _) => {
+                if let Some(field_indices) = self.uncopiable.get(&ident.span) {
                     for attr in &mut item.attrs {
                         let AttrKind::Normal(attr) = &mut attr.kind else { continue };
                         let AttrArgs::Delimited(args) = &mut attr.item.args else { continue };
@@ -584,7 +581,7 @@ impl MutVisitor for TransformVisitor<'_, '_> {
                         }
                         args.tokens = TokenStream::new(tokens);
                     }
-                    if let ItemKind::Union(vd, _) = &mut item.kind {
+                    if let ItemKind::Union(_, vd, _) = &mut item.kind {
                         let VariantData::Struct { fields, .. } = vd else { panic!() };
                         for i in field_indices {
                             let field = &mut fields[i.as_usize()];
@@ -1445,14 +1442,16 @@ impl MutVisitor for TransformVisitor<'_, '_> {
 fn walk_local<T: MutVisitor>(vis: &mut T, local: &mut P<Local>) {
     let Local {
         id,
+        super_,
         pat,
         ty,
         kind,
         span,
         colon_sp,
         attrs,
-        tokens,
+        tokens: _,
     } = local.deref_mut();
+    visit_opt(super_, |sp| vis.visit_span(sp));
     vis.visit_id(id);
     visit_attrs(vis, attrs);
     vis.visit_pat(pat);
@@ -1467,7 +1466,6 @@ fn walk_local<T: MutVisitor>(vis: &mut T, local: &mut P<Local>) {
             vis.visit_block(els);
         }
     }
-    visit_lazy_tts(vis, tokens);
     visit_opt(colon_sp, |sp| vis.visit_span(sp));
     vis.visit_span(span);
 }
@@ -1484,52 +1482,6 @@ where F: FnMut(&mut T) {
 fn visit_attrs<T: MutVisitor>(vis: &mut T, attrs: &mut AttrVec) {
     for attr in attrs.iter_mut() {
         vis.visit_attribute(attr);
-    }
-}
-
-fn visit_lazy_tts_opt_mut<T: MutVisitor>(vis: &mut T, lazy_tts: Option<&mut LazyAttrTokenStream>) {
-    if T::VISIT_TOKENS {
-        if let Some(lazy_tts) = lazy_tts {
-            let mut tts = lazy_tts.to_attr_token_stream();
-            visit_attr_tts(vis, &mut tts);
-            *lazy_tts = LazyAttrTokenStream::new(tts);
-        }
-    }
-}
-
-#[inline]
-fn visit_lazy_tts<T: MutVisitor>(vis: &mut T, lazy_tts: &mut Option<LazyAttrTokenStream>) {
-    visit_lazy_tts_opt_mut(vis, lazy_tts.as_mut());
-}
-
-fn visit_attr_tts<T: MutVisitor>(vis: &mut T, AttrTokenStream(tts): &mut AttrTokenStream) {
-    if T::VISIT_TOKENS && !tts.is_empty() {
-        let tts = Arc::make_mut(tts);
-        visit_vec(tts, |tree| visit_attr_tt(vis, tree));
-    }
-}
-
-fn visit_attr_tt<T: MutVisitor>(vis: &mut T, tt: &mut AttrTokenTree) {
-    match tt {
-        AttrTokenTree::Token(token, _spacing) => {
-            mut_visit::visit_token(vis, token);
-        }
-        AttrTokenTree::Delimited(dspan, _spacing, _delim, tts) => {
-            visit_attr_tts(vis, tts);
-            mut_visit::visit_delim_span(vis, dspan);
-        }
-        AttrTokenTree::AttrsTarget(AttrsTarget { attrs, tokens }) => {
-            visit_attrs(vis, attrs);
-            visit_lazy_tts_opt_mut(vis, Some(tokens));
-        }
-    }
-}
-
-#[inline]
-fn visit_vec<T, F>(elems: &mut Vec<T>, mut visit_elem: F)
-where F: FnMut(&mut T) {
-    for elem in elems {
-        visit_elem(elem);
     }
 }
 
@@ -1769,9 +1721,11 @@ impl TransformVisitor<'_, '_> {
                 // from rustc_ast/src/util/literal.rs
                 let s = fmt.as_str();
                 let mut buf = Vec::with_capacity(s.len());
-                unescape::unescape_unicode(fmt.as_str(), unescape::Mode::ByteStr, &mut |_, c| {
-                    buf.push(unescape::byte_from_char(c.unwrap()))
-                });
+                rustc_literal_escaper::unescape_unicode(
+                    fmt.as_str(),
+                    rustc_literal_escaper::Mode::ByteStr,
+                    &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
+                );
                 let specs = scanf::parse_specs(&buf);
                 let mut i = 0;
                 let mut code = String::new();
@@ -2020,9 +1974,11 @@ if !c.is_ascii_whitespace() {
         // from rustc_ast/src/util/literal.rs
         let s = fmt.as_str();
         let mut buf = Vec::with_capacity(s.len());
-        unescape::unescape_unicode(fmt.as_str(), unescape::Mode::ByteStr, &mut |_, c| {
-            buf.push(unescape::byte_from_char(c.unwrap()))
-        });
+        rustc_literal_escaper::unescape_unicode(
+            fmt.as_str(),
+            rustc_literal_escaper::Mode::ByteStr,
+            &mut |_, c| buf.push(rustc_literal_escaper::byte_from_char(c.unwrap())),
+        );
 
         if ctx.wide {
             let mut new_buf: Vec<u8> = vec![];

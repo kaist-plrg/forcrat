@@ -30,16 +30,22 @@ impl Pass for ApiCounter {
 
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
-            if defined_apis.contains(&item_id.owner_id.def_id) || item.ident.name.as_str() == "main"
-            {
+            if defined_apis.contains(&item_id.owner_id.def_id) {
                 continue;
             }
-            let (ItemKind::Fn { body: body_id, .. }
-            | ItemKind::Static(_, _, body_id)
-            | ItemKind::Const(_, _, body_id)) = item.kind
+            let (ItemKind::Fn {
+                ident,
+                body: body_id,
+                ..
+            }
+            | ItemKind::Static(ident, _, _, body_id)
+            | ItemKind::Const(ident, _, _, body_id)) = item.kind
             else {
                 continue;
             };
+            if ident.name.as_str() == "main" {
+                continue;
+            }
             let body = tcx.hir_body(body_id);
             visitor.visit_body(body);
         }

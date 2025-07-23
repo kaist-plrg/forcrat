@@ -88,7 +88,7 @@ pub fn make_config(input: Input) -> Config {
     let opts = find_deps();
     Config {
         opts: Options {
-            maybe_sysroot: Some(PathBuf::from(sys_root())),
+            sysroot: sys_root().unwrap(),
             search_paths: opts.search_paths,
             externs: opts.externs,
             unstable_features: UnstableFeatures::Allow,
@@ -112,6 +112,7 @@ pub fn make_config(input: Input) -> Config {
         })),
         register_lints: None,
         override_queries: None,
+        extra_symbols: vec![],
         make_codegen_backend: None,
         registry: Registry::new(rustc_errors::codes::DIAGNOSTICS),
         hash_untracked_state: None,
@@ -196,7 +197,7 @@ fn find_deps() -> Options {
     rustc_session::config::build_session_options(&mut handler, &matches)
 }
 
-fn sys_root() -> String {
+fn sys_root() -> Option<PathBuf> {
     std::env::var("SYSROOT")
         .ok()
         .map(PathBuf::from)
@@ -228,8 +229,6 @@ fn sys_root() -> String {
                 .map(ToString::to_string);
             toolchain_path(home, toolchain)
         })
-        .map(|pb| pb.to_string_lossy().to_string())
-        .unwrap()
 }
 
 fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<PathBuf> {
