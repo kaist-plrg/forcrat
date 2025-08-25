@@ -20,6 +20,8 @@ enum Command {
         #[arg(long, default_value = "false")]
         show_wide: bool,
         #[arg(long, default_value = "false")]
+        show_callers: bool,
+        #[arg(long, default_value = "false")]
         show_non_posix_high_level_io: bool,
         #[arg(long, default_value = "false")]
         show_api_names: bool,
@@ -83,11 +85,12 @@ fn main() {
             filter,
             show_detail,
             show_wide,
+            show_callers,
             show_non_posix_high_level_io,
             show_api_names,
             distinguish_std_args,
         } => {
-            if show_api_names {
+            if show_api_names && !show_callers {
                 print!("total ");
                 if show_detail {
                     for (name, api_info) in API_LIST {
@@ -109,7 +112,7 @@ fn main() {
                 }
                 println!();
             }
-            let (counts, std_arg_counts) = api_counter::ApiCounter.run_on_path(&file);
+            let res = api_counter::ApiCounter.run_on_path(&file);
             let mut sum = 0;
             let mut s = String::new();
             for (name, api_info) in API_LIST {
@@ -123,22 +126,52 @@ fn main() {
                 if !filter.is_empty() && !filter.iter().any(|f| f == name) {
                     continue;
                 }
+                if show_callers {
+                    println!("{name}");
+                }
                 if distinguish_std_args {
-                    let v = counts.get(name).copied().unwrap_or(0);
-                    sum += v;
-                    if show_detail {
-                        write!(s, "{v} ").unwrap();
-                    }
-                    if api_kind.is_operation() {
-                        let v = std_arg_counts.get(name).copied().unwrap_or(0);
+                    if show_callers {
+                        if let Some(v) = res.counts.get(name) {
+                            for f in v {
+                                println!("{f}");
+                            }
+                        }
+                    } else {
+                        let v = res.counts.get(name).map(|v| v.len()).unwrap_or(0);
                         sum += v;
                         if show_detail {
                             write!(s, "{v} ").unwrap();
                         }
                     }
+                    if api_kind.is_operation() {
+                        if show_callers {
+                            if let Some(v) = res.std_arg_counts.get(name) {
+                                for f in v {
+                                    println!("{f}");
+                                }
+                            }
+                        } else {
+                            let v = res.std_arg_counts.get(name).map(|v| v.len()).unwrap_or(0);
+                            sum += v;
+                            if show_detail {
+                                write!(s, "{v} ").unwrap();
+                            }
+                        }
+                    }
+                } else if show_callers {
+                    if let Some(v) = res.counts.get(name) {
+                        for f in v {
+                            println!("{f}");
+                        }
+                    }
+                    if let Some(v) = res.std_arg_counts.get(name) {
+                        for f in v {
+                            println!("{f}");
+                        }
+                    }
                 } else {
-                    let v1 = counts.get(name).copied().unwrap_or(0);
-                    let v2 = std_arg_counts.get(name).copied().unwrap_or(0);
+                    let v1 = res.counts.get(name).map(|v| v.len()).unwrap_or(0);
+                    let v2 = res.std_arg_counts.get(name).map(|v| v.len()).unwrap_or(0);
                     let v = v1 + v2;
                     sum += v;
                     if show_detail {
@@ -146,7 +179,9 @@ fn main() {
                     }
                 }
             }
-            println!("{sum} {s}");
+            if !show_callers {
+                println!("{sum} {s}");
+            }
         }
         Command::CountReturnValues => {
             let counts = retval_use_counter::RetValCounter.run_on_path(&file);

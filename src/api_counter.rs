@@ -2,8 +2,7 @@ use etrace::some_or;
 use rustc_hash::FxHashMap;
 use rustc_hir::{
     def::{DefKind, Res},
-    intravisit,
-    intravisit::Visitor,
+    intravisit::{self, Visitor},
     Expr, ExprKind, ItemKind, QPath,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
@@ -17,11 +16,13 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub struct ApiCounter;
 
+pub struct CountResult {
+    pub counts: FxHashMap<&'static str, Vec<String>>,
+    pub std_arg_counts: FxHashMap<&'static str, Vec<String>>,
+}
+
 impl Pass for ApiCounter {
-    type Out = (
-        FxHashMap<&'static str, usize>,
-        FxHashMap<&'static str, usize>,
-    );
+    type Out = CountResult;
 
     fn run(&self, tcx: TyCtxt<'_>) -> Self::Out {
         let defined_apis = file_analysis::find_defined_apis(tcx);
@@ -50,14 +51,17 @@ impl Pass for ApiCounter {
             visitor.visit_body(body);
         }
 
-        (visitor.counts, visitor.std_arg_counts)
+        CountResult {
+            counts: visitor.counts,
+            std_arg_counts: visitor.std_arg_counts,
+        }
     }
 }
 
 struct ApiVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    counts: FxHashMap<&'static str, usize>,
-    std_arg_counts: FxHashMap<&'static str, usize>,
+    counts: FxHashMap<&'static str, Vec<String>>,
+    std_arg_counts: FxHashMap<&'static str, Vec<String>>,
 }
 
 impl<'tcx> ApiVisitor<'tcx> {
@@ -96,6 +100,7 @@ impl<'tcx> Visitor<'tcx> for ApiVisitor<'tcx> {
         } else {
             &mut self.counts
         };
-        *counts.entry(*name).or_default() += 1;
+        let caller = self.tcx.def_path_str(expr.hir_id.owner.def_id);
+        counts.entry(*name).or_default().push(caller);
     }
 }
