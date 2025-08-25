@@ -13,6 +13,8 @@ use forcrat::{api_list::API_LIST, compile_util::Pass, *};
 #[derive(Subcommand, Debug)]
 enum Command {
     CountApis {
+        #[arg(long)]
+        filter: Vec<String>,
         #[arg(long, default_value = "false")]
         show_detail: bool,
         #[arg(long, default_value = "false")]
@@ -78,6 +80,7 @@ fn main() {
 
     match args.command {
         Command::CountApis {
+            filter,
             show_detail,
             show_wide,
             show_non_posix_high_level_io,
@@ -93,6 +96,9 @@ fn main() {
                             continue;
                         }
                         if !api_kind.is_posix_high_level_io() && !show_non_posix_high_level_io {
+                            continue;
+                        }
+                        if !filter.is_empty() && !filter.iter().any(|f| f == name) {
                             continue;
                         }
                         print!("{name} ");
@@ -112,6 +118,9 @@ fn main() {
                     continue;
                 }
                 if !api_kind.is_posix_high_level_io() && !show_non_posix_high_level_io {
+                    continue;
+                }
+                if !filter.is_empty() && !filter.iter().any(|f| f == name) {
                     continue;
                 }
                 if distinguish_std_args {
